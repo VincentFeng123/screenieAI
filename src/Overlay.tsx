@@ -2785,6 +2785,63 @@ function placeEditAffordance(
     return { side: corner, x, y, axis: "horizontal", expandToward };
   };
 
+  /// Place the pencil immediately to the LEFT of the show-chat pill on the
+  /// same y, so the two affordances cluster as a row at one end of the
+  /// rect's outside edge instead of splitting to opposite corners. Without
+  /// this, the standard "end" anchor would collide with the chat pill (the
+  /// regular `intersects` check enforces a PAD=14 gap), and the pencil
+  /// would fall back to the "start" anchor at the opposite edge of the
+  /// rect — which reads as the pencil "going to the middle / wrong end".
+  ///
+  /// Excludes `showChatPill` from the blocker check (we're snugging up to
+  /// it on purpose) but keeps the toolbar + chat panel as blockers. The
+  /// expanded pill grows leftward (away from the chat pill), so when
+  /// expanded it never overlaps. Returns null when there's no horizontal
+  /// room — the regular candidate loop then picks something else.
+  const tryAdjacentToShowChat = (): EditAnchor | null => {
+    if (!showChatPill) return null;
+    const ADJ_GAP = 4;
+
+    const x = showChatPill.x - ADJ_GAP - size;
+    const y = showChatPill.y;
+    const iconBox: PlacementBox = { x, y, w: size, h: size };
+
+    // Loose on-screen check covers both above-rect and inside-top-right
+    // placements of the show-chat pill (matching `tryInsideCorner`).
+    if (!onScreenLoose(iconBox)) return null;
+
+    const otherBlockers: PlacementBox[] = [toolbarBox];
+    if (panel) otherBlockers.push(panel);
+    const hitsOther = (b: PlacementBox): boolean =>
+      otherBlockers.some(
+        (box) =>
+          !(
+            b.x + b.w + PAD <= box.x ||
+            b.x >= box.x + box.w + PAD ||
+            b.y + b.h + PAD <= box.y ||
+            b.y >= box.y + box.h + PAD
+          ),
+      );
+    if (hitsOther(iconBox)) return null;
+
+    // Expanded pill grows leftward from the icon. If the natural left edge
+    // would clip off-screen, reject — clamping right would slide the pill
+    // back over the chat pill.
+    const expBox: PlacementBox = {
+      x: x + size - expandedH,
+      y,
+      w: expandedH,
+      h: size,
+    };
+    if (expBox.x < 0) return null;
+    if (hitsOther(expBox)) return null;
+
+    const pillCenterY = showChatPill.y + showChatPill.h / 2;
+    const corner: CornerKey =
+      pillCenterY < rect.y + rect.h / 2 ? "corner-tr" : "corner-br";
+    return { side: corner, x, y, axis: "horizontal", expandToward: "start" };
+  };
+
   // Same side priority as the companion action buttons: check the side
   // opposite the text field first, then the perpendicular gutters, then the
   // text-field side. Expansion direction is fixed by axis: top/bottom always
@@ -2830,6 +2887,17 @@ function placeEditAffordance(
     ? [...insideCornersTop, ...insideCornersBot]
     : [...insideCornersBot, ...insideCornersTop];
   for (const c of insideOrder) candidates.push({ kind: "inside", corner: c });
+
+  // Try adjacent-to-show-chat first. When the chat panel is hidden the
+  // show-chat pill is rendered at the rect's top-right corner; standard
+  // edge anchors would otherwise collide with it (PAD=14 gap) and the
+  // pencil would jump to the opposite corner. Snugging the pencil up to
+  // the chat pill keeps both affordances on the same row, reading as a
+  // single cluster of controls.
+  if (showChatPill) {
+    const adjacent = tryAdjacentToShowChat();
+    if (adjacent) return adjacent;
+  }
 
   for (const c of candidates) {
     const a = c.kind === "outside"

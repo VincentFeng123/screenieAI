@@ -1,23 +1,32 @@
 /* ------------------------------------------------------------------ */
-/* BlurredBackdrop — no-op shim (vibrancy moved to native AppKit)      */
+/* BlurredBackdrop — platform-split frost recipe                       */
 /*                                                                     */
-/* The frost behind each overlay panel is now provided by an           */
-/* NSVisualEffectView mounted as a sibling of the WKWebView (see       */
-/* macos_window.m's vibrancy section + the `useOverlayFrostRegions`    */
-/* hook in Overlay.tsx). The native compositor blurs the live desktop  */
-/* every frame, so the overlay no longer relies on a captured-PNG      */
-/* snapshot for frost.                                                 */
+/* macOS: returns null. Frost is drawn by an NSVisualEffectView        */
+/* mounted as a sibling of the WKWebView (see macos_window.m's         */
+/* vibrancy section + `useOverlayFrostRegions` in Overlay.tsx). The    */
+/* native compositor blurs the live desktop every frame.               */
 /*                                                                     */
-/* This component used to render the bitmap + tint + fill stack inside */
-/* every panel. Returning `null` here means callers don't have to be   */
-/* changed — the JSX still references it but it just renders nothing.  */
-/* The panel's CSS background still draws on top of the vibrancy view  */
-/* (which is BEHIND the WebView), so a low-alpha bg color is what      */
-/* tones the frost. Adjust panel CSS, not this component, to dial      */
-/* darkness in or out.                                                 */
+/* Windows: renders a 3-layer stack inside the panel —                 */
+/*   1. Blurred screenshot bitmap, positioned so the panel shows the   */
+/*      part of the screen behind it.                                  */
+/*   2. Tint color overlay.                                            */
+/*   3. Fill color overlay.                                            */
+/* The overlay window has no Mica (it's borderless + transparent +     */
+/* topmost), and CSS `backdrop-filter: blur()` over a transparent      */
+/* topmost window has nothing in the compositor stack to blur. So we   */
+/* fall back to the original v1 bitmap-blur recipe: the screenshot     */
+/* refresh path (`overlay-background-changed` → React reload) keeps    */
+/* this bitmap in step with the actual desktop content underneath.     */
+/* The detached Chat window doesn't need this — its window gets Mica   */
+/* applied via DWM in `windows_window::configure_main_window`.         */
 /* ------------------------------------------------------------------ */
 
-export function BlurredBackdrop(_props: {
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+
+const isWindowsPlatform =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+
+export function BlurredBackdrop(props: {
   src: string;
   screenW: number;
   screenH: number;
@@ -28,8 +37,134 @@ export function BlurredBackdrop(_props: {
   fill?: string;
   persistImage?: boolean;
 }) {
-  void _props;
-  return null;
+  // Mac path: native vibrancy does the work, this component renders nothing.
+  if (!isWindowsPlatform) return null;
+  return <WindowsBlurredBackdrop {...props} />;
+}
+
+function WindowsBlurredBackdrop({
+  src,
+  screenW,
+  screenH,
+  blurRadius = 24,
+  imageBrightness = 0.7,
+  tint = "rgba(34, 36, 35, 0.43)",
+  fill = "rgba(18, 19, 18, 0.17)",
+}: {
+  src: string;
+  screenW: number;
+  screenH: number;
+  blurRadius?: number;
+  zIndex?: number;
+  imageBrightness?: number;
+  tint?: string;
+  fill?: string;
+  persistImage?: boolean;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Background-position offset that anchors the bitmap so the panel shows
+  // the screen content directly behind itself. The bitmap covers the
+  // overlay's viewport; we shift it by the panel's screen-relative origin
+  // so each panel sees a window into the same global frame.
+  const [pos, setPos] = useState<{ left: number; top: number }>({
+    left: 0,
+    top: 0,
+  });
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const parent = el?.parentElement;
+    if (!el || !parent) return;
+    const update = () => {
+      const rect = parent.getBoundingClientRect();
+      setPos((prev) => {
+        const nextLeft = -rect.left;
+        const nextTop = -rect.top;
+        if (
+          Math.abs(prev.left - nextLeft) < 0.5 &&
+          Math.abs(prev.top - nextTop) < 0.5
+        ) {
+          return prev;
+        }
+        return { left: nextLeft, top: nextTop };
+      });
+    };
+    update();
+    // ResizeObserver catches CSS-driven size changes (edit-pill 36→280
+    // expansion, textarea auto-grow). MutationObserver catches inline-
+    // style changes (toolbar following the rect, chat panel drag). Between
+    // them, every position/size change React triggers fires an update
+    // without us needing a rAF loop per BlurredBackdrop instance.
+    const ro = new ResizeObserver(update);
+    ro.observe(parent);
+    const mo = new MutationObserver(update);
+    mo.observe(parent, {
+      attributes: true,
+      attributeFilter: ["style", "class"],
+    });
+    return () => {
+      ro.disconnect();
+      mo.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    // Window-level resize / scroll affect every panel's screen position, so
+    // sync all instances when those fire.
+    const onResize = () => {
+      const parent = ref.current?.parentElement;
+      if (!parent) return;
+      const rect = parent.getBoundingClientRect();
+      setPos({ left: -rect.left, top: -rect.top });
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  return (
+    <>
+      <div
+        ref={ref}
+        className="screenie-blurred-backdrop"
+        aria-hidden
+        style={{
+          position: "absolute",
+          inset: 0,
+          backgroundImage: `url(data:image/png;base64,${src})`,
+          backgroundSize: `${screenW}px ${screenH}px`,
+          backgroundPosition: `${pos.left}px ${pos.top}px`,
+          backgroundRepeat: "no-repeat",
+          filter: `blur(${blurRadius}px) brightness(${imageBrightness})`,
+          // Overshoot the blur radius so the blur kernel can sample pixels
+          // from beyond the panel's edge — without this, the blurred edge
+          // is darkened by the transparent border.
+          margin: -blurRadius,
+          zIndex: 0,
+          pointerEvents: "none",
+        }}
+      />
+      <div
+        aria-hidden
+        style={{
+          position: "absolute",
+          inset: 0,
+          background: tint,
+          zIndex: 0,
+          pointerEvents: "none",
+        }}
+      />
+      <div
+        aria-hidden
+        style={{
+          position: "absolute",
+          inset: 0,
+          background: fill,
+          zIndex: 0,
+          pointerEvents: "none",
+        }}
+      />
+    </>
+  );
 }
 
 /// Inset hairline that traces the parent's rounded edges. Originally an

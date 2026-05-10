@@ -37,7 +37,7 @@
 
 #![allow(non_snake_case)]
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter, WebviewWindow};
@@ -45,7 +45,7 @@ use tauri::{AppHandle, Emitter, WebviewWindow};
 use core::ffi::c_void;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -53,15 +53,20 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_ESCAPE,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, SetWindowDisplayAffinity,
+    CallNextHookEx, EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity,
     SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
-    GWL_EXSTYLE, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    GWL_EXSTYLE, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSLLHOOKSTRUCT,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+    WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 // `windows-rs 0.58` represents every HANDLE-style type as
@@ -112,6 +117,26 @@ static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TEXT_INPUT_FOCUSED: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_FOREGROUND_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Set true while a JS-driven drag is in progress. Mirrors macOS's
+/// `screenieOverlayMouseCaptureActive`. While set, the WH_MOUSE_LL hook
+/// stops toggling `WS_EX_TRANSPARENT` based on cursor position so the
+/// drag's mousemove/mouseup events keep flowing to our WebView even when
+/// the cursor leaves an interaction region.
+static MOUSE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Set true while a synthetic click/scroll is being relayed to the
+/// underlying app. Mirrors macOS's `screenieOverlayClickRelayActive`.
+/// While set, the mouse hook stops re-evaluating passthrough so the
+/// SendInput-posted event doesn't race the cursor-driven toggle.
+static CLICK_RELAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Generation counter so a stale relay's late-cleanup task can't reset
+/// state that a newer relay just installed.
+static CLICK_RELAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Background-change observer state. Mirrors macOS's space/window-list
+/// poll timer + `overlay-background-changed` emitter — drives the
+/// frosted-backdrop refresh on the React side when other windows move.
+static BG_OBSERVER_RUNNING: AtomicBool = AtomicBool::new(false);
+static BG_LAST_WINLIST_HASH: AtomicU64 = AtomicU64::new(0);
+static BG_LAST_SIGNAL_MS: AtomicU64 = AtomicU64::new(0);
 
 fn overlay_state() -> &'static Mutex<Option<OverlayState>> {
     OVERLAY.get_or_init(|| Mutex::new(None))
@@ -290,6 +315,196 @@ pub fn open_screen_settings() {
     }
 }
 
+/// Toggle the JS-driven mouse-capture flag. Mirrors macOS's
+/// `screenie_set_overlay_mouse_capture`. `useRectDrag` calls this with
+/// `true` on mousedown and `false` on mouseup. While active, the WH_MOUSE_LL
+/// hook stops toggling `WS_EX_TRANSPARENT`, so the in-flight drag's
+/// mousemove/mouseup events keep flowing to our WebView even after the
+/// cursor leaves the original interaction region.
+pub fn set_overlay_mouse_capture(active: bool) {
+    if active {
+        CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+        // Bump generation so any pending click-relay cleanup task
+        // doesn't later flip CLICK_RELAY_ACTIVE back to false a second
+        // time and steal the drag's receivable state.
+        CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+    MOUSE_CAPTURE_ACTIVE.store(active, Ordering::Release);
+    if active {
+        // Force the overlay receivable now — without this, a drag started
+        // while the cursor is inside a region but then drifts into empty
+        // overlay space would lose mousemove the moment the hook's
+        // cursor-driven toggle kicks in.
+        let info = if let Ok(g) = overlay_state().lock() {
+            g.as_ref().map(|s| (s.hwnd_raw, s.transparent_now))
+        } else {
+            None
+        };
+        if let Some((hwnd_raw, was_transparent)) = info {
+            if was_transparent {
+                set_transparent_now(hwnd_from_raw(hwnd_raw), false);
+            }
+        }
+    } else {
+        // Drag ended — re-evaluate transparency based on cursor position.
+        update_passthrough_from_cursor();
+    }
+}
+
+/// Synthesize a click at the current cursor position so the underlying app
+/// receives it. Mirrors macOS's
+/// `screenie_relay_overlay_click_at_current_mouse`. JS calls this when a
+/// mousedown on the captured rect turned out to be a click (no drag) — the
+/// rect is one of our interaction regions so the click landed on our
+/// WebView, but the user expected it to pass through to whatever app is
+/// behind the rect.
+///
+/// `button_number` matches `MouseEvent.button`: 0 = left, 1 = middle (mac
+/// quirk: 1 = right), 2 = right. The mac side maps 1 → right; we keep that
+/// quirk for parity with the JS callers.
+pub fn relay_overlay_pointer_click(button_number: i32) -> bool {
+    let hwnd_raw = match overlay_state().lock() {
+        Ok(g) => match g.as_ref() {
+            Some(s) => s.hwnd_raw,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let hwnd = hwnd_from_raw(hwnd_raw);
+
+    let generation = CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    CLICK_RELAY_ACTIVE.store(true, Ordering::Release);
+    MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    set_transparent_now(hwnd, true);
+
+    tauri::async_runtime::spawn(async move {
+        // Give the OS one beat to apply the WS_EX_TRANSPARENT change before
+        // the synthetic click is hit-tested. Without this, the click can
+        // race the style change and land back on our overlay (which would
+        // then see an injected event over a region — currently filtered
+        // out by `LLMHF_INJECTED`, but in any case wouldn't reach the
+        // intended underlying window).
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+        unsafe {
+            post_synthetic_click(button_number);
+        }
+        // Hold the relay flag long enough for the synthetic click to be
+        // dispatched and for the underlying app to process it (it'll
+        // typically activate via WM_MOUSEACTIVATE → MA_ACTIVATE). Then
+        // re-evaluate transparency from the cursor's current position.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        if CLICK_RELAY_GENERATION.load(Ordering::Acquire) == generation {
+            CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+            update_passthrough_from_cursor();
+        }
+    });
+    true
+}
+
+/// Synthesize a wheel event at the current cursor position. Mirrors macOS's
+/// `screenie_relay_overlay_scroll`. JS calls this from the rect's onWheel
+/// handler so scrolling inside the captured region scrolls the underlying
+/// app instead of being eaten by our WebView.
+pub fn relay_overlay_wheel(delta_x: f64, delta_y: f64) -> bool {
+    let hwnd_raw = match overlay_state().lock() {
+        Ok(g) => match g.as_ref() {
+            Some(s) => s.hwnd_raw,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let hwnd = hwnd_from_raw(hwnd_raw);
+
+    let generation = CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    CLICK_RELAY_ACTIVE.store(true, Ordering::Release);
+    MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    set_transparent_now(hwnd, true);
+
+    tauri::async_runtime::spawn(async move {
+        // Wheel events are less time-sensitive than clicks; a 1ms beat is
+        // enough for the style change to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        unsafe {
+            post_synthetic_wheel(delta_x, delta_y);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(24)).await;
+        if CLICK_RELAY_GENERATION.load(Ordering::Acquire) == generation {
+            CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+            update_passthrough_from_cursor();
+        }
+    });
+    true
+}
+
+/// Start the periodic background-change observer. Mirrors macOS's
+/// `screenie_install_overlay_deactivate_hider` + the `screenie_*_background_*`
+/// poll machinery. Hashes the visible top-level window list every 200 ms
+/// and emits `overlay-background-changed` to React when it changes — the
+/// frontend then refreshes the cached screenshot driving the frosted
+/// backdrops behind the panels. Idempotent.
+pub fn start_overlay_background_observer() {
+    if BG_OBSERVER_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    BG_LAST_WINLIST_HASH.store(0, Ordering::Relaxed);
+    BG_LAST_SIGNAL_MS.store(0, Ordering::Relaxed);
+
+    tauri::async_runtime::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(200));
+        // First tick fires immediately (tokio default). Skip it so we
+        // don't emit before React has had a chance to register the
+        // listener and seed its `lastSignature` cache.
+        interval.tick().await;
+        while BG_OBSERVER_RUNNING.load(Ordering::Acquire) {
+            interval.tick().await;
+            if !OVERLAY_VISIBLE.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            let next = unsafe { compute_winlist_hash() };
+            if next == 0 {
+                continue;
+            }
+            let last = BG_LAST_WINLIST_HASH.load(Ordering::Relaxed);
+            let changed = if last == 0 {
+                BG_LAST_WINLIST_HASH.store(next, Ordering::Relaxed);
+                false
+            } else if next != last {
+                BG_LAST_WINLIST_HASH.store(next, Ordering::Relaxed);
+                true
+            } else {
+                false
+            };
+
+            if changed {
+                let now = current_ms();
+                let last_signal = BG_LAST_SIGNAL_MS.load(Ordering::Relaxed);
+                // Match the macOS debounce so React's
+                // `suppressRefreshEventsUntilRef` window absorbs bursts.
+                if now.saturating_sub(last_signal) >= 50 {
+                    BG_LAST_SIGNAL_MS.store(now, Ordering::Relaxed);
+                    if let Ok(g) = overlay_app().lock() {
+                        if let Some(app) = g.as_ref() {
+                            let _ = app.emit_to(
+                                "overlay",
+                                "overlay-background-changed",
+                                (),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        BG_LAST_WINLIST_HASH.store(0, Ordering::Relaxed);
+        BG_LAST_SIGNAL_MS.store(0, Ordering::Relaxed);
+    });
+}
+
+pub fn stop_overlay_background_observer() {
+    BG_OBSERVER_RUNNING.store(false, Ordering::Release);
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
@@ -417,13 +632,29 @@ unsafe extern "system" fn mouse_hook_proc(
         let msg = wparam.0 as u32;
         if msg == WM_MOUSEMOVE {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            handle_mouse_move_screen(info.pt);
+            // Skip injected events. The click/wheel relay paths post
+            // synthetic input via SendInput; if we processed those here,
+            // the cursor-driven `WS_EX_TRANSPARENT` toggle would race the
+            // relay's own state machine and the synthetic event could
+            // land back on our overlay instead of the underlying app.
+            if (info.flags & LLMHF_INJECTED) == 0 {
+                handle_mouse_move_screen(info.pt);
+            }
         }
     }
     CallNextHookEx(HHOOK(core::ptr::null_mut()), code, wparam, lparam)
 }
 
 fn handle_mouse_move_screen(screen_pt: POINT) {
+    // Defer to the JS-driven drag / relay state machines when one of them
+    // owns the cursor. Mirrors macOS's `screenieOverlayMouseCaptureActive`
+    // / `screenieOverlayClickRelayActive` short-circuits in
+    // `screenie_update_overlay_mouse_passthrough`.
+    if MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed)
+        || CLICK_RELAY_ACTIVE.load(Ordering::Relaxed)
+    {
+        return;
+    }
     // Take a snapshot under the lock, then release before doing the
     // SetWindowLongPtrW call. Low-level hooks have a strict timeout
     // (`LowLevelHooksTimeout`, default 300 ms) — if the proc takes longer,
@@ -533,4 +764,164 @@ fn enable_dark_mode(hwnd: HWND) {
             std::mem::size_of_val(&dark) as u32,
         );
     }
+}
+
+unsafe fn post_synthetic_click(button_number: i32) {
+    // Match the mac mapping: 0 = left, 1 = right, 2 = middle. Anything
+    // else falls back to left so unexpected JS button values don't post
+    // an unintended right-click.
+    let (down_flag, up_flag) = match button_number {
+        1 => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        2 => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+    };
+    let down = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: down_flag,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let up = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: up_flag,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [down, up];
+    SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+}
+
+unsafe fn post_synthetic_wheel(delta_x: f64, delta_y: f64) {
+    // CSS deltaY > 0 = scroll down (content moves up). Windows wheel > 0 =
+    // forward = away from user = content scrolls down. Same sign convention,
+    // so DON'T negate — opposite of macOS's `CGScrollEventUnitPixel` path
+    // which uses an inverted Y sign.
+    //
+    // Windows wheel units are 1/WHEEL_DELTA notches (WHEEL_DELTA = 120). Pass
+    // CSS-pixel delta directly so 120 px of CSS delta produces one notch.
+    let mut wheel_y = (-delta_y).round() as i32;
+    let mut wheel_x = (-delta_x).round() as i32;
+    if wheel_y == 0 && delta_y.abs() > 0.01 {
+        wheel_y = if delta_y > 0.0 { -1 } else { 1 };
+    }
+    if wheel_x == 0 && delta_x.abs() > 0.01 {
+        wheel_x = if delta_x > 0.0 { -1 } else { 1 };
+    }
+
+    if wheel_y != 0 {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: wheel_y as u32,
+                    dwFlags: MOUSEEVENTF_WHEEL,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+    if wheel_x != 0 {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: wheel_x as u32,
+                    dwFlags: MOUSEEVENTF_HWHEEL,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// FNV-1a–style 64-bit hash mix. Same shape as macOS's `screenie_hash_mix`
+/// so the conceptual "fingerprint comparison" path matches across platforms.
+fn hash_mix(hash: u64, value: u64) -> u64 {
+    hash ^ value
+        .wrapping_add(0x9e3779b97f4a7c15)
+        .wrapping_add(hash << 6)
+        .wrapping_add(hash >> 2)
+}
+
+fn current_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Enumerate all visible top-level windows owned by other processes and
+/// hash their (hwnd, owner pid, rect) tuples. Mirrors macOS's
+/// `screenie_overlay_background_window_fingerprint` which uses
+/// `CGWindowListCopyWindowInfo`. The hash changes whenever windows move,
+/// resize, appear, or disappear behind our overlay; a change triggers a
+/// frosted-backdrop refresh on the JS side.
+unsafe fn compute_winlist_hash() -> u64 {
+    struct WinlistState {
+        hash: u64,
+        own_pid: u32,
+        included: u32,
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut WinlistState);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return TRUE;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 || pid == state.own_pid {
+            return TRUE;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return TRUE;
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        if w <= 1 || h <= 1 {
+            return TRUE;
+        }
+        state.included += 1;
+        state.hash = hash_mix(state.hash, hwnd.0 as u64);
+        state.hash = hash_mix(state.hash, pid as u64);
+        state.hash = hash_mix(state.hash, rect.left as i64 as u64);
+        state.hash = hash_mix(state.hash, rect.top as i64 as u64);
+        state.hash = hash_mix(state.hash, w as u64);
+        state.hash = hash_mix(state.hash, h as u64);
+        TRUE
+    }
+
+    let mut state = WinlistState {
+        hash: 1469598103934665603u64,
+        own_pid: std::process::id(),
+        included: 0,
+    };
+    let _ = EnumWindows(
+        Some(enum_cb),
+        LPARAM(&mut state as *mut _ as isize),
+    );
+    hash_mix(state.hash, state.included as u64)
 }

@@ -4,6 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <ApplicationServices/ApplicationServices.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <math.h>
@@ -1320,6 +1321,56 @@ static void screenie_note_global_mouse_click_for_refresh(NSEvent *event) {
   }
 }
 
+/// When a mouseDown happens through the overlay's empty-space passthrough
+/// (cursor outside every interaction region, `ignoresMouseEvents` already
+/// YES), the click already reached the underlying app — but our
+/// nonactivating panel keeps system-wide key-window status, so the next
+/// keystroke goes to our overlay's prompt textarea instead of the app the
+/// user just clicked. Mirror the explicit click-relay path: snapshot the
+/// PID under the cursor and `activateWithOptions:0` the target so keyboard
+/// focus follows the click. Without this, switching browser tabs through
+/// the overlay required a second click before keyboard shortcuts worked.
+static void screenie_activate_app_on_passthrough_click(NSEvent *event) {
+  if (event == nil ||
+      screenieOverlayWindow == nil ||
+      ![screenieOverlayWindow isVisible] ||
+      !screenieOverlayPassthroughEnabled ||
+      screenieOverlayMouseCaptureActive ||
+      screenieOverlayClickRelayActive) {
+    return;
+  }
+  if (!screenie_event_is_mouse_down([event type])) {
+    return;
+  }
+  // Inside an overlay region → overlay handles the click via the local
+  // monitor; nothing for us to do. Belt-and-braces: the global monitor
+  // only fires for events delivered to OTHER apps, so reaching here
+  // already implies the click went through.
+  if (screenie_overlay_mouse_is_inside_region([NSEvent mouseLocation])) {
+    return;
+  }
+
+  CGPoint cg;
+  if (!screenie_current_cg_mouse_location(&cg)) {
+    return;
+  }
+  pid_t targetPid = screenie_app_pid_at_cg_point(cg);
+  if (targetPid <= 0 || targetPid == getpid()) {
+    return;
+  }
+  NSRunningApplication *target =
+      [NSRunningApplication runningApplicationWithProcessIdentifier:targetPid];
+  if (target == nil || [target isActive]) {
+    return;
+  }
+  // `activateWithOptions:0` does NOT raise the target's windows — our
+  // status-level overlay stays visually on top. It just hands key-window
+  // status to the target's frontmost window so subsequent keystrokes
+  // follow the click. Same call shape as the explicit click-relay path
+  // (`screenie_relay_overlay_click_at_current_mouse`).
+  [target activateWithOptions:0];
+}
+
 static void screenie_enable_overlay_mouse_for_interaction(void) {
   if (screenieOverlayWindow == nil || ![screenieOverlayWindow isVisible]) {
     return;
@@ -1455,6 +1506,11 @@ static void screenie_install_overlay_mouse_monitors(void) {
                                                handler:^(NSEvent *event) {
       screenie_update_overlay_mouse_passthrough();
       screenie_note_global_mouse_click_for_refresh(event);
+      // Hand key-window status to whichever app the user just clicked
+      // through to. Without this, our nonactivating panel keeps key
+      // status and the next keystroke goes to the overlay textarea
+      // instead of the app the user is now interacting with.
+      screenie_activate_app_on_passthrough_click(event);
     }];
   }
 
@@ -1662,6 +1718,8 @@ static CGEventRef screenie_overlay_escape_event_tap(CGEventTapProxy proxy,
   return screenieOverlayEscapeCallback() ? NULL : event;
 }
 
+static bool screenieAccessibilityPrompted = false;
+
 static bool screenie_install_overlay_escape_event_tap(void) {
   if (screenieOverlayEscapeEventTap != NULL) {
     CGEventTapEnable(screenieOverlayEscapeEventTap, true);
@@ -1679,6 +1737,24 @@ static bool screenie_install_overlay_escape_event_tap(void) {
   if (screenieOverlayEscapeEventTap == NULL) {
     NSLog(@"[screenie] escape event tap unavailable; Accessibility permission "
           "is likely missing");
+    // The tap is the ONLY path that prevents Esc from also reaching the
+    // app under the overlay. Without it, Esc still closes our overlay
+    // (the NSEvent global monitor's observe-only path fires the
+    // callback) but Esc ALSO reaches the active app — fullscreen
+    // Safari/Chrome unfullscreens, slide presentations exit, etc. Surface
+    // the macOS Accessibility prompt once per launch so the user has a
+    // one-click path to grant. The OS no-ops when already trusted, and
+    // dedupes the dialog if the user has already dismissed it. Gating
+    // with `screenieAccessibilityPrompted` just keeps us from invoking
+    // the API on every overlay show — the OS would suppress the dialog
+    // anyway, but skipping the call is tidier.
+    if (!screenieAccessibilityPrompted) {
+      screenieAccessibilityPrompted = true;
+      NSDictionary *options = @{
+        (__bridge id)kAXTrustedCheckOptionPrompt: @YES,
+      };
+      (void)AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+    }
     return false;
   }
 

@@ -111,7 +111,54 @@ extern "C" {
 /// app icon, by contrast, is read straight from the bundled `.icns` by
 /// macOS — we deliberately do not override it at runtime so Settings,
 /// Onboarding, and the Dock all show the same artwork the bundle ships.
+///
+/// On Windows there's no template-image behavior — the tray renders the
+/// RGBA pixels as-is. The bundled PNG is white-on-transparent (sized for
+/// a dark taskbar); on a light taskbar that's invisible. We handle this
+/// by inverting RGB at runtime in `tray_icon_for_theme` when the system
+/// is on light theme.
 const TRAY_ICON_PNG: &[u8] = include_bytes!("../icons/tray-icon.png");
+
+/// Pick the right tray icon bytes for the current system theme.
+///
+/// - macOS: returns the bundled white-on-transparent glyph unchanged.
+///   `icon_as_template(true)` set on the tray builder tells AppKit to use
+///   only the alpha channel and tint based on the menu bar color.
+/// - Windows: inverts RGB on light theme so the glyph becomes
+///   black-on-transparent — visible against a light taskbar. Dark theme
+///   uses the bundled glyph as-is.
+///
+/// Returns the constructed `tauri::image::Image` owned (lifetime
+/// `'static`) so the caller can hand it to `set_icon` without keeping the
+/// backing buffer alive separately.
+fn tray_icon_for_theme(theme: tauri::Theme) -> Result<tauri::image::Image<'static>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let img = image::load_from_memory(TRAY_ICON_PNG)
+            .map_err(|e| format!("decode tray icon: {e}"))?;
+        let mut rgba = img.to_rgba8();
+        if matches!(theme, tauri::Theme::Light) {
+            // Light taskbar → need a DARK glyph. Pure white inverts to
+            // pure black; anti-aliased edges (partial whites) invert to
+            // the corresponding partial darks, preserving the silhouette.
+            // Alpha channel untouched so the transparent background stays
+            // transparent.
+            for pixel in rgba.pixels_mut() {
+                pixel[0] = 255 - pixel[0];
+                pixel[1] = 255 - pixel[1];
+                pixel[2] = 255 - pixel[2];
+            }
+        }
+        let (w, h) = rgba.dimensions();
+        Ok(tauri::image::Image::new_owned(rgba.into_raw(), w, h))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = theme;
+        tauri::image::Image::from_bytes(TRAY_ICON_PNG)
+            .map_err(|e| format!("decode tray icon: {e}"))
+    }
+}
 
 #[cfg(target_os = "macos")]
 static OVERLAY_ESCAPE_APP: OnceLock<Mutex<Option<AppHandle>>> = OnceLock::new();
@@ -804,9 +851,12 @@ fn close_overlay_now(app: &AppHandle) {
     #[cfg(target_os = "windows")]
     {
         // Mirror of the macOS cleanup: pull down the keyboard + mouse hooks,
-        // drop any passthrough region state, and forget the snapshotted
-        // foreground app. Without this the low-level hooks would keep
-        // intercepting Esc system-wide while the overlay is hidden.
+        // drop any passthrough region state, forget the snapshotted
+        // foreground app, and stop the background-change observer. Without
+        // these, the low-level hooks would keep intercepting Esc system-wide
+        // while the overlay is hidden and the poll task would keep emitting
+        // refresh events into the void.
+        windows_window::stop_overlay_background_observer();
         windows_window::clear_overlay_interaction_regions();
         windows_window::forget_previous_app();
         windows_window::uninstall_overlay_escape_monitor();
@@ -895,7 +945,15 @@ fn set_overlay_mouse_capture(window: WebviewWindow, active: bool) -> Result<(), 
     {
         set_overlay_mouse_capture_on_main(&window, active);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Match the macOS path: forward the JS-driven drag state to the
+        // native side so the WH_MOUSE_LL hook stops re-evaluating
+        // `WS_EX_TRANSPARENT` from the cursor position until the drag ends.
+        let _ = &window;
+        windows_window::set_overlay_mouse_capture(active);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = active;
     }
@@ -909,7 +967,16 @@ fn relay_overlay_pointer_click(window: WebviewWindow, button: i32) -> Result<(),
     {
         relay_overlay_pointer_click_on_main(&window, button);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Mirror of the macOS click-relay: temporarily set
+        // `WS_EX_TRANSPARENT` on the overlay and SendInput a synthetic
+        // click at the cursor so the app underneath receives it (and
+        // activates normally via WM_MOUSEACTIVATE).
+        let _ = &window;
+        windows_window::relay_overlay_pointer_click(button);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = button;
     }
@@ -923,7 +990,12 @@ fn relay_overlay_wheel(window: WebviewWindow, delta_x: f64, delta_y: f64) -> Res
     {
         relay_overlay_wheel_on_main(&window, delta_x, delta_y);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = &window;
+        windows_window::relay_overlay_wheel(delta_x, delta_y);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (delta_x, delta_y);
     }
@@ -1477,11 +1549,16 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     // Mirror of the macOS `show_overlay_window` setup: configure the window
     // styles + exclude-self capture flag, show it without activating, push it
     // to topmost, and install the low-level keyboard + mouse hooks (Esc
-    // consumption and per-region click-through).
+    // consumption and per-region click-through). Also start the background-
+    // change observer — the Windows analogue of macOS's
+    // `screenie_install_overlay_deactivate_hider` + space/window-list poll —
+    // which emits `overlay-background-changed` to React whenever the visible
+    // top-level window list changes, so the frosted backdrop stays fresh.
     windows_window::configure_overlay_window(window, app);
     let _ = window.show();
     windows_window::order_overlay_window(window);
     let _ = windows_window::install_overlay_escape_monitor();
+    windows_window::start_overlay_background_observer();
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1713,7 +1790,15 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&settings_item, &separator, &quit_item])?;
 
     let mut tray_builder = TrayIconBuilder::with_id("main");
-    match tauri::image::Image::from_bytes(TRAY_ICON_PNG) {
+    // Snapshot the system theme so we ship the right glyph from the very
+    // first paint. Falls back to Dark when the main window isn't available
+    // yet (rare — Tauri builds declared windows before .setup runs — but
+    // safer than panicking). Mac path ignores the theme arg internally.
+    let theme = app
+        .get_webview_window("main")
+        .and_then(|w| w.theme().ok())
+        .unwrap_or(tauri::Theme::Dark);
+    match tray_icon_for_theme(theme) {
         Ok(icon) => {
             tray_builder = tray_builder.icon(icon);
         }
@@ -2211,9 +2296,19 @@ async fn open_chat_window(
     .always_on_top(true)
     .skip_taskbar(true)
     .visible(true);
-    let _chat_win = chat_builder
+    let chat_win = chat_builder
         .build()
         .map_err(|e| format!("chat window: {e}"))?;
+    #[cfg(target_os = "windows")]
+    {
+        // Tauri's `WindowEffect::Sidebar` above is macOS-only; on Windows it's
+        // silently ignored, so the borderless transparent chat window would
+        // render with no backdrop at all. Apply Mica via DWM here so the
+        // detached chat panel gets a live frosted-glass background that
+        // matches the macOS sidebar vibrancy.
+        windows_window::configure_main_window(&chat_win);
+    }
+    let _ = chat_win;
     Ok(())
 }
 
@@ -2378,6 +2473,27 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             let _ = hide_settings_window(h).await;
                         });
+                    }
+                    // Windows tray glyph needs an explicit RGB swap on
+                    // light/dark theme changes — `icon_as_template` is a
+                    // no-op there, so a white glyph would otherwise stay
+                    // invisible after the user flips to a light taskbar.
+                    // On macOS the template flag handles it automatically,
+                    // so this branch is Windows-only.
+                    #[cfg(target_os = "windows")]
+                    if let WindowEvent::ThemeChanged(theme) = event {
+                        if let Some(tray) = app_handle.tray_by_id("main") {
+                            match tray_icon_for_theme(*theme) {
+                                Ok(icon) => {
+                                    let _ = tray.set_icon(Some(icon));
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[screenie] tray icon swap on theme change failed: {e}"
+                                    );
+                                }
+                            }
+                        }
                     }
                 });
             }
