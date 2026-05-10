@@ -1,0 +1,202 @@
+:root {
+  /* Theme tokens — inherited by the settings panel. The onboarding root
+     re-declares its own scoped copies but uses the same names so cross-view
+     styling stays consistent. */
+  --bg: #ffffff;
+  --bg-app: #f6f6f6;
+  --surface: #f5f5f7;
+  --surface-2: #ebebed;
+  --ink: #0a0a0b;
+  --ink-2: #4b4b52;
+  --ink-3: #8e8e93;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --section-bg: rgba(0, 0, 0, 0.04);
+  --error-bg: #fef2f2;
+  --error-border: #fca5a5;
+  --error-text: #991b1b;
+  --primary-bg: #2563eb;
+  --primary-border: #1d4ed8;
+  --primary-text: #ffffff;
+  --status-ok-bg: rgba(22, 163, 74, 0.13);
+  --status-ok-text: #15803d;
+  --status-neutral-bg: rgba(156, 163, 175, 0.13);
+  --status-neutral-text: #6b7280;
+
+  color-scheme: light dark;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Inter,
+    Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+  color: var(--ink);
+}
+
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-app: #f6f6f6;
+  --surface: #f5f5f7;
+  --surface-2: #ebebed;
+  --ink: #0a0a0b;
+  --ink-2: #4b4b52;
+  --ink-3: #8e8e93;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --section-bg: rgba(0, 0, 0, 0.04);
+  --error-bg: #fef2f2;
+  --error-border: #fca5a5;
+  --error-text: #991b1b;
+  --primary-bg: #2563eb;
+  --primary-border: #1d4ed8;
+  --primary-text: #ffffff;
+  --status-ok-bg: rgba(22, 163, 74, 0.13);
+  --status-ok-text: #15803d;
+  --status-neutral-bg: rgba(156, 163, 175, 0.13);
+  --status-neutral-text: #6b7280;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0a0a0b;
+  --bg-app: #0a0a0b;
+  --surface: #18181b;
+  --surface-2: #232326;
+  --ink: #fafafa;
+  --ink-2: #b4b4b8;
+  --ink-3: #6b6b70;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --section-bg: rgba(255, 255, 255, 0.04);
+  --error-bg: rgba(254, 226, 226, 0.06);
+  --error-border: rgba(252, 165, 165, 0.32);
+  --error-text: #fca5a5;
+  --primary-bg: #3b82f6;
+  --primary-border: #2563eb;
+  --primary-text: #ffffff;
+  --status-ok-bg: rgba(34, 197, 94, 0.18);
+  --status-ok-text: #4ade80;
+  --status-neutral-bg: rgba(156, 163, 175, 0.18);
+  --status-neutral-text: #9ca3af;
+}
+
+/* The settings + onboarding window is configured with macOS NSVisualEffectView
+   ("sidebar" material) behind the WebView (see tauri.conf.json). For that
+   frosted base to actually show through, html and #root must be fully
+   transparent — any opaque layer here masks the OS effect and the result
+   reads as "flat solid panel" rather than "frosted glass". The overlay
+   window already overrides html to transparent inline from main.tsx, so
+   this rule only affects settings/onboarding. */
+html {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+  overflow: hidden;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+}
+
+/* Body is fully transparent — the settings shell paints its own dark
+   frosted overlay on top, exactly the way the chat panel does. The
+   overlay's WebView body was already styled this way by main.tsx for
+   the overlay window; this rule lines up the settings window with the
+   same approach. */
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+/* Disable text selection by default; only true textfields opt back in.
+   Highlighting on titles, labels, AI markdown bubbles, history rows etc.
+   reads as accidental — every "I want to copy this" path in this app
+   goes through an explicit Copy button instead. */
+html {
+  -webkit-user-select: none;
+  user-select: none;
+}
+input,
+textarea,
+[contenteditable="true"],
+[contenteditable=""] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #0a0a0b;
+    --bg-app: #0a0a0b;
+    --surface: #18181b;
+    --surface-2: #232326;
+    --ink: #fafafa;
+    --ink-2: #b4b4b8;
+    --ink-3: #6b6b70;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.18);
+    --section-bg: rgba(255, 255, 255, 0.04);
+    --error-bg: rgba(254, 226, 226, 0.06);
+    --error-border: rgba(252, 165, 165, 0.32);
+    --error-text: #fca5a5;
+    --primary-bg: #3b82f6;
+    --primary-border: #2563eb;
+    --primary-text: #ffffff;
+    --status-ok-bg: rgba(34, 197, 94, 0.18);
+    --status-ok-text: #4ade80;
+    --status-neutral-bg: rgba(156, 163, 175, 0.18);
+    --status-neutral-text: #9ca3af;
+  }
+}
+
+input,
+button,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  border: 0;
+  background: transparent;
+  outline: none;
+  color: inherit;
+  margin: 0;
+  padding: 0;
+  box-shadow: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* Scrollbars are completely hidden — overlays don't show OS scroll
+   chrome. Scrolling still works (overflow auto / scroll), just without
+   any visible track or thumb. */
+::-webkit-scrollbar,
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-track-piece,
+::-webkit-scrollbar-thumb,
+::-webkit-scrollbar-button,
+::-webkit-scrollbar-corner,
+::-webkit-resizer {
+  display: none;
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}

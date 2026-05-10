@@ -1,0 +1,1492 @@
+/* settings.css — chat-overlay-style frosted glass redesign.
+
+   The settings window now reads as a larger sibling of the detached
+   chat panel (`.screenie-chat-panel` in overlay.css): same heavy dark
+   frost recipe, same 24px rounded shell, same white-on-translucent
+   ink palette, same chat-prompt-pill input shape, same flat icon
+   buttons.
+
+   The original sidebar nav and every functional control is preserved;
+   only the visual recipe changed. */
+
+/* Window-drag surfaces. Mousedown on any of these starts a native
+   Tauri window drag (see startWindowDragFromEmptySpace). Default
+   cursor stays default + selection disabled so the I-beam doesn't
+   stick on screen during the drag. */
+.settings-shell,
+.settings-sidebar,
+.settings-main,
+.settings-section,
+.settings-brand,
+.settings-nav,
+.settings-sidebar-footer,
+.settings-page-header,
+.settings-card,
+.settings-card-header,
+.settings-row,
+.settings-row-label,
+.settings-row-help,
+.settings-page-title,
+.settings-page-description,
+.settings-card-title,
+.settings-card-description,
+.settings-brand-title,
+.settings-brand-subtitle,
+.settings-stat,
+.settings-stat-label,
+.settings-stat-value,
+.settings-note {
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* === Shell ====================================================== */
+.settings-shell {
+  position: fixed;
+  inset: 0;
+  width: auto;
+  height: auto;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  /* `1fr` fills the remaining height after the shell's top padding.
+     The sidebar+main extend to the shell's rounded bottom corner —
+     no bottom inset — so there's no dark chrome strip below the
+     last control. */
+  grid-template-rows: 1fr;
+  gap: 0;
+  padding: 14px 0 0 14px;
+  border-radius: 24px;
+
+  /* Live frosted glass — no captured bitmap. The macOS native
+     `windowEffects: ["sidebar"]` (configured in tauri.conf.json) and
+     this `backdrop-filter` together blur the desktop visible behind
+     the window in real time, so moving other windows around updates
+     the frost without a re-capture. The dark CSS background tint
+     darkens the result to match the chat panel's heavy aesthetic. */
+  background: rgba(28, 30, 29, 0.50);
+  border: none;
+  outline: none;
+  box-shadow: none;
+  -webkit-backdrop-filter: blur(38px) saturate(140%) brightness(0.78);
+  backdrop-filter: blur(38px) saturate(140%) brightness(0.78);
+  isolation: isolate;
+
+  /* White-on-dark ink palette tuned to match the chat panel's
+     surface contrast. Used by every settings control downstream. */
+  --bg: rgba(255, 255, 255, 0.06);
+  --bg-app: transparent;
+  --surface: rgba(255, 255, 255, 0.06);
+  --surface-2: rgba(255, 255, 255, 0.12);
+  --ink: rgba(255, 255, 255, 0.92);
+  --ink-2: rgba(255, 255, 255, 0.72);
+  --ink-3: rgba(255, 255, 255, 0.5);
+  --border: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.20);
+  --section-bg: rgba(255, 255, 255, 0.05);
+  --hairline: rgba(255, 255, 255, 0.06);
+  --error-bg: rgba(255, 80, 80, 0.16);
+  --error-border: rgba(255, 200, 200, 0.32);
+  --error-text: rgba(255, 200, 200, 0.95);
+  --primary-bg: #3b82f6;
+  --primary-border: #2563eb;
+  --primary-text: #ffffff;
+  --status-ok-bg: rgba(34, 197, 94, 0.18);
+  --status-ok-text: #4ade80;
+  --status-neutral-bg: rgba(255, 255, 255, 0.10);
+  --status-neutral-text: rgba(255, 255, 255, 0.66);
+
+  color: var(--ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+/* Solid-fill fallback only renders when backdrop-filter is unavailable
+   (rare on macOS / Windows). When backdrop-filter IS supported (the
+   common case), the fallback div must be `display: none` — otherwise
+   a default static `<div>` participates in the grid auto-placement
+   and hogs cell (1,1), pushing the sidebar to column 2 and main to
+   an implicit row 2 below the viewport (blank-screen bug). */
+.settings-chat-frost-fallback {
+  display: none;
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .settings-chat-frost-fallback {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    border-radius: inherit;
+    background: rgba(28, 30, 29, 0.92);
+  }
+}
+
+/* Lift shell children above the @supports-not solid-fill fallback
+   (z-index: 0). The close button rides above everything (250); it
+   is excluded from this z-index:1 rule so its own higher z-index
+   can't be downgraded by specificity. */
+.settings-shell
+  > :not(.settings-chat-frost-fallback):not(.screenie-blurred-backdrop):not(.settings-close-btn) {
+  z-index: 1;
+}
+
+.settings-shell * {
+  box-sizing: border-box;
+}
+
+/* === Close affordance — top-right of the entire app =============== */
+/* Pinned to viewport via `position: fixed` so it sits above both the
+   sidebar and main content. The 24x24 hit target is generous, the X
+   glyph is slightly larger than the chat panel's inline close (size 11
+   vs 8) since this button is the only chrome on the panel and needs to
+   read clearly without crowding. */
+.settings-close-btn {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 250;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1;
+  pointer-events: auto;
+  transition: background 140ms ease, color 140ms ease, transform 140ms ease;
+}
+.settings-close-btn:hover {
+  background: rgba(255, 255, 255, 0.26);
+  color: #ffffff;
+}
+.settings-close-btn:active {
+  background: rgba(255, 255, 255, 0.34);
+  transform: scale(0.94);
+}
+
+/* === Sidebar ==================================================== */
+.settings-sidebar {
+  position: relative;
+  /* The sidebar reads as a rounded floating pebble inside the shell.
+     `height: calc(100% - 14px)` keeps the sidebar 14px shorter than
+     the grid row so it has equal 14px breathing room on top, left,
+     AND bottom — matching the 14px shell inset. `border-radius: 16px`
+     rounds the pebble's corners; `overflow: hidden` clips internal
+     overflow so long nav lists scroll inside the rounded boundary. */
+  align-self: stretch;
+  margin: 0 0 14px;
+  height: auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 18px 14px 18px 18px;
+  background: rgba(255, 255, 255, 0.045);
+  border: none;
+  border-radius: 16px;
+  isolation: isolate;
+}
+
+.settings-sidebar > :not(.screenie-blurred-backdrop) {
+  position: relative;
+  z-index: 1;
+}
+
+.settings-sidebar .settings-nav {
+  overflow-y: auto;
+  margin-right: -4px;
+  padding-right: 4px;
+}
+
+.settings-brand {
+  padding: 0 4px;
+}
+
+.settings-brand-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.005em;
+  color: rgba(255, 255, 255, 0.96);
+}
+
+.settings-brand-subtitle {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.settings-nav {
+  --settings-nav-step: 34px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Active-row indicator — translucent white tint that slides between
+   slots, the same hover-row idiom the chat overlay uses on history
+   rows and dropdown options. */
+.settings-nav-indicator {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 32px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.10);
+  pointer-events: none;
+  transform: translateY(calc(var(--active-nav-index, 0) * var(--settings-nav-step)));
+  transition: transform 210ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.settings-nav-btn {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 9px;
+  color: rgba(255, 255, 255, 0.62);
+  background: transparent;
+  text-align: left;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  cursor: pointer;
+  font-family: inherit;
+  transition: color 140ms ease;
+}
+
+.settings-nav-btn:hover {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.settings-nav-btn[data-active="true"] {
+  color: rgba(255, 255, 255, 0.98);
+  font-weight: 550;
+}
+
+.settings-sidebar-footer {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 4px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+/* === Main scroll area ============================================ */
+.settings-main {
+  position: relative;
+  width: 100%;
+  max-width: 920px;
+  justify-self: center;
+  /* `min-height: 0` + `height: 100%` lets main fill the grid row
+     exactly (= 100vh − shell padding). `overflow-y: auto` keeps long
+     content scrolling internally — the panel itself never expands. */
+  height: 100%;
+  min-height: 0;
+  /* Top padding clears the close-button cluster; right padding gives
+     the close button room without overlapping prose. */
+  padding: 26px 40px 14px;
+  overflow-y: auto;
+}
+
+.settings-section {
+  display: none;
+}
+
+.settings-section[data-active="true"] {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* === Page header ================================================ */
+.settings-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 2px;
+}
+
+.settings-page-title {
+  margin: 0;
+  font-size: 24px;
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.96);
+}
+
+.settings-page-description {
+  margin: 8px 0 0;
+  max-width: 640px;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* === Cards (borderless plates) ================================== */
+.settings-card {
+  width: 100%;
+  padding: 18px 20px;
+  border-radius: 16px;
+  display: flex;
+  flex-direction: column;
+  /* Subtle translucent plate over the panel's heavy frost — no
+     outer border, just a gentle wash that lets the desktop bitmap
+     read through. */
+  background: rgba(255, 255, 255, 0.045);
+  border: none;
+}
+
+.settings-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.settings-card-title {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.25;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.settings-card-description {
+  margin: 4px 0 0;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* === Stats grid ================================================== */
+.settings-status-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.settings-stat {
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.settings-stat-label {
+  display: block;
+  color: rgba(255, 255, 255, 0.52);
+  font-size: 10.5px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+.settings-stat-value {
+  display: block;
+  margin-top: 5px;
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 13px;
+  line-height: 1.35;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* Matches the 18px gap the section uses between its vertical
+     cards — so the horizontal split reads with the same rhythm as
+     the rest of the page. */
+  gap: 18px;
+}
+
+/* === Provider grid ============================================== */
+.settings-provider-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.settings-provider-option {
+  min-height: 84px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.92);
+  text-align: left;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 140ms ease;
+}
+
+.settings-provider-option:hover {
+  background: rgba(255, 255, 255, 0.10);
+}
+
+/* Selected provider — bright translucent surface, like the chat
+   panel's user message bubble (high-contrast on the dark frost). */
+.settings-provider-option[data-active="true"] {
+  background: rgba(255, 255, 255, 0.20);
+}
+
+.settings-provider-option[data-active="true"] .settings-provider-label {
+  color: rgba(255, 255, 255, 0.98);
+}
+
+.settings-provider-option[data-active="true"] .settings-provider-detail {
+  color: rgba(255, 255, 255, 0.74);
+}
+
+.settings-provider-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.settings-provider-detail {
+  display: block;
+  margin-top: 6px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+/* === Rows (label + control) ==================================== */
+.settings-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.9fr) minmax(260px, 1.1fr);
+  gap: 18px;
+  align-items: center;
+  padding: 14px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.settings-row:first-child {
+  padding-top: 4px;
+  border-top: none;
+}
+
+.settings-row:last-child {
+  padding-bottom: 0;
+}
+
+.settings-row-label {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  font-weight: 550;
+  line-height: 1.35;
+}
+
+.settings-row-help {
+  margin: 4px 0 0;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.settings-control {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.settings-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+}
+
+/* === Inputs (chat prompt-pill style) ============================= */
+.settings-input {
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.92);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 12.5px;
+  line-height: 1.35;
+  outline: none;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.settings-input::placeholder {
+  color: rgba(255, 255, 255, 0.38);
+}
+
+.settings-input:focus {
+  background: rgba(255, 255, 255, 0.10);
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+.settings-input-with-action {
+  position: relative;
+  width: 100%;
+}
+
+.settings-input-with-action .settings-input {
+  padding-right: 38px;
+}
+
+.settings-input-eye {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease;
+}
+
+.settings-input-eye:hover {
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.settings-input-eye:active {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* === Buttons (chat-style pills) ================================ */
+.settings-button {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 140ms ease, color 140ms ease, transform 140ms ease;
+}
+
+.settings-button:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.settings-button:active {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.settings-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.settings-button-icon {
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+}
+
+.settings-button-icon svg {
+  display: block;
+}
+
+/* Primary action — dark fill on white text, mirroring the chat
+   `.screenie-send` button's high-contrast solid pill. */
+.settings-button-primary {
+  background: rgba(255, 255, 255, 0.94);
+  color: #0a0a0b;
+}
+
+.settings-button-primary:hover {
+  background: #ffffff;
+}
+
+.settings-button-primary:active {
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.settings-button-danger {
+  color: rgba(255, 200, 200, 0.95);
+  background: rgba(255, 80, 80, 0.18);
+}
+
+.settings-button-danger:hover {
+  background: rgba(255, 80, 80, 0.32);
+  color: rgba(255, 220, 220, 1);
+}
+
+/* === Status pill ================================================ */
+.settings-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral-text);
+  white-space: nowrap;
+  /* Bound width so a long uppercased label can't push the card
+     header layout. */
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-status-pill[data-good="true"] {
+  background: var(--status-ok-bg);
+  color: var(--status-ok-text);
+}
+
+.settings-status-pill[data-warning="true"] {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+}
+
+/* Light-on-dark pill modifier — used by the Usage card's running
+   total so the cost figure reads with the same off-white + black-ink
+   idiom the chat panel uses for user bubbles, distinguishing it from
+   the neutral "Not set" pills elsewhere on the page. */
+.settings-status-pill-light {
+  background: rgba(245, 246, 250, 0.94);
+  color: rgba(18, 18, 16, 0.96);
+}
+
+.settings-alert {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: var(--error-bg);
+  color: var(--error-text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-alert button {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+
+/* === Segmented control (dark pill) ============================== */
+.settings-segmented {
+  position: relative;
+  width: 100%;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 3px;
+  padding: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.settings-segmented-indicator {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  pointer-events: none;
+  transition:
+    transform 210ms cubic-bezier(0.22, 0.61, 0.36, 1),
+    width 210ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.settings-segmented-btn {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  min-height: 26px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  transition: color 140ms ease;
+}
+
+.settings-segmented-btn:hover {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.settings-segmented-btn[data-active="true"] {
+  color: rgba(255, 255, 255, 0.98);
+}
+
+/* === Toggle (dark track + white knob) =========================== */
+.settings-toggle {
+  width: 40px;
+  height: 24px;
+  position: relative;
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  cursor: pointer;
+  transition: background 180ms ease;
+}
+
+.settings-toggle::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  transition:
+    transform 180ms cubic-bezier(0.22, 0.61, 0.36, 1),
+    background 180ms ease;
+}
+
+.settings-toggle[data-active="true"] {
+  background: rgba(255, 255, 255, 0.92);
+}
+.settings-toggle[data-active="true"]::after {
+  transform: translateX(16px);
+  background: #0a0a0b;
+}
+
+/* === Notes & code chips ========================================= */
+.settings-note {
+  margin: 10px 0 0;
+  color: rgba(255, 255, 255, 0.52);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.settings-note code,
+.settings-hotkey {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 0.95em;
+}
+
+.settings-hotkey {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 9px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.10);
+  color: rgba(255, 255, 255, 0.92);
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+
+.settings-quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  /* Push the action row to the card's bottom edge when grid-stretched. */
+  margin-top: auto;
+}
+
+/* === Density variants =========================================== */
+.settings-shell[data-density="compact"] .settings-sidebar {
+  gap: 18px;
+  padding-top: 22px;
+}
+.settings-shell[data-density="compact"] .settings-main {
+  padding-top: 30px;
+}
+.settings-shell[data-density="compact"] .settings-section {
+  gap: 14px;
+}
+.settings-shell[data-density="compact"] .settings-card {
+  padding: 14px 16px;
+}
+.settings-shell[data-density="compact"] .settings-card-header {
+  margin-bottom: 10px;
+}
+.settings-shell[data-density="compact"] .settings-row {
+  padding: 10px 0;
+}
+.settings-shell[data-density="compact"] .settings-provider-option {
+  min-height: 72px;
+  padding: 10px 12px;
+}
+
+@media (max-width: 900px) {
+  .settings-shell {
+    grid-template-columns: 204px minmax(0, 1fr);
+  }
+  .settings-sidebar {
+    padding-left: 14px;
+    padding-right: 12px;
+    gap: 18px;
+  }
+  .settings-brand-title { font-size: 16.5px; }
+  .settings-brand-subtitle { font-size: 11px; }
+  .settings-nav-btn { min-height: 30px; font-size: 12px; }
+  .settings-nav { --settings-nav-step: 32px; }
+  .settings-nav-indicator { height: 30px; }
+  .settings-main { padding-left: 22px; padding-right: 22px; }
+  .settings-card { padding: 14px 16px; }
+  .settings-page-title { font-size: 22px; }
+  .settings-page-description { font-size: 12.5px; }
+  .settings-row {
+    grid-template-columns: minmax(160px, 0.9fr) minmax(240px, 1.1fr);
+    gap: 12px;
+  }
+  .settings-status-grid,
+  .settings-provider-grid {
+    gap: 8px;
+  }
+}
+
+/* === History — chat-style row list =============================== */
+.screenie-history-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  min-width: 0;
+  transition: background 120ms ease;
+}
+.screenie-history-row[data-interactive="true"] {
+  cursor: pointer;
+}
+.screenie-history-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.screenie-history-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.92);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.screenie-history-archive {
+  flex-shrink: 0;
+  height: 22px;
+  min-width: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  opacity: 0;
+  /* Only opacity transitions — `background` and `color` snap instantly
+     so the red Confirm pill doesn't bleed through as a fading crescent
+     when it's dismissed. */
+  transition: opacity 120ms ease;
+}
+
+.screenie-history-row:hover .screenie-history-archive,
+.screenie-history-archive[data-pending="true"] {
+  opacity: 1;
+}
+
+.screenie-history-archive:hover {
+  background: rgba(255, 255, 255, 0.10);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.screenie-history-archive[data-pending="true"] {
+  padding: 0 10px;
+  min-width: 64px;
+  background: var(--error-bg);
+  color: var(--error-text);
+  font-weight: 600;
+}
+
+.screenie-history-archive[data-pending="true"]:hover {
+  background: rgba(255, 80, 80, 0.30);
+}
+
+.settings-history-section {
+  display: flex;
+  flex-direction: column;
+}
+.settings-history-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 4px;
+}
+.settings-history-hint {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.5);
+  line-height: 1.5;
+}
+.settings-history-hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 6px;
+  border-radius: 5px;
+}
+/* History rows in the dark-themed Settings panel: no per-row
+   background — they read as flowing list items with just a subtle
+   hover wash, matching the chat panel's history list. The light-mode
+   variant below adds a low-opacity off-white card for distinction
+   when the panel is rendered in a light theme. */
+.settings-history-section .screenie-history-row {
+  padding: 12px 14px;
+  border-radius: 10px;
+}
+.settings-history-section .screenie-history-title {
+  font-size: 13px;
+}
+
+/* Light-theme variant: row gets a low-opacity white card so list
+   items separate visibly from the lighter panel ground. The dark
+   theme above stays card-less. */
+:root[data-theme="light"] .settings-history-section .screenie-history-row {
+  background: rgba(255, 255, 255, 0.45);
+  margin-bottom: 6px;
+}
+:root[data-theme="light"]
+  .settings-history-section
+  .screenie-history-row:hover {
+  background: rgba(255, 255, 255, 0.65);
+}
+:root[data-theme="light"] .settings-history-section .screenie-history-title {
+  color: rgba(18, 18, 16, 0.96);
+}
+.settings-history-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  padding: 6px;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  transition: color 120ms ease, background 120ms ease;
+}
+.settings-history-clear:hover {
+  color: var(--error-text);
+  background: rgba(255, 80, 80, 0.10);
+}
+.settings-history-clear[data-pending="true"] {
+  padding: 6px 14px;
+  background: var(--error-bg);
+  color: var(--error-text);
+}
+
+.screenie-history-status {
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, 0.55);
+  padding: 12px 10px;
+}
+.screenie-history-status .screenie-action {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.10);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 12px;
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+}
+
+/* === Templates editor =========================================== */
+.settings-templates-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.settings-templates-hint {
+  margin: 0;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.5);
+}
+.settings-templates-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.settings-template-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  grid-template-areas:
+    "label  delete"
+    "prompt prompt";
+  column-gap: 12px;
+  /* Vertical gap between title and prompt — wide enough that the
+     hover/focus backgrounds on each don't touch each other. */
+  row-gap: 14px;
+  padding: 16px 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.settings-template-row:first-child {
+  padding-top: 6px;
+}
+.settings-template-row:last-child {
+  border-bottom: none;
+}
+.settings-template-label,
+.settings-template-prompt {
+  /* No border at any state — the inline-edit affordance shows only
+     via background. Padding + negative margin lets the hover/focus
+     surface extend past the row's content area without shifting
+     surrounding layout. */
+  padding: 5px 9px;
+  margin: -5px -9px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  font-family: inherit;
+  outline: none;
+  color: rgba(255, 255, 255, 0.92);
+  transition: background 120ms ease;
+}
+.settings-template-label {
+  grid-area: label;
+  width: 100%;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.settings-template-label::placeholder {
+  color: rgba(255, 255, 255, 0.42);
+  font-weight: 500;
+}
+.settings-template-prompt {
+  grid-area: prompt;
+  width: 100%;
+  /* Inherits the inline-edit affordance from the shared label+prompt
+     rule above (transparent at rest, hover/focus reveals a soft
+     surface + hairline border) — same editing style as the title.
+     `min-height` keeps the field visible for short prompts; the
+     auto-grow JS in SettingsPanel expands it for longer ones. */
+  min-height: 52px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.85);
+  line-height: 1.55;
+  resize: none;
+  overflow: hidden;
+  display: block;
+}
+.settings-template-prompt::placeholder {
+  color: rgba(255, 255, 255, 0.42);
+}
+.settings-template-label:hover:not(:focus),
+.settings-template-prompt:hover:not(:focus) {
+  background: rgba(255, 255, 255, 0.05);
+}
+.settings-template-label:focus,
+.settings-template-prompt:focus {
+  /* Edit mode = brighter background only. No border, no outline. */
+  background: rgba(255, 255, 255, 0.08);
+}
+.settings-template-delete {
+  grid-area: delete;
+  align-self: start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  padding: 4px 6px;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+.settings-template-row:hover .settings-template-delete,
+.settings-template-delete:focus-visible,
+.settings-template-delete[data-pending="true"] {
+  opacity: 1;
+}
+.settings-template-delete:hover {
+  color: var(--error-text);
+}
+.settings-template-delete[data-pending="true"] {
+  padding: 4px 10px;
+  background: var(--error-bg);
+  color: var(--error-text);
+}
+.settings-templates-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 4px;
+}
+.settings-templates-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  padding: 6px 0;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+.settings-templates-add:hover {
+  color: rgba(255, 255, 255, 1);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.settings-templates-reset {
+  background: transparent;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+.settings-templates-reset:hover {
+  color: rgba(255, 255, 255, 0.78);
+  background: rgba(255, 255, 255, 0.06);
+}
+.settings-templates-reset[data-pending="true"] {
+  background: var(--error-bg);
+  color: var(--error-text);
+  font-weight: 600;
+}
+.settings-templates-reset[data-pending="true"]:hover {
+  background: rgba(255, 80, 80, 0.32);
+}
+
+/* === Theme overrides ============================================ */
+:root[data-theme="light"] {
+  --settings-shell-bg: rgba(247, 248, 250, 0.78);
+  --settings-shell-fallback-bg: rgba(247, 248, 250, 0.96);
+  --settings-shell-blur: blur(38px) saturate(150%) brightness(1.05);
+  --settings-sidebar-bg: rgba(255, 255, 255, 0.56);
+  --settings-card-bg: rgba(255, 255, 255, 0.62);
+  --settings-soft-bg: rgba(10, 10, 11, 0.045);
+  --settings-soft-bg-hover: rgba(10, 10, 11, 0.08);
+  --settings-soft-bg-active: rgba(10, 10, 11, 0.12);
+  --settings-text-strong: rgba(10, 10, 11, 0.94);
+  --settings-text: rgba(10, 10, 11, 0.78);
+  --settings-text-muted: rgba(10, 10, 11, 0.56);
+  --settings-text-faint: rgba(10, 10, 11, 0.42);
+  --settings-line: rgba(10, 10, 11, 0.08);
+  --settings-line-strong: rgba(10, 10, 11, 0.16);
+  --settings-control-bg: rgba(255, 255, 255, 0.72);
+  --settings-control-bg-focus: rgba(255, 255, 255, 0.9);
+  --settings-selected-bg: rgba(37, 99, 235, 0.12);
+  --settings-selected-bg-strong: rgba(37, 99, 235, 0.18);
+  --settings-selected-text: #1d4ed8;
+  --settings-button-primary-bg: #2563eb;
+  --settings-button-primary-bg-hover: #1d4ed8;
+  --settings-button-primary-bg-active: #1e40af;
+  --settings-button-primary-text: #ffffff;
+  --settings-danger-bg-hover: rgba(220, 38, 38, 0.12);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --settings-shell-bg: rgba(247, 248, 250, 0.78);
+    --settings-shell-fallback-bg: rgba(247, 248, 250, 0.96);
+    --settings-shell-blur: blur(38px) saturate(150%) brightness(1.05);
+    --settings-sidebar-bg: rgba(255, 255, 255, 0.56);
+    --settings-card-bg: rgba(255, 255, 255, 0.62);
+    --settings-soft-bg: rgba(10, 10, 11, 0.045);
+    --settings-soft-bg-hover: rgba(10, 10, 11, 0.08);
+    --settings-soft-bg-active: rgba(10, 10, 11, 0.12);
+    --settings-text-strong: rgba(10, 10, 11, 0.94);
+    --settings-text: rgba(10, 10, 11, 0.78);
+    --settings-text-muted: rgba(10, 10, 11, 0.56);
+    --settings-text-faint: rgba(10, 10, 11, 0.42);
+    --settings-line: rgba(10, 10, 11, 0.08);
+    --settings-line-strong: rgba(10, 10, 11, 0.16);
+    --settings-control-bg: rgba(255, 255, 255, 0.72);
+    --settings-control-bg-focus: rgba(255, 255, 255, 0.9);
+    --settings-selected-bg: rgba(37, 99, 235, 0.12);
+    --settings-selected-bg-strong: rgba(37, 99, 235, 0.18);
+    --settings-selected-text: #1d4ed8;
+    --settings-button-primary-bg: #2563eb;
+    --settings-button-primary-bg-hover: #1d4ed8;
+    --settings-button-primary-bg-active: #1e40af;
+    --settings-button-primary-text: #ffffff;
+    --settings-danger-bg-hover: rgba(220, 38, 38, 0.12);
+  }
+}
+
+.settings-shell {
+  background: var(--settings-shell-bg, rgba(28, 30, 29, 0.50));
+  -webkit-backdrop-filter: var(--settings-shell-blur, blur(38px) saturate(140%) brightness(0.78));
+  backdrop-filter: var(--settings-shell-blur, blur(38px) saturate(140%) brightness(0.78));
+  --bg: var(--settings-soft-bg, rgba(255, 255, 255, 0.06));
+  --surface: var(--settings-soft-bg, rgba(255, 255, 255, 0.06));
+  --surface-2: var(--settings-soft-bg-active, rgba(255, 255, 255, 0.12));
+  --ink: var(--settings-text-strong, rgba(255, 255, 255, 0.92));
+  --ink-2: var(--settings-text, rgba(255, 255, 255, 0.72));
+  --ink-3: var(--settings-text-muted, rgba(255, 255, 255, 0.5));
+  --border: var(--settings-line, rgba(255, 255, 255, 0.10));
+  --border-strong: var(--settings-line-strong, rgba(255, 255, 255, 0.20));
+  --section-bg: var(--settings-soft-bg, rgba(255, 255, 255, 0.05));
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .settings-chat-frost-fallback {
+    background: var(--settings-shell-fallback-bg, rgba(28, 30, 29, 0.92));
+  }
+}
+
+.settings-close-btn {
+  background: var(--settings-soft-bg-active, rgba(255, 255, 255, 0.16));
+  color: var(--settings-text-strong, rgba(255, 255, 255, 0.92));
+}
+.settings-close-btn:hover {
+  background: var(--settings-soft-bg-hover, rgba(255, 255, 255, 0.26));
+  color: var(--settings-text-strong, #ffffff);
+}
+.settings-close-btn:active {
+  background: var(--settings-soft-bg-active, rgba(255, 255, 255, 0.34));
+}
+
+.settings-sidebar {
+  background: var(--settings-sidebar-bg, rgba(255, 255, 255, 0.045));
+}
+
+.settings-brand-title,
+.settings-page-title,
+.settings-card-title,
+.settings-stat-value,
+.settings-provider-label,
+.settings-row-label,
+.screenie-history-title,
+.settings-template-label,
+.settings-templates-add,
+.screenie-history-status .screenie-action {
+  color: var(--settings-text-strong, rgba(255, 255, 255, 0.95));
+}
+
+.settings-brand-subtitle,
+.settings-sidebar-footer,
+.settings-page-description,
+.settings-card-description,
+.settings-stat-label,
+.settings-provider-detail,
+.settings-row-help,
+.settings-note,
+.settings-history-hint,
+.screenie-history-status,
+.settings-templates-hint,
+.settings-templates-reset {
+  color: var(--settings-text-muted, rgba(255, 255, 255, 0.5));
+}
+
+.settings-nav-indicator,
+.settings-provider-option[data-active="true"],
+.settings-segmented-indicator {
+  background: var(--settings-selected-bg-strong, rgba(255, 255, 255, 0.18));
+}
+
+.settings-nav-btn {
+  color: var(--settings-text-muted, rgba(255, 255, 255, 0.62));
+}
+.settings-nav-btn:hover,
+.settings-nav-btn[data-active="true"],
+.settings-segmented-btn:hover,
+.settings-segmented-btn[data-active="true"] {
+  color: var(--settings-selected-text, rgba(255, 255, 255, 0.98));
+}
+
+.settings-card,
+.settings-stat,
+.settings-provider-option,
+.settings-button,
+.settings-hotkey,
+.settings-segmented,
+.screenie-history-status .screenie-action {
+  background: var(--settings-card-bg, rgba(255, 255, 255, 0.045));
+}
+
+.settings-provider-option:hover,
+.settings-button:hover,
+.screenie-history-row:hover,
+.settings-template-label:hover:not(:focus),
+.settings-template-prompt:hover:not(:focus),
+.settings-templates-reset:hover,
+.screenie-history-status .screenie-action:hover {
+  background: var(--settings-soft-bg-hover, rgba(255, 255, 255, 0.10));
+}
+
+.settings-row,
+.settings-template-row {
+  border-color: var(--settings-line, rgba(255, 255, 255, 0.06));
+}
+
+.settings-input {
+  background: var(--settings-control-bg, rgba(255, 255, 255, 0.06));
+  border-color: var(--settings-line-strong, rgba(255, 255, 255, 0.14));
+  color: var(--settings-text-strong, rgba(255, 255, 255, 0.92));
+}
+.settings-input::placeholder,
+.settings-template-label::placeholder,
+.settings-template-prompt::placeholder {
+  color: var(--settings-text-faint, rgba(255, 255, 255, 0.42));
+}
+.settings-input:focus,
+.settings-template-label:focus,
+.settings-template-prompt:focus {
+  background: var(--settings-control-bg-focus, rgba(255, 255, 255, 0.10));
+  border-color: var(--settings-line-strong, rgba(255, 255, 255, 0.24));
+}
+
+.settings-input-eye,
+.screenie-history-archive,
+.settings-history-clear,
+.settings-template-delete {
+  color: var(--settings-text-muted, rgba(255, 255, 255, 0.55));
+}
+.settings-input-eye:hover,
+.screenie-history-archive:hover,
+.settings-templates-add:hover {
+  color: var(--settings-text-strong, rgba(255, 255, 255, 0.95));
+}
+
+.settings-button {
+  color: var(--settings-text-strong, rgba(255, 255, 255, 0.92));
+}
+.settings-button:active {
+  background: var(--settings-soft-bg-active, rgba(255, 255, 255, 0.22));
+}
+.settings-button-primary {
+  background: var(--settings-button-primary-bg, rgba(255, 255, 255, 0.94));
+  color: var(--settings-button-primary-text, #0a0a0b);
+}
+.settings-button-primary:hover {
+  background: var(--settings-button-primary-bg-hover, #ffffff);
+}
+.settings-button-primary:active {
+  background: var(--settings-button-primary-bg-active, rgba(255, 255, 255, 0.86));
+}
+.settings-button-danger:hover,
+.settings-history-clear:hover {
+  background: var(--settings-danger-bg-hover, rgba(255, 80, 80, 0.32));
+}
+
+.settings-provider-option[data-active="true"] .settings-provider-label,
+.settings-provider-option[data-active="true"] .settings-provider-detail {
+  color: var(--settings-selected-text, rgba(255, 255, 255, 0.98));
+}
+
+.settings-segmented-btn {
+  color: var(--settings-text-muted, rgba(255, 255, 255, 0.62));
+}
+
+:root[data-theme="light"] .settings-toggle {
+  background: rgba(10, 10, 11, 0.14);
+}
+:root[data-theme="light"] .settings-toggle[data-active="true"] {
+  background: #2563eb;
+}
+:root[data-theme="light"] .settings-toggle[data-active="true"]::after {
+  background: #ffffff;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) .settings-toggle {
+    background: rgba(10, 10, 11, 0.14);
+  }
+  :root:not([data-theme]) .settings-toggle[data-active="true"] {
+    background: #2563eb;
+  }
+  :root:not([data-theme]) .settings-toggle[data-active="true"]::after {
+    background: #ffffff;
+  }
+}
+
+.settings-hotkey,
+.settings-history-hint code,
+.settings-template-prompt {
+  color: var(--settings-text, rgba(255, 255, 255, 0.72));
+}

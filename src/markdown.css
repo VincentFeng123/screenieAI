@@ -1,0 +1,171 @@
+/* Markdown styles for the AI response in the overlay's result panel.
+   Scoped under .screenie-md to avoid leaking into the main settings window. */
+
+.screenie-md > *:first-child {
+  margin-top: 0;
+}
+.screenie-md > *:last-child {
+  margin-bottom: 0;
+}
+
+.screenie-md {
+  --md-paragraph-gap: 12px;
+  --md-list-gap: 10px;
+  --md-block-gap: 8px;
+  --md-display-math-margin: 14px 0 18px;
+  --md-display-math-padding: 4px 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.screenie-md[data-density="compact"] {
+  --md-paragraph-gap: 8px;
+  --md-list-gap: 7px;
+  --md-block-gap: 6px;
+  --md-display-math-margin: 9px 0 11px;
+  --md-display-math-padding: 2px 0 3px;
+  font-size: 13px !important;
+  line-height: 1.45 !important;
+}
+
+.screenie-md[data-density="spacious"] {
+  --md-paragraph-gap: 16px;
+  --md-list-gap: 14px;
+  --md-block-gap: 12px;
+  --md-display-math-margin: 18px 0 22px;
+  --md-display-math-padding: 6px 0 8px;
+  font-size: 14px !important;
+  line-height: 1.68 !important;
+}
+
+.screenie-md p {
+  margin: 0 0 var(--md-paragraph-gap) 0;
+}
+
+.screenie-md h1,
+.screenie-md h2,
+.screenie-md h3,
+.screenie-md h4 {
+  margin: 14px 0 6px 0;
+  line-height: 1.25;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.96);
+  letter-spacing: 0.1px;
+}
+.screenie-md h1 { font-size: 17px; }
+.screenie-md h2 { font-size: 15.5px; }
+.screenie-md h3 { font-size: 14.5px; }
+.screenie-md h4 { font-size: 13.5px; opacity: 0.85; }
+
+.screenie-md ul,
+.screenie-md ol {
+  margin: 4px 0 var(--md-list-gap) 0;
+  padding-left: 22px;
+}
+.screenie-md li {
+  margin: 2px 0;
+}
+.screenie-md li > p {
+  margin: 0;
+}
+
+.screenie-md strong {
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.99);
+}
+
+.screenie-md em {
+  font-style: italic;
+}
+
+.screenie-md a {
+  color: rgba(140, 200, 255, 0.95);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.screenie-md blockquote {
+  margin: var(--md-block-gap) 0;
+  padding: 4px 12px;
+  border-left: 2px solid rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.screenie-md hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  margin: 14px 0;
+}
+
+/* Inline code */
+.screenie-md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 0.88em;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: rgba(255, 220, 180, 0.95);
+}
+
+/* Code block */
+.screenie-md pre {
+  margin: var(--md-block-gap) 0;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.42);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.screenie-md pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+  border-radius: 0;
+}
+
+/* Tables (from remark-gfm) */
+.screenie-md table {
+  border-collapse: collapse;
+  margin: var(--md-block-gap) 0;
+  width: 100%;
+  font-size: 12.5px;
+}
+.screenie-md th,
+.screenie-md td {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 4px 8px;
+  text-align: left;
+}
+.screenie-md th {
+  background: rgba(255, 255, 255, 0.06);
+  font-weight: 600;
+}
+
+/* Task list checkboxes */
+.screenie-md input[type="checkbox"] {
+  margin-right: 6px;
+  vertical-align: middle;
+  accent-color: rgba(140, 200, 255, 0.95);
+}
+
+/* KaTeX math output. Keep display equations readable inside the narrow
+   floating response panel without letting long formulas break layout. */
+.screenie-md .katex {
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 1.03em;
+}
+
+.screenie-md .katex-display {
+  margin: var(--md-display-math-margin);
+  padding: var(--md-display-math-padding);
+  overflow-x: auto;
+  overflow-y: hidden;
+  overflow-wrap: normal;
+}
+
+.screenie-md .katex-display > .katex {
+  display: inline-block;
+  min-width: min-content;
+}

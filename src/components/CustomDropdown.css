@@ -1,0 +1,448 @@
+/* CSS custom properties are declared on BOTH the wrapper (.screenie-select)
+   and the portaled menu (.screenie-select-menu-portal). The portaled menu
+   is rendered at <body> so it does NOT inherit from the wrapper — without
+   this duplication, every `var(--select-hover)` etc. inside the portaled
+   menu falls back to the unset value and the hover background never shows. */
+.screenie-select,
+.screenie-select-menu-portal {
+  --select-bg: var(--surface, rgba(10, 10, 11, 0.88));
+  --select-ink: var(--ink, rgba(255, 255, 255, 0.94));
+  --select-muted: var(--ink-3, rgba(255, 255, 255, 0.56));
+  /* Frosted-glass surface: translucent enough that the backdrop-filter blur
+     beneath actually registers visually, opaque enough that small-font text
+     stays readable. ~78% opacity in light mode, ~80% in dark — both kept
+     close to the chat panel's frosted aesthetic. The dropdown's own light
+     baseline value here drives the panel variant; ghost overrides below. */
+  --select-menu-bg: rgba(255, 255, 255, 0.78);
+  /* Hover row for the panel variant (Settings). 10% black is clearly
+     visible against the light Settings surface; in dark mode we flip to
+     10% white below. The ghost variant overrides this entirely with an
+     opaque gray since translucent overlays vanish on the chat panel's
+     near-black surface. */
+  --select-hover: rgba(0, 0, 0, 0.10);
+  --select-active: rgba(0, 0, 0, 0.16);
+  --select-accent: var(--primary-bg, #3b82f6);
+}
+
+/* Dark-mode variants of the panel hover + menu surface. */
+:root[data-theme="dark"] .screenie-select,
+:root[data-theme="dark"] .screenie-select-menu-portal {
+  --select-menu-bg: rgba(20, 22, 24, 0.80);
+  --select-hover: rgba(255, 255, 255, 0.10);
+  --select-active: rgba(255, 255, 255, 0.16);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .screenie-select,
+  :root:not([data-theme="light"]) .screenie-select-menu-portal {
+    --select-menu-bg: rgba(20, 22, 24, 0.80);
+    --select-hover: rgba(255, 255, 255, 0.10);
+    --select-active: rgba(255, 255, 255, 0.16);
+  }
+}
+
+.screenie-select {
+  position: relative;
+  width: 100%;
+  font-family: inherit;
+  text-align: left;
+}
+
+.screenie-select[data-open="true"] {
+  z-index: 1000;
+}
+
+/* Ghost variant — applies to the inline wrapper AND the portaled menu so
+   the variables and visual tokens line up regardless of where the menu
+   actually lives in the DOM. */
+.screenie-select[data-variant="ghost"],
+.screenie-select-menu-portal[data-variant="ghost"] {
+  --select-ink: rgba(255, 255, 255, 0.92);
+  --select-muted: rgba(255, 255, 255, 0.58);
+  /* Translucent dark surface — lighter than the chat panel beneath so the
+     menu reads as a distinct floating layer rather than blending in. The
+     backdrop-filter further down does the actual frosting work. */
+  --select-menu-bg: rgba(22, 24, 23, 0.58);
+  /* Hover row: an opaque gray, not a translucent white wash. Translucent
+     whites disappeared into the dark menu surface; this opaque gray reads
+     as a clearly-distinct row on every background the menu floats over. */
+  --select-hover: rgba(72, 74, 76, 1);
+  --select-active: rgba(96, 98, 100, 1);
+  --select-accent: rgba(255, 255, 255, 0.94);
+}
+
+.screenie-select[data-variant="ghost"] {
+  width: auto;
+  min-width: 0;
+}
+
+.screenie-select-trigger {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px 9px 16px;
+  border-radius: 8px;
+  background: var(--select-bg);
+  color: var(--select-ink);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition:
+    background 160ms ease,
+    color 160ms ease;
+}
+
+.screenie-select-trigger:hover {
+  background: color-mix(in srgb, var(--select-bg) 70%, var(--select-hover));
+}
+
+.screenie-select-trigger:active {
+  background: color-mix(in srgb, var(--select-bg) 60%, var(--select-hover));
+}
+
+.screenie-select-trigger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.screenie-select[data-variant="ghost"] .screenie-select-trigger {
+  min-height: 28px;
+  width: auto;
+  max-width: 280px;
+  padding: 4px 2px 4px 6px;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--select-ink);
+  justify-content: flex-start;
+}
+
+.screenie-select[data-variant="ghost"] .screenie-select-trigger:hover {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.96);
+}
+
+.screenie-select-label {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-align: left;
+}
+
+.screenie-select-value {
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.screenie-select-value-main {
+  flex: 0 0 auto;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.screenie-select-value-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--select-muted);
+}
+
+.screenie-select[data-variant="ghost"] .screenie-select-label {
+  flex: 0 1 auto;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.screenie-select-chevron {
+  flex: 0 0 auto;
+  color: var(--select-muted);
+  transition: transform 180ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.screenie-select[data-open="true"] .screenie-select-chevron {
+  transform: rotate(180deg);
+}
+
+.screenie-select-menu {
+  position: absolute;
+  z-index: 80;
+  left: 0;
+  width: 100%;
+  min-width: 0;
+  /* Soft fallback only — the JS-computed `maxHeight` (70vh, capped) wins via
+     inline style. This 70vh value matches the JS cap for the rare path where
+     the inline style hasn't been applied yet (initial paint). */
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  border-radius: 12px;
+  border: none;
+  background: var(--select-menu-bg);
+  color: var(--select-ink);
+  /* No outer hairline — the drop shadow alone separates the menu from the
+     surface below. A black ring read as a "boxed" element that didn't fit
+     the borderless visual language elsewhere in the app. */
+  box-shadow:
+    0 24px 56px rgba(0, 0, 0, 0.42),
+    0 2px 8px rgba(0, 0, 0, 0.28);
+  /* Mirrors the chat panel's frosted-glass recipe (overlay.css :23-34) so
+     the dropdown reads as a member of the same visual family. saturate
+     pushes color out of the blurred backdrop; brightness keeps the surface
+     from washing over into pure white in light mode. */
+  -webkit-backdrop-filter: blur(32px) saturate(150%) brightness(1.05);
+  backdrop-filter: blur(32px) saturate(150%) brightness(1.05);
+}
+
+/* Dark-mode tone-down: bring brightness below 1 so a light-blue desktop
+   behind a translucent dropdown doesn't render as washed-out cyan. */
+:root[data-theme="dark"] .screenie-select-menu,
+:root[data-theme="dark"] .screenie-select-menu-portal {
+  -webkit-backdrop-filter: blur(32px) saturate(140%) brightness(0.86);
+  backdrop-filter: blur(32px) saturate(140%) brightness(0.86);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .screenie-select-menu,
+  :root:not([data-theme="light"]) .screenie-select-menu-portal {
+    -webkit-backdrop-filter: blur(32px) saturate(140%) brightness(0.86);
+    backdrop-filter: blur(32px) saturate(140%) brightness(0.86);
+  }
+}
+
+/* The menu always opens below the trigger. The portaled variant gets its
+   `top` via inline style; the inline path uses CSS positioning relative to
+   the trigger. */
+.screenie-select-menu:not(.screenie-select-menu-portal) {
+  top: calc(100% + 6px);
+  bottom: auto;
+  transform-origin: top center;
+  animation: screenie-select-pop-down 150ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+
+.screenie-select-menu-portal {
+  transform-origin: top center;
+  animation: screenie-select-pop-down 150ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+
+.screenie-select[data-variant="ghost"] .screenie-select-menu,
+.screenie-select-menu-portal[data-variant="ghost"] {
+  width: max-content;
+  min-width: 230px;
+  /* `max-width` was 320px hard. Width is now JS-driven (capped at 70% of
+     the chat panel) — keep a generous CSS ceiling as a fallback so the
+     pre-paint frame doesn't render absurdly wide. */
+  max-width: 480px;
+  /* No border or shadow in chat contexts. The frosted surface itself should
+     read as part of the panel, not as a raised popover. */
+  border: none;
+  background: var(--select-menu-bg);
+  box-shadow: none;
+  /* Chat-panel-style frost: see overlay.css :23-34. Slightly stronger blur
+     than the chat panel itself because this menu floats over a region that
+     can include the user's actual screen content. */
+  -webkit-backdrop-filter: blur(36px) saturate(135%) brightness(0.86);
+  backdrop-filter: blur(36px) saturate(135%) brightness(0.86);
+}
+
+/* Drop the inner highlight ring too — without an outer border it just looked
+   like a leftover artifact. */
+.screenie-select[data-variant="ghost"] .screenie-select-menu::after,
+.screenie-select-menu-portal[data-variant="ghost"]::after {
+  content: none;
+}
+
+@keyframes screenie-select-pop-down {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.screenie-select-search-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  /* No side padding: the search input now spans the same horizontal extent as
+     the option rows below it (both anchored to the menu's content edge). */
+  margin: 0 0 4px 0;
+  padding: 0;
+}
+
+.screenie-select-search-icon {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--select-muted);
+  pointer-events: none;
+}
+
+.screenie-select-search {
+  /* `box-sizing: border-box` is required so `width: 100%` includes the
+     left/right padding (28px + 10px). Without it, the input box ends up
+     38px wider than its `.screenie-select-search-wrap` parent and
+     visually overflows the dropdown menu's rounded edge. */
+  box-sizing: border-box;
+  width: 100%;
+  height: 30px;
+  padding: 4px 10px 4px 28px;
+  border-radius: 7px;
+  /* No background — the frosted dropdown surface itself reads as the search
+     row; an extra fill made the input look pasted on. */
+  background: transparent;
+  color: var(--select-ink);
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+}
+
+.screenie-select-search::placeholder {
+  color: var(--select-muted);
+}
+
+.screenie-select-options {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* Firefox */
+  scrollbar-width: none;
+  /* Legacy IE/Edge */
+  -ms-overflow-style: none;
+}
+
+/* WebKit / Blink. The shared App.css scrollbar rules paint a 9px thumb
+   inside any scrollable area; this rule hides the chrome entirely just for
+   dropdown menus while leaving wheel/trackpad scrolling intact. */
+.screenie-select-options::-webkit-scrollbar,
+.screenie-select-options::-webkit-scrollbar-thumb,
+.screenie-select-options::-webkit-scrollbar-track,
+.screenie-select-options::-webkit-scrollbar-track-piece,
+.screenie-select-options::-webkit-scrollbar-corner {
+  display: none;
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+
+.screenie-select-option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px 8px 13px;
+  border-radius: 8px;
+  color: var(--select-ink);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  /* Quick fade so the hover feels responsive without strobing on rapid
+     pointer moves down the list. */
+  transition:
+    background 90ms ease,
+    color 90ms ease;
+}
+
+.screenie-select-option:hover {
+  background: var(--select-hover);
+  color: rgba(255, 255, 255, 0.98);
+}
+
+.screenie-select-option:active {
+  background: var(--select-active);
+}
+
+.screenie-select-option:hover .screenie-select-option-detail {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+/* Selected option: an off-white surface with black main text and a softer
+   gray subtitle. Same colors in light + dark + ghost variants — the goal is
+   a clear, neutral selection indicator that reads as "the picked one"
+   without competing with the rest of the menu. */
+.screenie-select-option[data-selected="true"] {
+  background: #ececee;
+  color: #0a0a0b;
+}
+
+.screenie-select-option-label {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  text-align: left;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.screenie-select-option-main {
+  flex: 0 0 auto;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--select-ink);
+}
+
+.screenie-select-option-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--select-muted);
+}
+
+.screenie-select-option[data-selected="true"] .screenie-select-option-main {
+  color: #0a0a0b;
+}
+
+.screenie-select-option[data-selected="true"] .screenie-select-option-detail {
+  color: #6b6b70;
+}
+
+.screenie-select-check {
+  flex: 0 0 auto;
+  color: #0a0a0b;
+  opacity: 0;
+}
+
+.screenie-select-option[data-selected="true"] .screenie-select-check {
+  opacity: 1;
+}
+
+.screenie-select-empty {
+  padding: 14px 10px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--select-muted);
+}

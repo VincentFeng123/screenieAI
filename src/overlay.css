@@ -1,0 +1,876 @@
+/* Overlay-specific styles. Loaded only when running in ?mode=overlay.
+   Single solid dark-gray frosted surface for every panel/toolbar/banner —
+   readable over any captured content (white pages, busy screenshots, etc.)
+   without depending on background-luminance sampling. No drop shadows. */
+
+/* Disable text selection by default; only true textfields opt back in.
+   Highlighting on titles, AI markdown bubbles, hint pills, history rows
+   etc. reads as accidental — every "I want to copy this" path in this app
+   (overlay + detached chat) goes through an explicit Copy button instead.
+   main.tsx also sets `body.style.userSelect = "none"` for the overlay,
+   but the chat-mode body doesn't get that inline; this rule covers both. */
+html {
+  -webkit-user-select: none;
+  user-select: none;
+}
+input,
+textarea,
+[contenteditable="true"],
+[contenteditable=""] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Translucent frosted surface. Heavy blur does the readability work; the
+   tinted base (alpha ~0.55) is a uniform gray wash so text contrast stays
+   acceptable when the underlying capture is bright or busy. The inset gray
+   box-shadow adds a constant ~10% gray fill that survives even when WebKit
+   transiently drops backdrop-filter on focus changes — so the panel never
+   collapses into plain transparent.
+
+   No top-bias gradient, no inset top highlight: those produced a visible
+   "thicker top border" band where the lightened top edge stacked with the
+   1px border, making the top read heavier than the sides.
+
+   These rules assume the host element is NOT transformed — the chat panel
+   and toolbar wrap their frosted surface in an outer animation/positioning
+   layer so backdrop-filter never lives on a transformed node. */
+/* Overlay surfaces. The frost itself is now drawn by a native
+   NSVisualEffectView mounted behind the WebView at this panel's viewport
+   rect (see macos_window.m + useOverlayFrostRegions in Overlay.tsx). The
+   panel's own CSS background is a faint dark wash that tints the live
+   vibrancy without hiding it. CSS `backdrop-filter` is intentionally NOT
+   used here — it doesn't actually compute against the desktop on a
+   transparent overlay window. */
+.screenie-chat-panel,
+.screenie-toolbar,
+.screenie-hint {
+  position: relative;
+  background: rgba(220, 222, 220, 0.20);
+  border: none;
+  outline: none;
+  box-shadow: none;
+  box-sizing: border-box;
+  color: rgba(255, 255, 255, 0.95);
+  isolation: isolate;
+  contain: layout style;
+}
+
+.screenie-chat-panel > :not(.screenie-blurred-backdrop),
+.screenie-toolbar > :not(.screenie-blurred-backdrop),
+.screenie-hint > :not(.screenie-blurred-backdrop):not(.screenie-inset-border) {
+  position: relative;
+  z-index: 1;
+}
+
+.screenie-chat-panel > .screenie-chat-titlebar {
+  position: relative;
+  z-index: 30;
+}
+
+.screenie-inset-border {
+  position: absolute !important;
+  inset: 0;
+  pointer-events: none;
+  z-index: 40 !important;
+}
+
+.screenie-inset-border svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.screenie-chip {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  font-weight: 500;
+  font-family: inherit;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+.screenie-chip:hover {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+.screenie-chip:active {
+  background: rgba(220, 222, 220, 0.20);
+}
+.screenie-chip:disabled,
+.screenie-chip[aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.screenie-send {
+  background: #202124;
+  color: #ffffff;
+  border: none;
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-family: inherit;
+  flex-shrink: 0;
+  transition: background 120ms ease;
+}
+.screenie-send:hover {
+  background: #303134;
+}
+.screenie-send:active {
+  background: #111214;
+}
+.screenie-send:disabled {
+  background: rgba(0, 0, 0, 0.14);
+  color: rgba(0, 0, 0, 0.34);
+  cursor: not-allowed;
+}
+
+/* Close button — small circular gray pill in the chat titlebar's top-right.
+   The X glyph is intentionally small inside the pill (the click target
+   stays 22px, but the glyph reads as a delicate hint, not a heavy mark).
+   Hover only nudges the background a touch darker so it doesn't flash. */
+.screenie-close-btn {
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1;
+  /* Natural flex position is top:11px, right:8px in the 38px titlebar.
+     This nudge lands the button at top:12px, right:13px — pulled inboard
+     from the rounded corner and dropped 1px so the X glyph centers on the
+     same baseline as the larger titlebar icons next to it. */
+  transform: translate(-5px, 1px);
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+}
+.screenie-close-btn:hover {
+  /* Subtle nudge — drop the white wash a few percent so a bit more of the
+     dark panel shows through. No black overlay, no jarring switch. */
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+.screenie-close-btn:active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.screenie-chat-titlebar[data-draggable="true"] {
+  cursor: move;
+}
+.screenie-chat-titlebar[data-draggable="true"] button,
+.screenie-chat-titlebar[data-draggable="true"] .screenie-select {
+  cursor: pointer;
+}
+
+.screenie-model-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: rgba(255, 255, 255, 0.78);
+  user-select: none;
+}
+.screenie-model-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  display: inline-block;
+}
+.screenie-model-dot.cloud {
+  background: #f59e0b;
+}
+.screenie-model-dot.local {
+  background: #22c55e;
+}
+.screenie-model-separator {
+  color: rgba(255, 255, 255, 0.38);
+}
+.screenie-model-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Mirrors the chat panel / toolbar recipe: translucent dark base + bitmap
+   blur via a child <BlurredBackdrop> (the JSX passes `persistImage` so the
+   bitmap never fades — keeps the pill from going transparent on a WebKit
+   backdrop-filter glitch). The CSS backdrop-filter is kept too, but the
+   bitmap is the load-bearing layer here. */
+.screenie-action {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  color: rgba(255, 255, 255, 0.95);
+  /* Native NSVisualEffectView is mounted behind this pill; the bg here
+     is just a tint over the live vibrancy. */
+  background: rgba(220, 222, 220, 0.20);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  cursor: pointer;
+  isolation: isolate;
+  overflow: hidden;
+  contain: layout style;
+}
+
+/* Lift the icon + text above the absolutely-positioned BlurredBackdrop
+   (which has z-index 0). Same pattern as .screenie-chat-panel children. */
+.screenie-action > :not(.screenie-blurred-backdrop) {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Hover / active tints sit between the bitmap and the content so they
+   wash over the blur without dimming the icon / label. */
+.screenie-action::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  z-index: 0;
+  pointer-events: none;
+  background: transparent;
+  transition: background 120ms ease;
+}
+.screenie-action:hover::after {
+  background: rgba(255, 255, 255, 0.10);
+}
+.screenie-action:active::after {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.screenie-copy-btn {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.62);
+  border: none;
+  border-radius: 8px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    opacity 120ms ease;
+}
+.screenie-copy-btn:hover {
+  color: rgba(255, 255, 255, 0.92);
+}
+.screenie-copy-btn.copied {
+  color: rgba(255, 255, 255, 0.86);
+}
+
+.screenie-input-shell {
+  position: relative;
+  background: transparent;
+  border: none;
+  border-radius: 18px;
+  box-shadow: none;
+}
+
+.screenie-textarea::placeholder {
+  color: rgba(255, 255, 255, 0.46);
+}
+
+/* Spawn keyframes are intentionally OPACITY-ONLY now. CSS transforms
+   change `getBoundingClientRect()` mid-animation but don't trigger
+   `ResizeObserver` (no border-box change), so the native vibrancy view
+   would sit at the post-transform position while the chrome was still
+   sliding into it. Fading without translating keeps the frost in
+   pixel-perfect lockstep with the panel chrome. */
+.screenie-fadein {
+  animation: screenie-fadein 160ms ease both;
+}
+@keyframes screenie-fadein {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.screenie-chat-spawn {
+  animation: screenie-chat-spawn 260ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+@keyframes screenie-chat-spawn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.screenie-toolbar-spawn {
+  animation: screenie-toolbar-spawn 280ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+@keyframes screenie-toolbar-spawn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.screenie-pulse {
+  animation: screenie-pulse 1.6s ease-in-out infinite;
+}
+@keyframes screenie-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+/* Gradient shimmer used by the in-flight assistant bubble while it waits
+   for the first chunk. A bright spot slides across the text, clipped to
+   the glyph shapes via background-clip so the panel surface around it
+   stays untouched. */
+.screenie-thinking-shimmer {
+  display: inline-block;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: transparent;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.32) 0%,
+    rgba(255, 255, 255, 0.96) 45%,
+    rgba(255, 255, 255, 0.96) 55%,
+    rgba(255, 255, 255, 0.32) 100%
+  );
+  background-size: 220% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: screenie-thinking-shimmer 1.8s ease-in-out infinite;
+  user-select: none;
+}
+
+@keyframes screenie-thinking-shimmer {
+  0% { background-position: 160% 0; }
+  100% { background-position: -60% 0; }
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .screenie-chat-panel,
+  .screenie-toolbar,
+  .screenie-action,
+  .screenie-edit-pill,
+  .screenie-edit-popover,
+  .screenie-hint {
+    background: rgba(54, 56, 54, 0.94);
+  }
+}
+
+/* ---------------------------------------------------------------- */
+/* Image edit affordance, pill, popover, canvas, text input          */
+/*                                                                   */
+/* The pill and popover share the EXACT same frost recipe as the     */
+/* prompt toolbar (`.screenie-toolbar`) — same base tint, same       */
+/* backdrop-filter, same inner BlurredBackdrop tuning, same          */
+/* SvgInsetBorder. They differ only in geometry (pill vs rounded     */
+/* card).                                                            */
+/* ---------------------------------------------------------------- */
+
+.screenie-edit-pill,
+.screenie-edit-popover {
+  position: relative;
+  /* Frost comes from the per-panel NSVisualEffectView (see
+     macos_window.m). Keep this background as a faint tint so the
+     vibrancy reads as a slightly darker frosted glass, matching the
+     toolbar/chat-panel recipe above. */
+  background: rgba(220, 222, 220, 0.20);
+  border: none;
+  outline: none;
+  box-shadow: none;
+  box-sizing: border-box;
+  color: rgba(255, 255, 255, 0.95);
+  isolation: isolate;
+  contain: layout style;
+}
+
+/* Children sit above the BlurredBackdrop bitmap (which is z-index: 0). */
+.screenie-edit-pill > :not(.screenie-blurred-backdrop):not(.screenie-inset-border),
+.screenie-edit-popover > :not(.screenie-blurred-backdrop):not(.screenie-inset-border) {
+  position: relative;
+  z-index: 1;
+}
+
+/* Spawn animation when the affordance first appears next to the rect. */
+.screenie-edit-pill-wrap {
+  animation: screenie-edit-spawn 260ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+@keyframes screenie-edit-spawn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Cross-fade between the collapsed pencil icon and the expanded toolbar.
+   Collapse is intentionally staged in React: toolbar contents fade out
+   before the pill geometry shrinks, so icons never get squeezed. */
+.screenie-edit-pill-icon {
+  transition: opacity 70ms ease;
+}
+.screenie-edit-pill-icon[data-visible="true"] {
+  opacity: 1;
+  transition-delay: 0ms;
+}
+.screenie-edit-pill-icon[data-visible="false"] {
+  opacity: 0;
+  transition-delay: 0ms;
+}
+
+.screenie-edit-pill-row {
+  transition: opacity 100ms ease;
+}
+.screenie-edit-pill-row[data-visible="true"] {
+  opacity: 1;
+  transition-delay: 70ms;
+}
+.screenie-edit-pill-row[data-visible="false"] {
+  opacity: 0;
+  transition-duration: 50ms;
+  transition-delay: 0ms;
+}
+
+/* Popover spawn / fade — gentler than the pill since it's already a
+   stable shape anchored to the pill. The wrapper stays mounted while the
+   user has a tool selected; visibility is driven by `data-visible`, so
+   pressing on the canvas to start drawing flips the attribute and the
+   panel fades out instead of disappearing abruptly. */
+.screenie-edit-popover-wrap[data-visible="true"] {
+  animation: screenie-edit-popover-spawn 200ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+.screenie-edit-popover-wrap[data-visible="false"] {
+  animation: screenie-edit-popover-fade 160ms cubic-bezier(0.4, 0, 0.6, 1) both;
+}
+/* Opacity-only — see the spawn keyframes above for the rationale. */
+@keyframes screenie-edit-popover-spawn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes screenie-edit-popover-fade {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+/* Tool buttons inside the pill / popover. Same hover treatment as the
+   prompt toolbar's `.screenie-chip` so they read as one family. Active
+   state is a slightly more saturated gray fill (no border) — matches the
+   "selected chip" idiom rather than a focus ring. */
+.screenie-edit-tool {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  transition: background 120ms ease;
+  font-family: inherit;
+  padding: 0;
+}
+.screenie-edit-tool:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+.screenie-edit-tool:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.26);
+}
+.screenie-edit-tool[data-active="true"] {
+  background: rgba(220, 222, 220, 0.20);
+}
+.screenie-edit-tool:disabled,
+.screenie-edit-tool[aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.screenie-edit-tool-md {
+  width: 28px;
+  height: 28px;
+}
+.screenie-edit-tool-sm {
+  width: 22px;
+  height: 22px;
+}
+
+/* Popover internal layout — more spacious so each row breathes. */
+.screenie-edit-popover-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+.screenie-edit-popover-label {
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.66);
+  white-space: nowrap;
+}
+
+.screenie-edit-segment {
+  display: inline-flex;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  padding: 2px;
+  gap: 2px;
+}
+.screenie-edit-segment-btn {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 11.5px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.screenie-edit-segment-btn:hover:not([data-active="true"]) {
+  background: rgba(255, 255, 255, 0.10);
+}
+.screenie-edit-segment-btn[data-active="true"] {
+  background: rgba(220, 222, 220, 0.20);
+  color: rgba(255, 255, 255, 0.98);
+}
+
+.screenie-edit-swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1.5px solid rgba(255, 255, 255, 0.20);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: transform 120ms ease, border-color 120ms ease;
+}
+.screenie-edit-swatch:hover {
+  transform: scale(1.08);
+  border-color: rgba(255, 255, 255, 0.45);
+}
+.screenie-edit-swatch[data-active="true"] {
+  border-color: rgba(255, 255, 255, 0.95);
+}
+
+/* Icon buttons inside the chat titlebar (history clock, pin, etc.) — same
+   visual language as the close button but slightly larger so the icons
+   read clearly. */
+.screenie-titlebar-icon {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.78);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+  padding: 0;
+  font-family: inherit;
+}
+.screenie-titlebar-icon:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.95);
+}
+.screenie-titlebar-icon[data-active="true"] {
+  background: rgba(220, 222, 220, 0.20);
+  color: rgba(255, 255, 255, 0.98);
+}
+
+/* Detached chat — header icon buttons. Always flat (no fill); hover only
+   brightens the icon. The close pill on the opposite side is the only
+   chrome competing with the chat content. Active state (e.g., history
+   open) brightens the icon further to mark its sticky-pressed status. */
+.screenie-chat-flat-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: color 120ms ease;
+  padding: 0;
+  font-family: inherit;
+}
+.screenie-chat-flat-btn:hover {
+  color: rgba(255, 255, 255, 0.95);
+}
+.screenie-chat-flat-btn[data-active="true"] {
+  color: rgba(255, 255, 255, 1);
+}
+
+/* Detached chat — bottom prompt pill. Outer rounded rect with a textarea
+   on top and a tools row underneath, mirroring the screenshot's
+   "Ask anything" composition. */
+.screenie-chat-prompt {
+  background: rgba(255, 255, 255, 0.06);
+  border: none;
+  border-radius: 18px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.screenie-chat-model-select {
+  overflow: hidden;
+  transform: translateY(2px);
+}
+
+/* Action icons under each assistant bubble (Copy, Regenerate). */
+.screenie-chat-action {
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+  padding: 0;
+  font-family: inherit;
+}
+.screenie-chat-action:hover {
+  background: rgba(255, 255, 255, 0.10);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+/* Tiny token-cost badge under each assistant bubble. Reads as
+   "10k in · 1k out · 8.3¢" — provider's own counts when streaming
+   includes them, with cost computed against the per-model rate table.
+   Width is capped to the parent so the chip never overflows the chat
+   panel; long summaries wrap to a small multi-line badge instead of
+   sliding off the right edge. The chat panel's natural 14px scroll-area
+   padding keeps the chip from touching the panel's left/right edges. */
+.screenie-usage-chip {
+  display: inline-block;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  margin-right: 4px;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.55);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 3px 10px;
+  border-radius: 10px;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Standalone 36×36 action pills (Save, OCR, Copy) — each renders as a
+   single pencil-sized circle, identical recipe to the collapsed edit
+   affordance. Hover reuses the same lift as the edit pill at rest. */
+.screenie-action-btn {
+  transition: transform 140ms cubic-bezier(.2, .8, .2, 1),
+              background 140ms ease;
+}
+.screenie-action-btn:hover:not(:disabled) {
+  transform: scale(1.04);
+}
+
+/* Pencil affordance — at rest (collapsed), match the save/OCR/copy pills'
+   subtle scale-in-on-hover. We only apply the scale while data-open is
+   false because once expanded, the pill is a 280 px row and a scale would
+   look ridiculous. */
+.screenie-edit-pill[data-open="false"] {
+  transition: transform 140ms cubic-bezier(.2, .8, .2, 1);
+}
+.screenie-edit-pill[data-open="false"]:hover {
+  transform: scale(1.04);
+}
+
+/* Quick provider toggle pill in the chat titlebar. ⌘L (= Ctrl+L) flips
+   between the user's last cloud provider and Ollama. */
+.screenie-provider-toggle {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: none;
+  background: rgba(255, 255, 255, 0.10);
+  color: rgba(255, 255, 255, 0.86);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 120ms ease, color 120ms ease;
+}
+.screenie-provider-toggle:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.98);
+}
+.screenie-provider-toggle:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* History list inside the chat panel. Single-line rows: derived title +
+   archive button that swaps to "Confirm" on first click and deletes on the
+   second. The archive button stays hidden until row hover, and forces
+   itself visible while pending so the user can find it again to confirm. */
+.screenie-history-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  min-width: 0;
+  transition: background 120ms ease;
+}
+.screenie-history-row[data-interactive="true"] {
+  cursor: pointer;
+}
+.screenie-history-row:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+.screenie-history-status {
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, 0.6);
+  padding: 12px 10px;
+  text-align: center;
+}
+.screenie-history-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.92);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.screenie-history-archive {
+  flex-shrink: 0;
+  height: 22px;
+  min-width: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  opacity: 0;
+  /* Only opacity transitions — `background` and `color` snap instantly
+     so the red Confirm pill doesn't bleed through as a fading crescent
+     when it's dismissed. */
+  transition: opacity 120ms ease;
+}
+.screenie-history-row:hover .screenie-history-archive,
+.screenie-history-archive[data-pending="true"] {
+  opacity: 1;
+}
+.screenie-history-archive:hover {
+  background: rgba(255, 255, 255, 0.10);
+  color: rgba(255, 255, 255, 0.95);
+}
+.screenie-history-archive[data-pending="true"] {
+  padding: 0 10px;
+  min-width: 64px;
+  background: rgba(255, 80, 80, 0.18);
+  color: rgba(255, 200, 200, 0.95);
+  font-weight: 600;
+}
+.screenie-history-archive[data-pending="true"]:hover {
+  background: rgba(255, 80, 80, 0.32);
+}
+
+/* Icon button used inside the prompt toolbar (e.g. Save image). Visually
+   matches the chips' translucency but sized like a 32px send button so the
+   row stays tidy. */
+.screenie-toolbar-icon-btn {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+  font-family: inherit;
+  padding: 0;
+}
+.screenie-toolbar-icon-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 1);
+}
+.screenie-toolbar-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.screenie-edit-text-input {
+  /* Must match the canvas's `ctx.font` shorthand exactly so the input's
+     in-progress text and the committed canvas text are visually
+     indistinguishable: same family, weight, no letter-spacing, line-height
+     1 (set inline; matches canvas's textBaseline = "top" + fillText with
+     no extra leading). */
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-weight: 600;
+  letter-spacing: normal;
+  caret-color: currentColor;
+  min-width: 60px;
+}

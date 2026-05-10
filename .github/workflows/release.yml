@@ -1,0 +1,134 @@
+# Cross-platform release pipeline.
+#
+# Trigger: push a tag like `v0.2.0`. CI then runs two jobs in parallel:
+#
+#   1. macOS Universal — produces a single DMG containing both Apple Silicon
+#      and Intel binaries.
+#   2. Windows x64 — produces an NSIS `.exe` (auto-fetches WebView2 at
+#      install time) and a WiX `.msi`.
+#
+# Both jobs attach their bundle artifacts to the same draft GitHub Release
+# at github.com/<owner>/<repo>/releases. After both jobs finish, you review
+# the binaries and click "Publish release" in the GitHub UI to ship.
+#
+# Manual trigger: Actions tab → "Publish" → Run workflow. Useful for
+# checking the build end-to-end without cutting a real release; the draft
+# release it produces can be deleted afterward.
+#
+# Code signing is optional — the workflow reads cert + notarization
+# credentials from repo secrets if they exist, and produces an unsigned
+# build otherwise. Unsigned macOS apps trip Gatekeeper on first launch;
+# unsigned Windows apps trip SmartScreen. Users can bypass both, but for
+# anything resembling a public release you'll want real certs.
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      # Required for GITHUB_TOKEN to create / append to the release.
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            label: macOS (Universal)
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            tauri-args: --target universal-apple-darwin
+          - platform: windows-latest
+            label: Windows (x64)
+            rust-targets: ''
+            tauri-args: ''
+
+    runs-on: ${{ matrix.platform }}
+    name: Build ${{ matrix.label }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          # Without `workspaces:`, the action caches the wrong target dir
+          # because Cargo.toml is in src-tauri/, not the repo root.
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # macOS code signing + notarization. All optional; missing
+          # secrets produce an unsigned build (Gatekeeper will warn users
+          # on first launch). Set these in repo Settings → Secrets and
+          # variables → Actions once you have an Apple Developer ID.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+          # Windows Authenticode code signing. Set this once you've
+          # bought a code-signing certificate (EV cert recommended for
+          # instant SmartScreen trust). The thumbprint is the SHA-1 of
+          # the cert installed on the runner.
+          # See https://v2.tauri.app/distribute/sign/windows
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+
+          # Tauri updater signing. Used by the auto-updater plugin if /
+          # when you add it; harmless to leave blank otherwise.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # When triggered by a tag push, ref_name is the tag (e.g.
+          # "v0.2.0"). When triggered manually via workflow_dispatch, it's
+          # the branch name — the draft release will be named after the
+          # branch and can be deleted after testing.
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Screenie AI ${{ github.ref_name }}'
+          releaseBody: |
+            ## Downloads
+
+            - **macOS** — `Screenie AI_*.dmg` (universal: works on both Intel and Apple Silicon)
+            - **Windows** — `Screenie AI_*-setup.exe` (recommended; auto-fetches WebView2) or `*.msi` (for `winget` / enterprise deploys)
+
+            ## Install notes
+
+            - **macOS**: open the DMG and drag the app to Applications. If Gatekeeper warns on first launch, right-click the app → Open → confirm.
+            - **Windows**: double-click the `.exe`. If SmartScreen says "Windows protected your PC", click **More info** → **Run anyway**. (This warning goes away once the build is code-signed.)
+
+            ## Permissions Screenie AI will ask for
+
+            - **macOS**: Screen Recording (required) and Accessibility (optional — improves Esc handling over fullscreen apps).
+            - **Windows**: no system-level prompts; capture works out of the box.
+          # Draft means the release is hidden from users until you flip
+          # the "Publish" toggle in the GitHub UI. Both matrix jobs append
+          # to the same draft release.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.tauri-args }}

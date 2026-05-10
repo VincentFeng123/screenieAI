@@ -1,0 +1,854 @@
+/* Onboarding theme — soft rounded surfaces, system typography, dynamic
+   light/dark via prefers-color-scheme. Scoped under .onboarding-root so
+   nothing bleeds into the settings panel. The active step scrolls when short
+   windows or long status messages need more room. */
+
+.onboarding-root {
+  /* Light theme defaults — overridden below by either the user's explicit
+     theme preference (data-theme on <html>) or the system color-scheme
+     media query when the preference is "system". */
+  --bg: #ffffff;
+  --surface: #f5f5f7;
+  --surface-2: #ebebed;
+  --ink: #0a0a0b;
+  --ink-2: #4b4b52;
+  --ink-3: #8e8e93;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+
+  --radius-card: 16px;
+  --radius-button: 999px;
+  --radius-input: 12px;
+  --radius-key: 12px;
+
+  position: fixed;
+  inset: 0;
+  /* Transparent — the body's dark tint + macOS sidebar effect underneath
+     supply the frosty background. */
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14.5px;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Explicit theme="dark" overrides the OS preference. */
+:root[data-theme="dark"] .onboarding-root,
+/* When the user picks "system" we follow OS dark mode. */
+:root:not([data-theme]) .onboarding-root {
+  /* Default to light unless OS prefers dark. */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .onboarding-root {
+    --bg: #0a0a0b;
+    --surface: #18181b;
+    --surface-2: #232326;
+    --ink: #fafafa;
+    --ink-2: #b4b4b8;
+    --ink-3: #6b6b70;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.18);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+}
+
+:root[data-theme="dark"] .onboarding-root {
+  --bg: #0a0a0b;
+  --surface: #18181b;
+  --surface-2: #232326;
+  --ink: #fafafa;
+  --ink-2: #b4b4b8;
+  --ink-3: #6b6b70;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+/* Header — wordmark anchored to the top-left corner with equal top/left
+   margins so it reads as a logo, not a title-bar band. The whole header
+   is a Tauri drag region. (decorations: false in tauri.conf.json means
+   there are no native traffic lights to clear, despite earlier comments
+   here that assumed otherwise.) */
+.onboarding-header {
+  flex-shrink: 0;
+  padding: 18px 18px 0 18px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  user-select: none;
+  -webkit-app-region: drag;
+}
+
+.onboarding-header * {
+  /* Buttons / interactive children opt out of dragging. Currently none, but
+     keeps the rule sane if we add any. */
+  -webkit-app-region: no-drag;
+}
+
+.onboarding-mark {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 13.5px;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.onboarding-mark-dim {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+
+/* Bottom-centered step indicator. Sits in its own footer band so it doesn't
+   compete with the actions row inside each step. */
+.onboarding-progress-footer {
+  flex-shrink: 0;
+  padding: 0 0 22px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  user-select: none;
+}
+
+.onboarding-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.onboarding-progress-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--border-strong);
+  transition: background 220ms ease, transform 220ms ease;
+}
+
+.onboarding-progress-dot.active {
+  background: var(--ink);
+  transform: scale(1.18);
+}
+
+.onboarding-progress-dot.done {
+  background: var(--ink-2);
+}
+
+/* Step container — vertically centered content with overflow fallback. */
+.onboarding-step {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 32px 24px;
+  overflow: auto;
+}
+
+.onboarding-step-inner {
+  width: 100%;
+  max-width: 440px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: onboarding-enter 460ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+
+/* Welcome uses an internal 2-column grid (text+CTA on the left, image on
+   the right); the inner just lets that grid stretch. Tutorial keeps default
+   stretch alignment so the centered hotkey stage spans the full width. */
+.onboarding-step-inner.welcome {
+  max-width: 760px;
+  gap: 0;
+}
+
+.onboarding-step-inner.tutorial {
+  gap: 18px;
+}
+
+/* Welcome two-column grid */
+.onboarding-welcome-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 36px;
+  align-items: center;
+  width: 100%;
+}
+
+.onboarding-welcome-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.onboarding-welcome-cta {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+@keyframes onboarding-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Stagger a touch — the cascade is so subtle it just keeps the entrance
+   from feeling stiff. */
+.onboarding-step-inner > *:nth-child(1) { animation-delay: 0ms; }
+.onboarding-step-inner > *:nth-child(2) { animation: onboarding-enter 460ms cubic-bezier(0.22, 0.61, 0.36, 1) both; animation-delay: 60ms; }
+.onboarding-step-inner > *:nth-child(3) { animation: onboarding-enter 460ms cubic-bezier(0.22, 0.61, 0.36, 1) both; animation-delay: 100ms; }
+.onboarding-step-inner > *:nth-child(4) { animation: onboarding-enter 460ms cubic-bezier(0.22, 0.61, 0.36, 1) both; animation-delay: 140ms; }
+.onboarding-step-inner > *:nth-child(5) { animation: onboarding-enter 460ms cubic-bezier(0.22, 0.61, 0.36, 1) both; animation-delay: 180ms; }
+.onboarding-step-inner > *:nth-child(6) { animation: onboarding-enter 460ms cubic-bezier(0.22, 0.61, 0.36, 1) both; animation-delay: 220ms; }
+.onboarding-step-inner > *:nth-child(7) { animation: onboarding-enter 460ms cubic-bezier(0.22, 0.61, 0.36, 1) both; animation-delay: 260ms; }
+
+/* Eyebrow — small caps mono, no leading rule */
+.onboarding-eyebrow {
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  text-transform: none;
+}
+
+/* Display headline — clean, semibold, system font */
+.onboarding-h1 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 32px;
+  line-height: 1.12;
+  letter-spacing: -0.025em;
+  margin: 0;
+  color: var(--ink);
+}
+
+.onboarding-step-inner.welcome .onboarding-h1 {
+  font-size: 36px;
+}
+
+.onboarding-subtitle {
+  font-family: var(--font-sans);
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  margin: 0;
+  letter-spacing: -0.005em;
+}
+
+/* Welcome image — placeholder slot for product art. Aspect-locked rounded
+   surface; the inline SVG inside inherits currentColor so it themes for
+   light/dark. Swap with <img src="..." /> when there's a real asset. */
+.onboarding-welcome-image {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  border-radius: var(--radius-card);
+  /* Frosted glass placeholder — matches the input rows and status card. */
+  background: rgba(255, 255, 255, 0.8);
+  border: 1px solid var(--border);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  color: var(--ink);
+  max-height: 280px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .onboarding-welcome-image {
+    background: rgba(255, 255, 255, 0.05);
+  }
+}
+
+:root[data-theme="dark"] .onboarding-welcome-image {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.onboarding-welcome-image svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Hotkey display — rounded keys, soft surface */
+.onboarding-hotkey {
+  display: inline-flex;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.onboarding-key {
+  width: 52px;
+  height: 52px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-sans);
+  font-size: 19px;
+  font-weight: 500;
+  background: var(--surface);
+  color: var(--ink);
+  border-radius: var(--radius-key);
+  letter-spacing: 0;
+  transition: background 200ms ease, transform 200ms ease;
+}
+
+.onboarding-key.wide {
+  width: auto;
+  padding: 0 16px;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+/* Form fields — rounded surface inputs, no underlines */
+.onboarding-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.onboarding-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.onboarding-label {
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  letter-spacing: -0.005em;
+}
+
+.onboarding-input-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  /* Frosted glass — translucent base + backdrop-filter so the body tint
+     and OS sidebar effect show through, matching the settings cards and
+     the overlay's surfaces. Light mode is near-opaque to read as a clean
+     white frosted field; dark mode stays much more translucent. */
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
+  transition: background 160ms ease, border-color 160ms ease;
+}
+
+.onboarding-input-row:focus-within {
+  background: rgba(255, 255, 255, 0.92);
+  border-color: var(--border-strong);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .onboarding-input-row {
+    background: rgba(255, 255, 255, 0.06);
+  }
+  :root:not([data-theme="light"]) .onboarding-input-row:focus-within {
+    background: rgba(255, 255, 255, 0.1);
+  }
+}
+
+:root[data-theme="dark"] .onboarding-input-row {
+  background: rgba(255, 255, 255, 0.06);
+}
+:root[data-theme="dark"] .onboarding-input-row:focus-within {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.onboarding-input {
+  flex: 1;
+  min-width: 0;
+  padding: 11px 14px;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  outline: none;
+  letter-spacing: 0;
+  border-radius: var(--radius-input);
+}
+
+/* Make room for the eye button on the right edge of the input. */
+.onboarding-input-row .onboarding-input {
+  padding-right: 44px;
+}
+
+.onboarding-input::placeholder {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+}
+
+.onboarding-input-eye {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease;
+}
+
+.onboarding-input-eye:hover {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
+.onboarding-input-eye:active {
+  background: color-mix(in srgb, var(--ink) 14%, transparent);
+}
+
+.onboarding-input-help {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  margin: 0;
+  padding-left: 2px;
+}
+
+/* Status card for Ollama step — frosted glass surface matching the
+   settings cards, no internal rules. */
+.onboarding-status {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .onboarding-status {
+    background: rgba(255, 255, 255, 0.06);
+  }
+}
+
+:root[data-theme="dark"] .onboarding-status {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.onboarding-status-row {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  font-size: 13.5px;
+  letter-spacing: -0.005em;
+}
+
+.onboarding-status-marker {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  position: relative;
+  transition: background 200ms ease;
+}
+
+.onboarding-status-marker.good {
+  background: var(--ink);
+}
+
+.onboarding-status-marker.good::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 5.5px;
+  width: 4px;
+  height: 1.5px;
+  background: var(--bg);
+  transform: rotate(45deg);
+  transform-origin: left center;
+  box-shadow: 5px -3.5px 0 0 var(--bg);
+}
+
+.onboarding-status-label {
+  color: var(--ink);
+}
+
+.onboarding-status-row.pending .onboarding-status-label {
+  color: var(--ink-2);
+}
+
+.onboarding-status-state {
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink-3);
+  letter-spacing: -0.005em;
+}
+
+.onboarding-status-state.good {
+  color: var(--ink);
+}
+
+/* Inline progress (install / pull) */
+.onboarding-progress-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 2px;
+}
+
+.onboarding-progress-meta {
+  font-size: 11.5px;
+  color: var(--ink-2);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  letter-spacing: -0.005em;
+}
+
+.onboarding-progress-bar {
+  width: 100%;
+  height: 3px;
+  background: var(--surface-2);
+  border-radius: 999px;
+  overflow: hidden;
+  position: relative;
+}
+
+.onboarding-progress-bar-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--ink);
+  border-radius: 999px;
+  transition: width 280ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.onboarding-progress-bar.indeterminate .onboarding-progress-bar-fill {
+  width: 32% !important;
+  animation: onboarding-indeterminate 1.4s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+@keyframes onboarding-indeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+
+/* CTA — secondary action between status and footer */
+.onboarding-cta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Action footer */
+.onboarding-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.onboarding-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-left: auto;
+}
+
+@media (max-width: 760px) {
+  .onboarding-step {
+    padding: 18px 22px 24px;
+  }
+
+  .onboarding-welcome-grid {
+    grid-template-columns: 1fr;
+    gap: 22px;
+  }
+
+  .onboarding-welcome-image {
+    max-height: 180px;
+  }
+
+  .onboarding-step-inner.welcome .onboarding-h1,
+  .onboarding-h1 {
+    font-size: 29px;
+  }
+
+  .onboarding-actions,
+  .onboarding-actions-right {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .onboarding-actions-right {
+    width: 100%;
+    gap: 8px;
+  }
+
+  .onboarding-btn,
+  .onboarding-link {
+    justify-content: center;
+  }
+}
+
+@media (max-height: 600px) {
+  .onboarding-progress-footer {
+    padding-bottom: 12px;
+  }
+
+  .onboarding-step {
+    padding-top: 10px;
+  }
+
+  .onboarding-step-inner {
+    gap: 10px;
+  }
+}
+
+/* Buttons — pill, soft */
+.onboarding-btn {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 10px 20px;
+  border-radius: var(--radius-button);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  letter-spacing: -0.005em;
+  transition:
+    background 200ms ease,
+    color 200ms ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.onboarding-btn:hover {
+  background: var(--surface-2);
+}
+
+.onboarding-btn:active {
+  background: color-mix(in srgb, var(--surface-2) 75%, var(--ink));
+}
+
+.onboarding-btn:disabled {
+  opacity: 0.36;
+  cursor: not-allowed;
+}
+
+.onboarding-btn.primary {
+  background: var(--ink);
+  color: var(--bg);
+}
+
+.onboarding-btn.primary:hover {
+  background: var(--ink-2);
+  color: var(--bg);
+}
+
+.onboarding-btn.primary:disabled {
+  background: var(--ink);
+  color: var(--bg);
+  opacity: 0.32;
+}
+
+.onboarding-btn .arrow {
+  font-size: 14px;
+  line-height: 1;
+  transition: transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  display: inline-flex;
+}
+
+.onboarding-btn:hover .arrow {
+  transform: translateX(3px);
+}
+
+.onboarding-btn.back-arrow:hover .arrow {
+  transform: translateX(-3px);
+}
+
+/* Text-only links */
+.onboarding-link {
+  background: transparent;
+  border: none;
+  padding: 6px 4px;
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: color 160ms ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  letter-spacing: -0.005em;
+}
+
+.onboarding-link:hover {
+  color: var(--ink);
+}
+
+.onboarding-link .arrow {
+  font-size: 13px;
+  line-height: 1;
+  transition: transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  display: inline-flex;
+}
+
+.onboarding-link.back:hover .arrow {
+  transform: translateX(-3px);
+}
+
+.onboarding-link:not(.back):hover .arrow {
+  transform: translateX(3px);
+}
+
+/* Active-provider radio group (shown only when 2+ keys entered) */
+.onboarding-active-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 0 0;
+}
+
+.onboarding-link.active {
+  color: var(--ink);
+  background: var(--surface);
+  border-radius: 999px;
+  padding: 6px 12px;
+}
+
+/* Inline alert */
+.onboarding-error {
+  font-size: 12.5px;
+  color: var(--ink);
+  background: var(--surface-2);
+  border-radius: 12px;
+  padding: 10px 14px;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+}
+
+/* Tutorial — interactive hotkey stage. No surface, no border — the keys
+   are the focal point, breathing on the page. */
+.onboarding-tutorial-stage {
+  padding: 28px 0 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 22px;
+}
+
+.onboarding-tutorial-prompt {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-3);
+  margin: 0;
+  letter-spacing: -0.005em;
+}
+
+.onboarding-tutorial-hotkey {
+  display: inline-flex;
+  gap: 8px;
+  position: relative;
+}
+
+/* Pulsing ring around the hotkey while we wait — staggered double.
+   Implemented with box-shadow rather than a border so it composes cleanly
+   with the borderless visual language. */
+.onboarding-tutorial-hotkey::before,
+.onboarding-tutorial-hotkey::after {
+  content: "";
+  position: absolute;
+  inset: -10px;
+  border-radius: 24px;
+  box-shadow: 0 0 0 1.5px var(--ink);
+  pointer-events: none;
+  animation: onboarding-ring 2.4s cubic-bezier(0.22, 0.61, 0.36, 1) infinite;
+}
+
+.onboarding-tutorial-hotkey::after {
+  animation-delay: 1.2s;
+}
+
+@keyframes onboarding-ring {
+  0% {
+    inset: -8px;
+    opacity: 0.5;
+  }
+  100% {
+    inset: -44px;
+    opacity: 0;
+  }
+}
+
+.onboarding-tutorial-hotkey .onboarding-key {
+  width: 88px;
+  height: 88px;
+  font-size: 34px;
+  font-weight: 500;
+  background: var(--surface);
+  border-radius: 16px;
+}
+
+/* Completion check */
+.onboarding-check {
+  width: 76px;
+  height: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 36px;
+  font-weight: 500;
+  border-radius: 50%;
+  animation: onboarding-check-in 540ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+
+@keyframes onboarding-check-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.82);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}

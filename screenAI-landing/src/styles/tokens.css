@@ -1,0 +1,48 @@
+:root {
+  /* Page palette (from Screenie AI Landing Page Design Skill) */
+  --bg: #030303;
+  --bg-soft: #080808;
+  --panel: rgba(255, 255, 255, 0.045);
+  --panel-strong: rgba(255, 255, 255, 0.075);
+  --border: rgba(255, 255, 255, 0.12);
+  --border-strong: rgba(255, 255, 255, 0.24);
+  --text: #f5f5f5;
+  --text-muted: rgba(255, 255, 255, 0.62);
+  --text-faint: rgba(255, 255, 255, 0.38);
+  --white: #ffffff;
+  --black: #000000;
+  --glow: rgba(255, 255, 255, 0.18);
+  --scanline: rgba(255, 255, 255, 0.08);
+  --selection: rgba(255, 255, 255, 0.16);
+
+  /* Frosted recipe (from parent app's Chat panel) */
+  --frost-bg: rgba(28, 30, 29, 0.56);
+  --frost-blur: blur(22px) saturate(125%) brightness(0.86);
+  --frost-hairline: rgba(255, 255, 255, 0.42);
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco,
+    Consolas, "Liberation Mono", "Courier New", monospace;
+
+  /* Motion */
+  --ease-spawn: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Layout */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 18px;
+  --radius-panel: 24px;
+
+  --maxw: 1180px;
+  --gutter: clamp(20px, 4vw, 48px);
+
+  --nav-height: 56px;
+}
+
+::selection {
+  background: var(--selection);
+  color: var(--white);
+}

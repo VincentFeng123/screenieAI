@@ -1,0 +1,193 @@
+.sl-shell {
+  position: relative;
+  isolation: isolate;
+  min-height: 100vh;
+}
+
+.sl-container {
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+}
+
+/* ----- Nav ----- */
+.sl-nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  height: var(--nav-height);
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid transparent;
+  transition: background 200ms ease, backdrop-filter 200ms ease, border-color 200ms ease;
+}
+
+.sl-nav[data-scrolled="1"] {
+  background: rgba(3, 3, 3, 0.7);
+  backdrop-filter: blur(14px) saturate(120%);
+  -webkit-backdrop-filter: blur(14px) saturate(120%);
+  border-bottom-color: var(--border);
+}
+
+.sl-nav__inner {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.sl-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  font-size: 15px;
+}
+
+.sl-brand__mark {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  border: 1px solid var(--border-strong);
+  position: relative;
+  overflow: hidden;
+}
+.sl-brand__mark::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  background: var(--text);
+}
+
+.sl-brand__name {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.sl-brand__name b {
+  font-weight: 500;
+  color: var(--text);
+}
+.sl-brand__name span {
+  font-weight: 400;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sl-nav__links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.sl-nav__links a {
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+  border-radius: 8px;
+  transition: color 120ms ease, background 120ms ease;
+}
+.sl-nav__links a:hover {
+  color: var(--text);
+  background: var(--panel);
+}
+
+.sl-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  border-radius: 999px;
+  background: var(--white);
+  color: var(--black);
+  transition: transform 120ms var(--ease-out), background 120ms ease;
+  white-space: nowrap;
+}
+.sl-btn:hover { transform: translateY(-1px); background: #ebebed; }
+.sl-btn--ghost {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.sl-btn--ghost:hover { background: var(--panel); border-color: var(--border-strong); }
+.sl-btn--lg { height: 44px; padding: 0 22px; font-size: 14px; }
+.sl-btn[disabled] { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
+
+@media (max-width: 720px) {
+  .sl-nav__links { display: none; }
+}
+
+/* ----- Footer ----- */
+.sl-footer {
+  border-top: 1px solid var(--border);
+  padding: 24px 0 36px;
+  margin-top: 80px;
+  position: relative;
+  z-index: 1;
+}
+.sl-footer__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.sl-footer__links { display: flex; gap: 18px; }
+.sl-footer__links a:hover { color: var(--text-muted); }
+
+/* ----- Section base ----- */
+.sl-section {
+  position: relative;
+  z-index: 1;
+  padding: clamp(80px, 12vw, 140px) 0;
+}
+.sl-section__head {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: clamp(40px, 6vw, 64px);
+  max-width: 720px;
+}
+.sl-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.sl-eyebrow::before {
+  content: "";
+  width: 18px;
+  height: 1px;
+  background: var(--border-strong);
+}
+.sl-section__title {
+  font-size: clamp(2rem, 4.4vw, 3.2rem);
+  letter-spacing: -0.025em;
+  line-height: 1.02;
+  color: var(--text);
+}
+.sl-section__lede {
+  color: var(--text-muted);
+  font-size: clamp(15px, 1.4vw, 17px);
+  max-width: 56ch;
+}
