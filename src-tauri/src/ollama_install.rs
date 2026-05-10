@@ -394,7 +394,9 @@ fn windows_shell_execute_installer(path: &Path) -> bool {
     let path_w = PCWSTR::from_raw(path_h.as_ptr());
     let inst = unsafe {
         ShellExecuteW(
-            HWND(0),
+            // HWND in windows-rs 0.58 is `pub struct HWND(*mut c_void)` —
+            // a literal 0 won't coerce. Use a null pointer for "no owner."
+            HWND(core::ptr::null_mut()),
             // "runas" forces an elevated launch. Plain "open" would
             // sometimes attach the installer to our process tree without
             // the elevation prompt, leaving the installer stuck at

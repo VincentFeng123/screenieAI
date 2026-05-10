@@ -76,34 +76,50 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Export code-signing env vars ONLY when their corresponding repo
+      # secrets are non-empty. `tauri-action` interprets an empty
+      # `APPLE_CERTIFICATE` as "the user is trying to sign" and attempts
+      # `security import` with empty cert data, which fails the build —
+      # see https://github.com/tauri-apps/tauri-action/issues/... .
+      # By writing the vars into $GITHUB_ENV from a shell step only when
+      # they have values, builds without certs run clean (unsigned), and
+      # builds with certs configured are signed automatically — no
+      # workflow change needed when you eventually add the secrets.
+      - name: Configure code-signing env (if certs are configured)
+        shell: bash
+        env:
+          APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERT_PW: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID_USER: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PW: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          WIN_CERT: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WIN_CERT_PW: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          TAURI_SIGN_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGN_KEY_PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -e
+          push() { [ -n "$2" ] && echo "$1=$2" >> "$GITHUB_ENV"; }
+          push APPLE_CERTIFICATE "$APPLE_CERT"
+          push APPLE_CERTIFICATE_PASSWORD "$APPLE_CERT_PW"
+          push APPLE_SIGNING_IDENTITY "$APPLE_IDENTITY"
+          push APPLE_ID "$APPLE_ID_USER"
+          push APPLE_PASSWORD "$APPLE_ID_PW"
+          push APPLE_TEAM_ID "$APPLE_TEAM"
+          push WINDOWS_CERTIFICATE "$WIN_CERT"
+          push WINDOWS_CERTIFICATE_PASSWORD "$WIN_CERT_PW"
+          push TAURI_SIGNING_PRIVATE_KEY "$TAURI_SIGN_KEY"
+          push TAURI_SIGNING_PRIVATE_KEY_PASSWORD "$TAURI_SIGN_KEY_PW"
+
       - name: Build and publish bundle
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-          # macOS code signing + notarization. All optional; missing
-          # secrets produce an unsigned build (Gatekeeper will warn users
-          # on first launch). Set these in repo Settings → Secrets and
-          # variables → Actions once you have an Apple Developer ID.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-
-          # Windows Authenticode code signing. Set this once you've
-          # bought a code-signing certificate (EV cert recommended for
-          # instant SmartScreen trust). The thumbprint is the SHA-1 of
-          # the cert installed on the runner.
-          # See https://v2.tauri.app/distribute/sign/windows
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-
-          # Tauri updater signing. Used by the auto-updater plugin if /
-          # when you add it; harmless to leave blank otherwise.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Signing env vars (if any) flow in via $GITHUB_ENV from the
+          # step above. Don't list them here — listing an empty secret
+          # as an env: value passes the empty string through and trips
+          # tauri-action's signing path.
         with:
           # When triggered by a tag push, ref_name is the tag (e.g.
           # "v0.2.0"). When triggered manually via workflow_dispatch, it's
