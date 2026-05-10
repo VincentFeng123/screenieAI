@@ -100,7 +100,14 @@ jobs:
           TAURI_SIGN_KEY_PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -e
-          push() { [ -n "$2" ] && echo "$1=$2" >> "$GITHUB_ENV"; }
+          # `set -e` + `[ … ] && echo` short-circuits the function to exit 1
+          # when the test is false (no cert), which kills the whole step.
+          # Explicit if/fi returns 0 in the no-op case.
+          push() {
+            if [ -n "$2" ]; then
+              echo "$1=$2" >> "$GITHUB_ENV"
+            fi
+          }
           push APPLE_CERTIFICATE "$APPLE_CERT"
           push APPLE_CERTIFICATE_PASSWORD "$APPLE_CERT_PW"
           push APPLE_SIGNING_IDENTITY "$APPLE_IDENTITY"
