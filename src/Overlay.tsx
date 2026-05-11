@@ -4447,7 +4447,7 @@ function PermissionBanner({
   const isMac =
     typeof navigator !== "undefined" && navigator.userAgent.includes("Mac");
   const explanation = isMac
-    ? "This usually means macOS has not granted Screen Recording permission to Screenie AI. If the screen is intentionally black, close this banner and retry on the region you want to capture."
+    ? "If you've already enabled Screen Recording for Screenie AI in System Settings → Privacy & Security, you still need to quit and reopen the app — macOS caches the permission state per running process and only re-checks at launch. Use Quit & relaunch below. If you haven't granted it yet, open System Settings first."
     : "This usually means the region you captured contained DRM-protected content (Netflix, some banking apps, fullscreen games) or a window that opts out of capture. If the screen is intentionally black, close this banner and retry on a different region.";
   const settingsLabel = isMac
     ? "Open System Settings ↗"
@@ -4512,23 +4512,42 @@ function PermissionBanner({
         >
           {explanation}
         </p>
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            justifyContent: "flex-end",
+            flexWrap: "wrap",
+          }}
+        >
           <button className="screenie-action" onClick={onRetry ?? onClose}>
-            Close · I'll retry
+            Close
           </button>
           <button
             className="screenie-action"
-            style={{
-              background: "rgba(255,255,255,0.95)",
-              color: "#0a0a0a",
-              borderColor: "rgba(255,255,255,1)",
-            }}
             onClick={() => {
               invoke("open_screen_settings");
             }}
           >
             {settingsLabel}
           </button>
+          {isMac && (
+            <button
+              className="screenie-action"
+              style={{
+                background: "rgba(255,255,255,0.95)",
+                color: "#0a0a0a",
+                borderColor: "rgba(255,255,255,1)",
+              }}
+              onClick={() => {
+                invoke("restart_app").catch((e) =>
+                  console.error("restart_app failed:", e),
+                );
+              }}
+            >
+              Quit &amp; relaunch
+            </button>
+          )}
         </div>
       </div>
     </div>

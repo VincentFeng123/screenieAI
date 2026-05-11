@@ -1160,6 +1160,20 @@ fn quit_app(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// Hard-quit and re-launch the process. Used by the Screen Recording
+/// permission banner on macOS: TCC caches the screen-recording grant
+/// per-process at launch, so a user who flips the toggle while
+/// Screenie is running can't see the new state without a fresh
+/// process. `AppHandle::restart()` runs the platform-specific cleanup
+/// and re-spawns Screenie in one call (returns `!`).
+#[tauri::command]
+fn restart_app(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    if window.label() != "overlay" && window.label() != "main" {
+        return Err("command not allowed from this window".into());
+    }
+    app.restart()
+}
+
 fn restore_main_window(app: &AppHandle, emit_tutorial_complete: bool) {
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(ActivationPolicy::Regular);
@@ -2498,6 +2512,7 @@ pub fn run() {
             cancel_ai,
             open_screen_settings,
             quit_app,
+            restart_app,
             ask_ai,
             check_ollama,
             check_ollama_installed,
