@@ -1634,11 +1634,37 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     // `screenie_install_overlay_deactivate_hider` + space/window-list poll —
     // which emits `overlay-background-changed` to React whenever the visible
     // top-level window list changes, so the frosted backdrop stays fresh.
+    //
+    // CRITICAL: low-level hooks (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) only fire
+    // on a thread with a Win32 message loop — Microsoft's docs say the OS
+    // posts hook events as messages to the installer thread, which then
+    // dispatches them via its message pump. Tokio worker threads have no
+    // message loop, so installing the hooks here directly (this function
+    // is called from `tauri::async_runtime::spawn`'d tasks) leaves both
+    // hooks dormant: Esc never gets consumed and `WS_EX_TRANSPARENT` is
+    // never toggled — making the overlay swallow every click instead of
+    // letting it fall through to the app underneath. Dispatching to the
+    // main UI thread (which Tauri runs the wry/winit message pump on)
+    // puts the hooks on a thread that actually pumps. The macOS bridge
+    // already follows this same pattern via `app.run_on_main_thread`.
     windows_window::configure_overlay_window(window, app);
     let _ = window.show();
     windows_window::order_overlay_window(window);
-    let _ = windows_window::install_overlay_escape_monitor();
-    windows_window::start_overlay_background_observer();
+    if let Err(e) = app.run_on_main_thread(|| {
+        let _ = windows_window::install_overlay_escape_monitor();
+        // Background observer doesn't share the hook's message-loop
+        // requirement (it's a tokio interval task), but moving it inside
+        // this dispatch keeps the show-overlay sequencing clean.
+        windows_window::start_overlay_background_observer();
+    }) {
+        eprintln!(
+            "[screenie] show_overlay_window: main-thread dispatch failed: {e}"
+        );
+        // Fall back to in-place install — hooks won't fire, but the
+        // overlay at least appears so the user can dismiss it.
+        let _ = windows_window::install_overlay_escape_monitor();
+        windows_window::start_overlay_background_observer();
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1702,6 +1728,8 @@ async fn capture_and_show_overlay(app: AppHandle) {
             let _ = w.hide();
         }
         // Brief pause so macOS finishes the hide before screencapture fires.
+        // Windows hides synchronously; no settle time needed.
+        #[cfg(target_os = "macos")]
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     } else if let Some(w) = app.get_webview_window("main") {
         if w.is_visible().unwrap_or(false) {
@@ -1715,7 +1743,9 @@ async fn capture_and_show_overlay(app: AppHandle) {
             let _ = app.set_activation_policy(ActivationPolicy::Accessory);
             // Native fullscreen Spaces are especially sensitive to an app's
             // normal window being visible in another Space. Let AppKit finish
-            // hiding Settings before we build the overlay.
+            // hiding Settings before we build the overlay. Windows has no
+            // Spaces concept and hide is synchronous, so we skip the wait.
+            #[cfg(target_os = "macos")]
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
     }
@@ -1738,6 +1768,14 @@ async fn capture_and_show_overlay(app: AppHandle) {
                 state.overlay_alive.store(false, Ordering::Relaxed);
             }
             let _ = overlay.hide();
+            // macOS needs a beat for AppKit to finish the hide before the
+            // next screencapture, otherwise the previous overlay's pixels
+            // bake into the new background. On Windows the overlay carries
+            // `WDA_EXCLUDEFROMCAPTURE`, so BitBlt skips it even while it's
+            // still on-screen — no settle needed, and the wait was the
+            // single biggest contributor to perceived hotkey lag on
+            // re-trigger.
+            #[cfg(target_os = "macos")]
             tokio::time::sleep(std::time::Duration::from_millis(180)).await;
         }
     }

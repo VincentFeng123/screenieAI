@@ -42,6 +42,19 @@ export function BlurredBackdrop(props: {
   return <WindowsBlurredBackdrop {...props} />;
 }
 
+// Caller blur radii are tuned for the macOS NSVisualEffectView path (which
+// applies its own ~50-80px-equivalent blur on top in the system compositor).
+// CSS filter:blur() on a static bitmap is qualitatively different — a 26px
+// CSS blur reads as a noticeably milder smear than the live OS-level vibrancy
+// the Mac side gets. Scaling the caller's value up at this layer keeps the
+// per-call-site tuning meaningful (toolbar < chat panel) while bringing the
+// Windows panels into the same visual ballpark as the Mac.
+const WIN_BLUR_SCALE = 2.4;
+// Saturation boost mirrors the slight saturation lift NSVisualEffectMaterial.sidebar
+// applies — without it the static-bitmap blur reads as a gray mush instead of
+// faintly tinted glass.
+const WIN_SATURATION = 1.4;
+
 function WindowsBlurredBackdrop({
   src,
   screenW,
@@ -62,6 +75,7 @@ function WindowsBlurredBackdrop({
   persistImage?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const effectiveBlur = blurRadius * WIN_BLUR_SCALE;
 
   // Track the parent panel's screen-relative origin so the bitmap inside
   // each panel shows the part of the screen directly behind it. Earlier
@@ -120,7 +134,7 @@ function WindowsBlurredBackdrop({
           backgroundImage: `url(data:image/png;base64,${src})`,
           backgroundSize: `${screenW}px ${screenH}px`,
           backgroundRepeat: "no-repeat",
-          filter: `blur(${blurRadius}px) brightness(${imageBrightness})`,
+          filter: `blur(${effectiveBlur}px) brightness(${imageBrightness}) saturate(${WIN_SATURATION})`,
           zIndex: 0,
           pointerEvents: "none",
         }}

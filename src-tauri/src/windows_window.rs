@@ -155,12 +155,22 @@ fn overlay_app() -> &'static Mutex<Option<AppHandle>> {
 
 /// Apply Mica system backdrop + immersive dark mode to the main settings
 /// window. No-op on Windows 10 (the DWM attributes are silently ignored).
+///
+/// Also marks the window as excluded from screen capture
+/// (`WDA_EXCLUDEFROMCAPTURE`). This is what lets `trigger_capture_flow`
+/// fire BitBlt immediately on hotkey without first waiting for `Settings`
+/// or `Chat` to finish hiding — the desktop snapshot will skip our own
+/// pixels regardless of whether the window is still visible. Macs get the
+/// same property "for free" via ScreenCaptureKit's exclude-self filter.
 pub fn configure_main_window(window: &WebviewWindow) {
     let Some(hwnd) = get_hwnd(window) else {
         return;
     };
     enable_dark_mode(hwnd);
     apply_mica_backdrop(hwnd);
+    unsafe {
+        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+    }
 }
 
 /// Apply the overlay's extended window styles + the screen-capture exclusion
