@@ -21,7 +21,7 @@
 /* applied via DWM in `windows_window::configure_main_window`.         */
 /* ------------------------------------------------------------------ */
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 
 const isWindowsPlatform =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
@@ -62,65 +62,52 @@ function WindowsBlurredBackdrop({
   persistImage?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  // Background-position offset that anchors the bitmap so the panel shows
-  // the screen content directly behind itself. The bitmap covers the
-  // overlay's viewport; we shift it by the panel's screen-relative origin
-  // so each panel sees a window into the same global frame.
-  const [pos, setPos] = useState<{ left: number; top: number }>({
-    left: 0,
-    top: 0,
-  });
 
-  useLayoutEffect(() => {
-    const el = ref.current;
-    const parent = el?.parentElement;
-    if (!el || !parent) return;
-    const update = () => {
-      const rect = parent.getBoundingClientRect();
-      setPos((prev) => {
-        const nextLeft = -rect.left;
-        const nextTop = -rect.top;
-        if (
-          Math.abs(prev.left - nextLeft) < 0.5 &&
-          Math.abs(prev.top - nextTop) < 0.5
-        ) {
-          return prev;
-        }
-        return { left: nextLeft, top: nextTop };
-      });
-    };
-    update();
-    // ResizeObserver catches CSS-driven size changes (edit-pill 36→280
-    // expansion, textarea auto-grow). MutationObserver catches inline-
-    // style changes (toolbar following the rect, chat panel drag). Between
-    // them, every position/size change React triggers fires an update
-    // without us needing a rAF loop per BlurredBackdrop instance.
-    const ro = new ResizeObserver(update);
-    ro.observe(parent);
-    const mo = new MutationObserver(update);
-    mo.observe(parent, {
-      attributes: true,
-      attributeFilter: ["style", "class"],
-    });
-    return () => {
-      ro.disconnect();
-      mo.disconnect();
-    };
-  }, []);
-
+  // Track the parent panel's screen-relative origin so the bitmap inside
+  // each panel shows the part of the screen directly behind it. Earlier
+  // versions of this hook used MutationObserver on the parent's style
+  // attribute, which created a feedback loop with the overlay's
+  // `useOverlayInteractionRegions` body-subtree observer — every BlurredBackdrop
+  // setState fired the regions IPC, which re-rendered React, which set new
+  // styles, repeat. The rAF loop below is allocation-free, doesn't go
+  // through React state, and only writes the `backgroundPosition` style
+  // when the value actually changes, so it stays cheap even across 8
+  // mounted instances during a chat-panel drag.
   useEffect(() => {
-    // Window-level resize / scroll affect every panel's screen position, so
-    // sync all instances when those fire.
-    const onResize = () => {
-      const parent = ref.current?.parentElement;
-      if (!parent) return;
+    let raf = 0;
+    let lastLeft = Number.NaN;
+    let lastTop = Number.NaN;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const el = ref.current;
+      const parent = el?.parentElement;
+      if (!el || !parent) return;
       const rect = parent.getBoundingClientRect();
-      setPos({ left: -rect.left, top: -rect.top });
+      const nextLeft = -rect.left;
+      const nextTop = -rect.top;
+      if (
+        Math.abs(nextLeft - lastLeft) < 0.5 &&
+        Math.abs(nextTop - lastTop) < 0.5
+      ) {
+        return;
+      }
+      lastLeft = nextLeft;
+      lastTop = nextTop;
+      // Direct style write — bypasses React reconciliation. Each frame
+      // becomes one getBoundingClientRect + (at most) one style assignment.
+      el.style.backgroundPosition = `${nextLeft}px ${nextTop}px`;
     };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
   }, []);
 
+  // All three layers carry the `screenie-blurred-backdrop` class so the
+  // `.screenie-chat-panel > :not(.screenie-blurred-backdrop)` rule in
+  // overlay.css correctly excludes them from the z-index: 1 layer reserved
+  // for actual panel content. Without this the tint/fill divs would land
+  // on the same layer as the content, painting OVER buttons (they have
+  // pointer-events: none so clicks still reach controls — but they read as
+  // milky-glass on top of text, which is the wrong look).
   return (
     <>
       <div
@@ -132,18 +119,14 @@ function WindowsBlurredBackdrop({
           inset: 0,
           backgroundImage: `url(data:image/png;base64,${src})`,
           backgroundSize: `${screenW}px ${screenH}px`,
-          backgroundPosition: `${pos.left}px ${pos.top}px`,
           backgroundRepeat: "no-repeat",
           filter: `blur(${blurRadius}px) brightness(${imageBrightness})`,
-          // Overshoot the blur radius so the blur kernel can sample pixels
-          // from beyond the panel's edge — without this, the blurred edge
-          // is darkened by the transparent border.
-          margin: -blurRadius,
           zIndex: 0,
           pointerEvents: "none",
         }}
       />
       <div
+        className="screenie-blurred-backdrop"
         aria-hidden
         style={{
           position: "absolute",
@@ -154,6 +137,7 @@ function WindowsBlurredBackdrop({
         }}
       />
       <div
+        className="screenie-blurred-backdrop"
         aria-hidden
         style={{
           position: "absolute",

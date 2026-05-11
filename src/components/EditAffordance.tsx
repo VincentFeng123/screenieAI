@@ -101,17 +101,30 @@ export default function EditAffordance(props: EditAffordanceProps) {
   const { ctl, anchor } = props;
   if (anchor.hidden) return null;
 
-  // Render the popover whenever the pill is open and a tool is selected,
-  // even when `popoverOpen` is false. We pass `visible` through so the
-  // popover can run a CSS fade-out animation before the (next) unmount —
-  // necessary so that pointer-down on the canvas (which sets popoverOpen
-  // to false to hide the panel while the user draws) produces a smooth
-  // fade rather than an abrupt disappearance.
+  // Snap-unmount on close — no fade-out animation. The popover renders
+  // only while `popoverOpen` is true; the moment it flips false, the
+  // popover unmounts in the same React tick.
+  //
+  // Why no fade: the popover's frosted background is provided by a
+  // sibling `NSVisualEffectView` (macOS) or a bitmap `BlurredBackdrop`
+  // (Windows) that is REGISTERED with `useOverlayFrostRegions` based on
+  // a `MutationObserver` watching attribute/childList changes on the body
+  // subtree. A CSS opacity transition isn't a mutation, so during the
+  // fade window the native frost layer stays mounted at the popover's
+  // last position even though the React content has faded to opacity 0.
+  // Users saw a "leftover dark rectangle" — the frost without its
+  // content — for the 50–80 ms between fade-completion and the next
+  // MutationObserver-driven re-sync.
+  //
+  // Unmounting immediately fires the body-subtree MutationObserver's
+  // `childList` callback, which re-syncs the frost region list, which
+  // removes the native view — all in one tick. Content and frost
+  // disappear together, matching what the user expects.
   return (
     <>
       <EditPill {...props} />
-      {ctl.open && ctl.tool && (
-        <EditPopover {...props} visible={ctl.popoverOpen} />
+      {ctl.open && ctl.tool && ctl.popoverOpen && (
+        <EditPopover {...props} visible />
       )}
     </>
   );
@@ -603,7 +616,13 @@ function EditPopover({
         position: "absolute",
         left: chosen.x,
         top: chosen.y,
-        zIndex: 13,
+        // Bumped well above the rest of the overlay's z-index range
+        // (capture rect ~0, edit pill 12, action bar 12, toast pills 20)
+        // so the popover can never end up underneath a toast that
+        // happens to spawn at the same screen position, or a panel that
+        // some future change gives an explicit z-index. The natural
+        // place for a transient tool palette is "above everything."
+        zIndex: 9999,
         pointerEvents: visible ? "auto" : "none",
       }}
       onMouseDown={(e) => e.stopPropagation()}

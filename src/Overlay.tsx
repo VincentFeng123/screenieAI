@@ -120,10 +120,52 @@ function relayOverlayPointerClick(button: number) {
   });
 }
 
+// Track scroll-gesture phase so the macOS synthetic CGEvents the relay
+// posts carry the same Began/Changed/Ended sequence a real trackpad
+// gesture would. Without these, the receiving app treats each event as
+// a discrete mouse-wheel tick (instant jump, no momentum), and the
+// stream mixes phaseless synth ticks with phased real-passthrough
+// events — the result reads as choppy scrolling. Phase values match
+// kCGScrollPhase: 1=Began, 2=Changed, 4=Ended. The Rust side just
+// forwards the int to native; Windows ignores it (Win32 SendInput has
+// no phase concept).
+const WHEEL_PHASE_BEGAN = 1;
+const WHEEL_PHASE_CHANGED = 2;
+const WHEEL_PHASE_ENDED = 4;
+const WHEEL_IDLE_END_MS = 100;
+let wheelLastEventMs = 0;
+let wheelEndedTimer: number | null = null;
+
 function relayOverlayWheel(deltaX: number, deltaY: number) {
-  invoke("relay_overlay_wheel", { deltaX, deltaY }).catch((e) => {
+  const now = performance.now();
+  const sinceLast = now - wheelLastEventMs;
+  wheelLastEventMs = now;
+  if (wheelEndedTimer !== null) {
+    window.clearTimeout(wheelEndedTimer);
+    wheelEndedTimer = null;
+  }
+  // First event after an idle period starts a new gesture. JS WheelEvent
+  // doesn't expose phase info directly, so we infer Began vs Changed
+  // from the gap between events.
+  const phase =
+    sinceLast > WHEEL_IDLE_END_MS ? WHEEL_PHASE_BEGAN : WHEEL_PHASE_CHANGED;
+  invoke("relay_overlay_wheel", { deltaX, deltaY, phase }).catch((e) => {
     console.error("relay_overlay_wheel failed:", e);
   });
+  // Synth an Ended event after a brief idle so the receiving app
+  // terminates its scroll gesture cleanly. The user's real Ended event
+  // may or may not have passed through (depends on the relay/passthrough
+  // alternation); the timer ensures the app always sees one.
+  wheelEndedTimer = window.setTimeout(() => {
+    wheelEndedTimer = null;
+    invoke("relay_overlay_wheel", {
+      deltaX: 0,
+      deltaY: 0,
+      phase: WHEEL_PHASE_ENDED,
+    }).catch((e) => {
+      console.error("relay_overlay_wheel (ended) failed:", e);
+    });
+  }, WHEEL_IDLE_END_MS);
 }
 
 type Handle =
@@ -1619,6 +1661,9 @@ function AdjustingLayer({
     TOP_HINT_RESERVED_H,
   );
   const editAnchor = placeEditAffordance(rect, W, H, toolbarBox, null, null);
+  const pillBox =
+    editCtl.open && !editAnchor.hidden ? editAnchorBox(editAnchor, true) : null;
+  const hiddenHandles = useObscuredHandles(rect, pillBox);
 
   const [adjustingToast, setAdjustingToast] = useState<{
     text: string;
@@ -1723,7 +1768,7 @@ function AdjustingLayer({
           style={{ ...style, pointerEvents: editCtl.tool ? "none" : "auto" }}
         />
       ))}
-      {HANDLES.map((h) => (
+      {HANDLES.filter((h) => !hiddenHandles.has(h)).map((h) => (
         <div key={`v-${h}`} className="screenie-handle" style={handleStyle(rect, h)} />
       ))}
       {HANDLES.map((h) => (
@@ -3670,6 +3715,9 @@ function ResultLayer({
       : null,
     showChatBox,
   );
+  const pillBox =
+    editCtl.open && !editAnchor.hidden ? editAnchorBox(editAnchor, true) : null;
+  const hiddenHandles = useObscuredHandles(rect, pillBox);
   const affordanceAvoidBoxes: PlacementBox[] = [toolbarBox];
   if (chatPanelVisible && panel) {
     affordanceAvoidBoxes.push({ x: panel.x, y: panel.y, w: panel.w, h: panel.h });
@@ -3816,7 +3864,7 @@ function ResultLayer({
           style={{ ...style, pointerEvents: editCtl.tool ? "none" : "auto" }}
         />
       ))}
-      {HANDLES.map((h) => (
+      {HANDLES.filter((h) => !hiddenHandles.has(h)).map((h) => (
         <div key={`v-${h}`} className="screenie-handle" style={handleStyle(rect, h)} />
       ))}
       {HANDLES.map((h) => (
@@ -4683,6 +4731,89 @@ function handleStyle(rect: Rect, h: Handle): React.CSSProperties {
         background: color,
       };
   }
+}
+
+/// Bbox of the visible resize handle — mirrors the geometry in
+/// `handleStyle`. Used by `useObscuredHandles` to decide whether a given
+/// handle is covered by the expanded edit pill or popover.
+function handleBbox(rect: Rect, h: Handle): PlacementBox {
+  const shortEdge = Math.max(1, Math.min(rect.w, rect.h));
+  const T = clamp(shortEdge * 0.07, 2, 4);
+  const HALF = T / 2;
+  const CORNER = scaledHandleLength(shortEdge, 0.32, 8, 22);
+  const EDGE_H = scaledHandleLength(rect.w, 0.34, 10, 44);
+  const EDGE_V = scaledHandleLength(rect.h, 0.34, 10, 44);
+  switch (h) {
+    case "nw":
+      return { x: rect.x - HALF, y: rect.y - HALF, w: CORNER, h: CORNER };
+    case "ne":
+      return { x: rect.x + rect.w - CORNER + HALF, y: rect.y - HALF, w: CORNER, h: CORNER };
+    case "se":
+      return {
+        x: rect.x + rect.w - CORNER + HALF,
+        y: rect.y + rect.h - CORNER + HALF,
+        w: CORNER,
+        h: CORNER,
+      };
+    case "sw":
+      return { x: rect.x - HALF, y: rect.y + rect.h - CORNER + HALF, w: CORNER, h: CORNER };
+    case "n":
+      return { x: rect.x + rect.w / 2 - EDGE_H / 2, y: rect.y - HALF, w: EDGE_H, h: T };
+    case "s":
+      return { x: rect.x + rect.w / 2 - EDGE_H / 2, y: rect.y + rect.h - HALF, w: EDGE_H, h: T };
+    case "e":
+      return { x: rect.x + rect.w - HALF, y: rect.y + rect.h / 2 - EDGE_V / 2, w: T, h: EDGE_V };
+    case "w":
+      return { x: rect.x - HALF, y: rect.y + rect.h / 2 - EDGE_V / 2, w: T, h: EDGE_V };
+  }
+}
+
+/// Returns the set of resize handles obscured by the expanded edit pill
+/// or popover so the calling layer can skip rendering just those.
+///
+/// The pill's bbox is supplied by the caller (we have it without a DOM
+/// query via `editAnchorBox`); the popover's bbox is read from the DOM
+/// because EditPopover picks its own placement based on internal sizing
+/// logic that the parent doesn't see.
+function useObscuredHandles(
+  rect: Rect,
+  pillBox: PlacementBox | null,
+): Set<Handle> {
+  const [popoverBox, setPopoverBox] = useState<PlacementBox | null>(null);
+  // Re-measure every render: the popover repositions when the pill moves
+  // (rect drag), opens/closes on tool switches, and resizes on content
+  // changes. State update bails when nothing moved, so this stays cheap.
+  useLayoutEffect(() => {
+    const el = document.querySelector<HTMLElement>(".screenie-edit-popover");
+    if (!el || el.offsetWidth < 1 || el.offsetHeight < 1) {
+      setPopoverBox((prev) => (prev === null ? prev : null));
+      return;
+    }
+    const r = el.getBoundingClientRect();
+    const next: PlacementBox = { x: r.left, y: r.top, w: r.width, h: r.height };
+    setPopoverBox((prev) =>
+      prev &&
+      Math.abs(prev.x - next.x) < 0.5 &&
+      Math.abs(prev.y - next.y) < 0.5 &&
+      Math.abs(prev.w - next.w) < 0.5 &&
+      Math.abs(prev.h - next.h) < 0.5
+        ? prev
+        : next,
+    );
+  });
+  const hidden = new Set<Handle>();
+  if (!pillBox && !popoverBox) return hidden;
+  for (const h of HANDLES) {
+    const hb = handleBbox(rect, h);
+    if (pillBox && intersectsWithGap(hb, pillBox, 0)) {
+      hidden.add(h);
+      continue;
+    }
+    if (popoverBox && intersectsWithGap(hb, popoverBox, 0)) {
+      hidden.add(h);
+    }
+  }
+  return hidden;
 }
 
 function moveHitAreas(rect: Rect): React.CSSProperties[] {

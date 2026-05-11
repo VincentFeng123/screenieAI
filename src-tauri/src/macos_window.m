@@ -832,7 +832,7 @@ static bool screenie_post_mouse_click(CGPoint point, CGMouseButton button) {
   return true;
 }
 
-static bool screenie_post_scroll(double deltaX, double deltaY) {
+static bool screenie_post_scroll(double deltaX, double deltaY, int phase) {
   if (!screenie_can_post_mouse_events()) {
     return false;
   }
@@ -853,6 +853,18 @@ static bool screenie_post_scroll(double deltaX, double deltaY) {
                                     wheelX);
   if (scroll == NULL) {
     return false;
+  }
+  // Tag the synthetic event as a continuous (trackpad-style) scroll and
+  // stamp the gesture phase JS inferred. Without these the receiving
+  // app's compositor treats each event as a discrete mouse-wheel tick:
+  // no momentum, no rubber-band, no continuity with the user's real
+  // passthrough wheel events that arrive between relays — and the mix
+  // of phased real events with phaseless synth events is what reads as
+  // choppy. Phase values match kCGScrollPhase (1=Began, 2=Changed,
+  // 4=Ended); 0 means "don't stamp a phase".
+  CGEventSetIntegerValueField(scroll, kCGScrollWheelEventIsContinuous, 1);
+  if (phase != 0) {
+    CGEventSetIntegerValueField(scroll, kCGScrollWheelEventScrollPhase, phase);
   }
   CGEventPost(kCGHIDEventTap, scroll);
   CFRelease(scroll);
@@ -1002,7 +1014,9 @@ static bool screenie_relay_overlay_click_at_current_mouse(NSInteger buttonNumber
   return true;
 }
 
-static bool screenie_relay_overlay_scroll(double deltaX, double deltaY) {
+static bool screenie_relay_overlay_scroll(double deltaX,
+                                          double deltaY,
+                                          int phase) {
   if (screenieOverlayWindow == nil || ![screenieOverlayWindow isVisible]) {
     return false;
   }
@@ -1012,16 +1026,18 @@ static bool screenie_relay_overlay_scroll(double deltaX, double deltaY) {
   screenieOverlayMouseCaptureActive = false;
   screenie_overlay_set_ignores_mouse(true);
 
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_MSEC),
+  // Post immediately — the click-relay path waits 1ms for WindowServer to
+  // settle `ignoresMouseEvents:YES` before the injected click is
+  // hit-tested, but a scroll only needs the cursor position (handled by
+  // CGEventPost regardless of overlay state), so the delay just added
+  // jitter between events in the gesture stream.
+  (void)screenie_post_scroll(deltaX, deltaY, phase);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 24 * NSEC_PER_MSEC),
                  dispatch_get_main_queue(), ^{
-    (void)screenie_post_scroll(deltaX, deltaY);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 24 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{
-      if (screenieOverlayClickRelayGeneration == generation) {
-        screenieOverlayClickRelayActive = false;
-        screenie_update_overlay_mouse_passthrough();
-      }
-    });
+    if (screenieOverlayClickRelayGeneration == generation) {
+      screenieOverlayClickRelayActive = false;
+      screenie_update_overlay_mouse_passthrough();
+    }
   });
   return true;
 }
@@ -1591,13 +1607,16 @@ bool screenie_relay_overlay_click(void *window_ptr, int buttonNumber) {
   }
 }
 
-bool screenie_relay_overlay_wheel(void *window_ptr, double deltaX, double deltaY) {
+bool screenie_relay_overlay_wheel(void *window_ptr,
+                                  double deltaX,
+                                  double deltaY,
+                                  int phase) {
   @try {
     if (window_ptr == NULL) {
       return false;
     }
     screenieOverlayWindow = (NSWindow *)window_ptr;
-    return screenie_relay_overlay_scroll(deltaX, deltaY);
+    return screenie_relay_overlay_scroll(deltaX, deltaY, phase);
   } @catch (NSException *exception) {
     NSLog(@"[screenie] relay overlay wheel exception: %@ %@",
           [exception name], [exception reason]);

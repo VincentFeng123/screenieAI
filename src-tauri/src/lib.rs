@@ -63,6 +63,7 @@ extern "C" {
         window: *mut std::ffi::c_void,
         delta_x: f64,
         delta_y: f64,
+        phase: std::os::raw::c_int,
     ) -> bool;
     fn screenie_set_overlay_capture_drag_region(
         window: *mut std::ffi::c_void,
@@ -105,28 +106,70 @@ extern "C" {
     fn screenie_set_overlay_text_input_focused(focused: bool);
 }
 
-/// Tray-bar icon: just the wink glyph on a transparent background. Loaded
-/// as a macOS template image so the alpha mask is auto-tinted by the system
-/// — black on light menu bars, white on dark. The Dock / Settings-window
-/// app icon, by contrast, is read straight from the bundled `.icns` by
-/// macOS — we deliberately do not override it at runtime so Settings,
-/// Onboarding, and the Dock all show the same artwork the bundle ships.
+/// Tray-bar icon: just the wink glyph on a transparent background. The
+/// bundled PNG is a 512×512 master rendered from `tray-icon.svg` so both
+/// platforms have plenty of source pixels for high-DPI taskbars.
 ///
-/// On Windows there's no template-image behavior — the tray renders the
-/// RGBA pixels as-is. The bundled PNG is white-on-transparent (sized for
-/// a dark taskbar); on a light taskbar that's invisible. We handle this
-/// by inverting RGB at runtime in `tray_icon_for_theme` when the system
-/// is on light theme.
+/// - macOS: AppKit's template-image mode (`icon_as_template(true)` on the
+///   tray builder) auto-tints the alpha mask black/white to match the
+///   menu bar and downsamples cleanly via Core Graphics for Retina.
+/// - Windows: there's no template-image equivalent, so `tray_icon_for_theme`
+///   downsamples the master with Lanczos3 to match the system tray icon
+///   size and inverts RGB on light theme so the glyph stays visible
+///   against a light taskbar.
+///
+/// The Dock / Settings-window app icon is read straight from the bundled
+/// `.icns` / `.ico` by the OS — we deliberately do not override it at
+/// runtime so Settings, Onboarding, and the Dock all show the same
+/// artwork the bundle ships.
 const TRAY_ICON_PNG: &[u8] = include_bytes!("../icons/tray-icon.png");
+
+/// Resolve the target tray icon size for the current system DPI on Windows.
+/// We feed the shell an icon at the exact small-icon size so its built-in
+/// scaler doesn't have to do any work — the Lanczos3 downsample we apply
+/// to the 512×512 master in `tray_icon_for_theme` is always sharper than
+/// the shell's bilinear fallback.
+///
+/// Returns 2× the system small-icon size, clamped to a reasonable range.
+/// Doubling gives the shell headroom on multi-monitor setups where the
+/// taskbar may be displayed at a different DPI than the one we sampled
+/// (the shell's bicubic from a Lanczos3 source still beats bilinear from
+/// a raw 512×512).
+#[cfg(target_os = "windows")]
+fn windows_tray_icon_target_size() -> u32 {
+    use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+
+    let system_size = unsafe {
+        let dpi = GetDpiForSystem();
+        let s = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+        if s > 0 {
+            s as u32
+        } else {
+            let fallback = GetSystemMetrics(SM_CXSMICON);
+            if fallback > 0 {
+                fallback as u32
+            } else {
+                16
+            }
+        }
+    };
+    (system_size.saturating_mul(2)).clamp(32, 128)
+}
 
 /// Pick the right tray icon bytes for the current system theme.
 ///
-/// - macOS: returns the bundled white-on-transparent glyph unchanged.
-///   `icon_as_template(true)` set on the tray builder tells AppKit to use
-///   only the alpha channel and tint based on the menu bar color.
-/// - Windows: inverts RGB on light theme so the glyph becomes
-///   black-on-transparent — visible against a light taskbar. Dark theme
-///   uses the bundled glyph as-is.
+/// - macOS: hands the bundled 512×512 master to AppKit unchanged. The
+///   `icon_as_template(true)` flag set on the tray builder tells AppKit
+///   to use only the alpha channel and tint based on the menu bar color,
+///   then downsample for the actual menu bar height (typically ~22pt
+///   logical, 44px on Retina).
+/// - Windows: downsamples the 512×512 master with Lanczos3 to the system
+///   tray icon size, then inverts RGB on light theme so the glyph stays
+///   visible against a light taskbar. Without the explicit downsample
+///   the Win32 tray code path scales the full 512×512 with a bilinear
+///   filter that visibly softens the wink's strokes — Lanczos3 from the
+///   master keeps them crisp at every DPI level.
 ///
 /// Returns the constructed `tauri::image::Image` owned (lifetime
 /// `'static`) so the caller can hand it to `set_icon` without keeping the
@@ -134,9 +177,25 @@ const TRAY_ICON_PNG: &[u8] = include_bytes!("../icons/tray-icon.png");
 fn tray_icon_for_theme(theme: tauri::Theme) -> Result<tauri::image::Image<'static>, String> {
     #[cfg(target_os = "windows")]
     {
-        let img = image::load_from_memory(TRAY_ICON_PNG)
-            .map_err(|e| format!("decode tray icon: {e}"))?;
-        let mut rgba = img.to_rgba8();
+        let master = image::load_from_memory(TRAY_ICON_PNG)
+            .map_err(|e| format!("decode tray icon: {e}"))?
+            .to_rgba8();
+        let target = windows_tray_icon_target_size();
+        let mut rgba = if master.width() == target && master.height() == target {
+            master
+        } else {
+            // Lanczos3 is the highest-quality downsampler the `image` crate
+            // ships. For an 8× shrink (512 → 64) it preserves the wink's
+            // 1-2px-equivalent strokes far better than the OS shell's
+            // built-in bilinear, which is what makes the tray glyph look
+            // muddy on default Tauri tray icons at low DPI.
+            image::imageops::resize(
+                &master,
+                target,
+                target,
+                image::imageops::FilterType::Lanczos3,
+            )
+        };
         if matches!(theme, tauri::Theme::Light) {
             // Light taskbar → need a DARK glyph. Pure white inverts to
             // pure black; anti-aliased edges (partial whites) invert to
@@ -984,20 +1043,29 @@ fn relay_overlay_pointer_click(window: WebviewWindow, button: i32) -> Result<(),
 }
 
 #[tauri::command]
-fn relay_overlay_wheel(window: WebviewWindow, delta_x: f64, delta_y: f64) -> Result<(), String> {
+fn relay_overlay_wheel(
+    window: WebviewWindow,
+    delta_x: f64,
+    delta_y: f64,
+    phase: i32,
+) -> Result<(), String> {
     require_window(&window, "overlay")?;
     #[cfg(target_os = "macos")]
     {
-        relay_overlay_wheel_on_main(&window, delta_x, delta_y);
+        relay_overlay_wheel_on_main(&window, delta_x, delta_y, phase);
     }
     #[cfg(target_os = "windows")]
     {
         let _ = &window;
+        // Win32 SendInput has no gesture-phase concept; phase is silently
+        // ignored on Windows but accepted at the IPC boundary so the JS
+        // caller can use one signature across platforms.
+        let _ = phase;
         windows_window::relay_overlay_wheel(delta_x, delta_y);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (delta_x, delta_y);
+        let _ = (delta_x, delta_y, phase);
     }
     Ok(())
 }
@@ -1441,7 +1509,12 @@ fn relay_overlay_pointer_click_on_main(window: &tauri::WebviewWindow, button: i3
 }
 
 #[cfg(target_os = "macos")]
-fn relay_overlay_wheel_on_main(window: &tauri::WebviewWindow, delta_x: f64, delta_y: f64) {
+fn relay_overlay_wheel_on_main(
+    window: &tauri::WebviewWindow,
+    delta_x: f64,
+    delta_y: f64,
+    phase: i32,
+) {
     let window_clone = window.clone();
     if let Err(e) = window.run_on_main_thread(move || {
         let raw = match window_clone.ns_window() {
@@ -1451,7 +1524,14 @@ fn relay_overlay_wheel_on_main(window: &tauri::WebviewWindow, delta_x: f64, delt
                 return;
             }
         };
-        let ok = unsafe { screenie_relay_overlay_wheel(raw.cast(), delta_x, delta_y) };
+        let ok = unsafe {
+            screenie_relay_overlay_wheel(
+                raw.cast(),
+                delta_x,
+                delta_y,
+                phase as std::os::raw::c_int,
+            )
+        };
         if !ok {
             eprintln!("[screenie] relay_overlay_wheel: native helper failed");
         }
@@ -2478,19 +2558,37 @@ pub fn run() {
                     // light/dark theme changes — `icon_as_template` is a
                     // no-op there, so a white glyph would otherwise stay
                     // invisible after the user flips to a light taskbar.
-                    // On macOS the template flag handles it automatically,
-                    // so this branch is Windows-only.
+                    // We also re-render on DPI changes so the Lanczos3
+                    // downsample in `tray_icon_for_theme` retargets to the
+                    // new system small-icon size and the wink stays crisp
+                    // when the user moves the laptop between docks at
+                    // different scales. macOS's template-image path handles
+                    // both transitions automatically.
                     #[cfg(target_os = "windows")]
-                    if let WindowEvent::ThemeChanged(theme) = event {
-                        if let Some(tray) = app_handle.tray_by_id("main") {
-                            match tray_icon_for_theme(*theme) {
-                                Ok(icon) => {
-                                    let _ = tray.set_icon(Some(icon));
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "[screenie] tray icon swap on theme change failed: {e}"
-                                    );
+                    {
+                        let needs_refresh = matches!(
+                            event,
+                            WindowEvent::ThemeChanged(_)
+                                | WindowEvent::ScaleFactorChanged { .. }
+                        );
+                        if needs_refresh {
+                            let theme = match event {
+                                WindowEvent::ThemeChanged(t) => *t,
+                                _ => app_handle
+                                    .get_webview_window("main")
+                                    .and_then(|w| w.theme().ok())
+                                    .unwrap_or(tauri::Theme::Dark),
+                            };
+                            if let Some(tray) = app_handle.tray_by_id("main") {
+                                match tray_icon_for_theme(theme) {
+                                    Ok(icon) => {
+                                        let _ = tray.set_icon(Some(icon));
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[screenie] tray icon refresh failed: {e}"
+                                        );
+                                    }
                                 }
                             }
                         }

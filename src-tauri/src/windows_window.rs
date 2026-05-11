@@ -54,18 +54,21 @@ use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_ESCAPE,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE,
+    VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
-    GWL_EXSTYLE, HHOOK, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLMHF_INJECTED, MSLLHOOKSTRUCT,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_MOUSEMOVE, WM_SYSKEYDOWN,
+    AllowSetForegroundWindow, CallNextHookEx, EnumWindows, GetCursorPos, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
+    SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GWL_EXSTYLE, HHOOK, HWND_TOPMOST,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSLLHOOKSTRUCT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SYSKEYDOWN,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
@@ -380,10 +383,11 @@ pub fn relay_overlay_pointer_click(button_number: i32) -> bool {
     tauri::async_runtime::spawn(async move {
         // Give the OS one beat to apply the WS_EX_TRANSPARENT change before
         // the synthetic click is hit-tested. Without this, the click can
-        // race the style change and land back on our overlay (which would
-        // then see an injected event over a region — currently filtered
-        // out by `LLMHF_INJECTED`, but in any case wouldn't reach the
-        // intended underlying window).
+        // race the style change and land back on our overlay instead of
+        // the underlying window. The injected event would still be
+        // ignored by our own region toggle because CLICK_RELAY_ACTIVE
+        // short-circuits `handle_mouse_move_screen`, but it would also
+        // confuse Win32 hit testing.
         tokio::time::sleep(std::time::Duration::from_millis(8)).await;
         unsafe {
             post_synthetic_click(button_number);
@@ -450,17 +454,29 @@ pub fn start_overlay_background_observer() {
     BG_LAST_SIGNAL_MS.store(0, Ordering::Relaxed);
 
     tauri::async_runtime::spawn(async move {
+        // Delay the first poll past WebView2 cold-start. The overlay's
+        // initial mount + React layout completes well within 500ms; without
+        // this gap the first window-list hash competes with the cold-start
+        // render for main-thread time and amplifies hotkey lag. macOS uses
+        // NSWorkspace observers which fire only on real events (Space
+        // change), not a timer, so it doesn't need this delay.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if !BG_OBSERVER_RUNNING.load(Ordering::Acquire) {
+            return;
+        }
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(200));
-        // First tick fires immediately (tokio default). Skip it so we
-        // don't emit before React has had a chance to register the
-        // listener and seed its `lastSignature` cache.
+        // First tick fires immediately (tokio default). Skip it so the
+        // observer's actual cadence is the configured interval.
         interval.tick().await;
+        let mut tick_count: u64 = 0;
+        let mut emit_count: u64 = 0;
         while BG_OBSERVER_RUNNING.load(Ordering::Acquire) {
             interval.tick().await;
             if !OVERLAY_VISIBLE.load(Ordering::Relaxed) {
                 continue;
             }
+            tick_count = tick_count.saturating_add(1);
 
             let next = unsafe { compute_winlist_hash() };
             if next == 0 {
@@ -486,11 +502,26 @@ pub fn start_overlay_background_observer() {
                     BG_LAST_SIGNAL_MS.store(now, Ordering::Relaxed);
                     if let Ok(g) = overlay_app().lock() {
                         if let Some(app) = g.as_ref() {
-                            let _ = app.emit_to(
+                            let emit_result = app.emit_to(
                                 "overlay",
                                 "overlay-background-changed",
                                 (),
                             );
+                            emit_count = emit_count.saturating_add(1);
+                            // Log only the first few emits so the dev
+                            // console shows the observer is alive without
+                            // becoming a firehose. Subsequent emits are
+                            // silent.
+                            if emit_count <= 5 {
+                                match emit_result {
+                                    Ok(_) => eprintln!(
+                                        "[screenie] bg observer emit #{emit_count} after {tick_count} ticks"
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[screenie] bg observer emit FAILED: {e}"
+                                    ),
+                                }
+                            }
                         }
                     }
                 }
@@ -605,22 +636,152 @@ unsafe extern "system" fn keyboard_hook_proc(
         let msg = wparam.0 as u32;
         if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
             let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            if info.vkCode == VK_ESCAPE.0 as u32 {
-                if let Ok(g) = overlay_app().lock() {
-                    if let Some(app) = g.as_ref() {
-                        let _ = app.emit_to("overlay", "overlay-escape-pressed", ());
+            // Skip events we ourselves injected via SendInput in
+            // `forward_ctrl_digit_to_previous_app` — without this guard
+            // the synthesized Ctrl+digit press would re-enter the hook,
+            // be detected as a forwardable keystroke again, and the
+            // second forward would fire SetForegroundWindow on top of
+            // the one already in flight.
+            let injected = info.flags.0 & LLKHF_INJECTED.0 != 0;
+            if !injected {
+                if info.vkCode == VK_ESCAPE.0 as u32 {
+                    if let Ok(g) = overlay_app().lock() {
+                        if let Some(app) = g.as_ref() {
+                            let _ = app.emit_to("overlay", "overlay-escape-pressed", ());
+                        }
                     }
+                    // Consume the event — equivalent of returning NULL from
+                    // the macOS CGEventTap so fullscreen Chrome/Safari etc.
+                    // never sees the Esc keystroke.
+                    return LRESULT(1);
                 }
-                // Consume the event — equivalent of returning NULL from the
-                // macOS CGEventTap so fullscreen Chrome/Safari etc. never
-                // sees the Esc keystroke.
-                return LRESULT(1);
+                // Mirror of the macOS local NSEvent monitor's Cmd+digit
+                // forwarding: when the user is looking at the result panel
+                // (no text input focused) and presses Ctrl+1..0, hand the
+                // keystroke to whichever app was frontmost before the
+                // overlay opened. Browsers map Ctrl+digit to tab switching;
+                // forwarding lets the user flip tabs in Chrome/Edge/Firefox
+                // without first dismissing the overlay. Every other shortcut
+                // continues to flow normally — no broad keystroke-stealing.
+                if try_forward_ctrl_digit(info.vkCode) {
+                    return LRESULT(1);
+                }
             }
         }
     }
     // CallNextHookEx's first argument has been ignored since Win 95 — docs
     // explicitly say to pass NULL even when you hold the hook handle.
     CallNextHookEx(HHOOK(core::ptr::null_mut()), code, wparam, lparam)
+}
+
+/// Returns true when the keystroke matched a forwardable Ctrl+digit and a
+/// background task has been spawned to deliver it to the previously-frontmost
+/// app — caller should consume the original event by returning `LRESULT(1)`
+/// from the hook. Returns false in every other case (wrong key, modifiers
+/// wrong, text input focused, no remembered foreground app), and the caller
+/// should fall through to `CallNextHookEx` so the keystroke reaches the
+/// normal focus target.
+unsafe fn try_forward_ctrl_digit(vk_code: u32) -> bool {
+    // Top-row digits VK_0..VK_9 are 0x30..0x39 — matches the Mac side which
+    // limits to "Cmd alone + 1..9, 0" and deliberately ignores numpad digits
+    // since those are usually for entry, not navigation.
+    if !(0x30..=0x39).contains(&vk_code) {
+        return false;
+    }
+    if TEXT_INPUT_FOCUSED.load(Ordering::Acquire) {
+        return false;
+    }
+    let target_raw = PREVIOUS_FOREGROUND_HWND.load(Ordering::Acquire);
+    if target_raw == 0 {
+        return false;
+    }
+    if !ctrl_alone_pressed() {
+        return false;
+    }
+    let vk = vk_code as u16;
+    tauri::async_runtime::spawn(async move {
+        // The user's Ctrl-down was processed by the OS before we got here;
+        // a 2ms beat lets the keyboard input queue settle so the target's
+        // GetKeyState/GetAsyncKeyState read the held Ctrl when the
+        // synthesized digit lands.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let target = hwnd_from_raw(target_raw);
+        unsafe {
+            if !IsWindow(target).as_bool() {
+                return;
+            }
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(target, Some(&mut pid));
+            if pid == 0 {
+                return;
+            }
+            // Required when the foreground transition crosses processes:
+            // without it, SetForegroundWindow can be silently demoted to a
+            // taskbar flash (Microsoft's anti-focus-steal mitigation). The
+            // grant is cheap and only valid for one transition.
+            let _ = AllowSetForegroundWindow(pid);
+            let _ = SetForegroundWindow(target);
+        }
+        // Give the activation a beat to actually take effect before
+        // injecting the keystroke. Empirically 8ms is enough on a warm
+        // system; matches the click-relay cushion in `relay_overlay_pointer_click`.
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+        unsafe {
+            inject_ctrl_digit(vk);
+        }
+    });
+    true
+}
+
+/// Returns true iff the Ctrl modifier is currently held with no Shift, Alt,
+/// or Win modifier alongside it. Mirrors the Mac side's
+/// `mods == NSEventModifierFlagCommand` check — combos like Ctrl+Shift+digit
+/// are bound to other actions in browsers (move tab, select tab range) and
+/// are deliberately not forwarded.
+unsafe fn ctrl_alone_pressed() -> bool {
+    let pressed = |vk: VIRTUAL_KEY| (GetAsyncKeyState(vk.0 as i32) as u16) & 0x8000 != 0;
+    let ctrl = pressed(VK_CONTROL);
+    let shift = pressed(VK_SHIFT);
+    let alt = pressed(VK_MENU);
+    let win = pressed(VK_LWIN) || pressed(VK_RWIN);
+    ctrl && !shift && !alt && !win
+}
+
+/// Synthesize a Ctrl+digit press at the system level via `SendInput`.
+/// Sequence is Ctrl-down, digit-down, digit-up, Ctrl-up so the target
+/// window's WM_KEYDOWN sees Ctrl held when it processes the digit — that's
+/// what TranslateAccelerator (the path Chrome/Edge/Firefox use for Ctrl+1..9
+/// tab switching) reads to match the accelerator entry.
+///
+/// We send Ctrl explicitly even though the user is physically holding it:
+/// the user's original Ctrl-down was delivered to whichever window had focus
+/// at that moment (often our overlay's WebView, which doesn't propagate it
+/// back out of WebKit), and the target app's per-message Ctrl-state isn't
+/// guaranteed to reflect physical state across the foreground transition.
+unsafe fn inject_ctrl_digit(digit_vk: u16) {
+    let make_input = |vk: u16, key_up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: 0,
+                dwFlags: if key_up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [
+        make_input(VK_CONTROL.0, false),
+        make_input(digit_vk, false),
+        make_input(digit_vk, true),
+        make_input(VK_CONTROL.0, true),
+    ];
+    SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
 }
 
 unsafe extern "system" fn mouse_hook_proc(
@@ -632,13 +793,19 @@ unsafe extern "system" fn mouse_hook_proc(
         let msg = wparam.0 as u32;
         if msg == WM_MOUSEMOVE {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            // Skip injected events. The click/wheel relay paths post
-            // synthetic input via SendInput; if we processed those here,
-            // the cursor-driven `WS_EX_TRANSPARENT` toggle would race the
-            // relay's own state machine and the synthetic event could
-            // land back on our overlay instead of the underlying app.
-            if (info.flags & LLMHF_INJECTED) == 0 {
-                handle_mouse_move_screen(info.pt);
+            handle_mouse_move_screen(info.pt);
+        } else if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP {
+            // Safety net for stuck drags. If a JS-driven drag was started
+            // (set_overlay_mouse_capture(true)) but the JS mouseup
+            // never fired — e.g., the overlay lost focus mid-drag, or
+            // the WebView was re-mounted — the MOUSE_CAPTURE_ACTIVE flag
+            // would otherwise be stuck true, freezing `WS_EX_TRANSPARENT`
+            // at its drag-start value and breaking every subsequent click.
+            // Auto-clear on any mouse-up so the next mousemove re-evaluates
+            // transparency from cursor position. Cheap: one atomic compare,
+            // no lock acquisition inside the hot path.
+            if MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed) {
+                MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
             }
         }
     }

@@ -418,6 +418,7 @@ textarea,
   contain: layout style;
 }
 
+
 /* Children sit above the BlurredBackdrop bitmap (which is z-index: 0). */
 .screenie-edit-pill > :not(.screenie-blurred-backdrop):not(.screenie-inset-border),
 .screenie-edit-popover > :not(.screenie-blurred-backdrop):not(.screenie-inset-border) {
