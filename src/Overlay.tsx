@@ -482,11 +482,27 @@ function useOverlayFrostRegions(enabled: boolean) {
   }, [cancelScheduledSync, scheduleSync]);
 }
 
+const PERMISSION_BANNER_DISMISSED_KEY = "screenie.permissionBannerDismissed";
+
 export default function Overlay() {
   const [screen, setScreen] = useState<ScreenCapture | null>(null);
   const [mode, setMode] = useState<Mode>({ kind: "loading" });
   const [preferences, setPreferences] = useState<ScreeniePreferences>(() =>
     readPreferences(),
+  );
+  // The capture-side `is_blank` heuristic can false-positive on dark
+  // content / TCC edge cases. A user who has dismissed the banner is
+  // saying "I know what I'm doing, stop nagging" — respect that for the
+  // life of this install. Clearable from devtools or by removing the
+  // localStorage key.
+  const [permissionBannerDismissed, setPermissionBannerDismissed] = useState(
+    () => {
+      try {
+        return localStorage.getItem(PERMISSION_BANNER_DISMISSED_KEY) === "1";
+      } catch {
+        return false;
+      }
+    },
   );
   // Edit controller is lifted to the overlay root so strokes survive the
   // adjusting → result transition (and the user's open/tool state survives an
@@ -863,9 +879,10 @@ export default function Overlay() {
   if (!screen || mode.kind === "loading") return null;
 
   // The OS handed us an all-black frame — almost always Screen Recording
-  // permission was likely denied. Surface a recovery banner instead of the
-  // regular flow.
-  if (screen.blank) {
+  // permission was likely denied. Surface a recovery banner instead of
+  // the regular flow, unless the user has explicitly told us to stop
+  // showing it (they may know better than the heuristic does).
+  if (screen.blank && !permissionBannerDismissed) {
     return (
       <PermissionBanner
         onClose={() => invoke("close_overlay")}
@@ -877,6 +894,14 @@ export default function Overlay() {
           // the user-visible "I'm done with this banner" — they then re-
           // press the hotkey and the new capture flows through normally.
           await invoke("close_overlay");
+        }}
+        onDismissPermanently={() => {
+          try {
+            localStorage.setItem(PERMISSION_BANNER_DISMISSED_KEY, "1");
+          } catch {
+            /* localStorage unavailable — dismissal won't persist */
+          }
+          setPermissionBannerDismissed(true);
         }}
       />
     );
@@ -4434,9 +4459,11 @@ function MessageBubble({
 function PermissionBanner({
   onClose,
   onRetry,
+  onDismissPermanently,
 }: {
   onClose: () => void;
   onRetry?: () => void;
+  onDismissPermanently?: () => void;
 }) {
   // Same banner UI on both platforms — only the explanatory copy and the
   // settings deep-link button label change. On Mac a blank capture nearly
@@ -4549,6 +4576,26 @@ function PermissionBanner({
             </button>
           )}
         </div>
+        {onDismissPermanently && (
+          <div style={{ marginTop: 14, textAlign: "center" }}>
+            <button
+              type="button"
+              onClick={onDismissPermanently}
+              style={{
+                background: "transparent",
+                border: "none",
+                padding: 0,
+                fontSize: 11.5,
+                color: "rgba(255,255,255,0.55)",
+                textDecoration: "underline",
+                cursor: "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              Don&apos;t show this again
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

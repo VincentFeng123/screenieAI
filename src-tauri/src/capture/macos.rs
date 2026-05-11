@@ -3,6 +3,19 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::path::PathBuf;
 use tokio::process::Command;
 
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
+/// True when the running process is currently authorized by macOS for
+/// Screen Recording. Reads CoreGraphics's TCC-backed authorization
+/// state — the same state `screencapture` will see when we shell out.
+/// macOS caches this per-process at launch, so a toggle flipped in
+/// System Settings is reflected here only after a process restart.
+fn has_screen_recording_permission() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
 /// Capture an arbitrary rectangle of the desktop in *logical* pixels via the
 /// built-in `screencapture` CLI. `-x` silences the shutter, `-R x,y,w,h`
 /// constrains the capture to a region in global screen coordinates.
@@ -37,7 +50,13 @@ pub async fn capture_rect(
     let (width, height) = png_dimensions(&bytes)
         .ok_or_else(|| CaptureError::Other("could not parse PNG dimensions".into()))?;
 
-    let blank = is_blank(&bytes);
+    // Only run the all-black heuristic when the OS itself reports we do
+    // NOT have Screen Recording permission. When we do have it, the
+    // capture pixels are whatever the user pointed at — a dark
+    // terminal, a black wallpaper, a fullscreen dark-mode app — and
+    // the heuristic produces false positives that latch the recovery
+    // banner on every capture even though nothing is wrong.
+    let blank = !has_screen_recording_permission() && is_blank(&bytes);
 
     Ok(ScreenCapture {
         png_base64: STANDARD.encode(&bytes),
