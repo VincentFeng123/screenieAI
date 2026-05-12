@@ -24,21 +24,19 @@ export const ANTHROPIC_MODELS = [
 // Vision-capable models only. o4-mini was removed because it doesn't accept
 // image input; o3 is kept because it does. The Rust client switches to
 // `max_completion_tokens` for o-series and GPT-5-family model ids.
+// Speculative GPT-5.x point-release SKUs were removed — only ship IDs
+// confirmed against the OpenAI model catalogue. The Rust default in
+// `provider_default_model` (lib.rs) must stay in sync with the head entry
+// here.
 export const OPENAI_MODELS = [
-  { id: "gpt-5.5", label: "GPT-5.5 — latest flagship" },
-  { id: "gpt-5.4", label: "GPT-5.4" },
-  { id: "gpt-5.4-mini", label: "GPT-5.4 mini — fast" },
-  { id: "gpt-5.4-nano", label: "GPT-5.4 nano — cheapest" },
-  { id: "gpt-5.2", label: "GPT-5.2" },
-  { id: "gpt-5.2-chat-latest", label: "GPT-5.2 Chat latest" },
+  { id: "gpt-4o", label: "GPT-4o — recommended" },
+  { id: "gpt-4o-mini", label: "GPT-4o mini — fast + cheap" },
+  { id: "gpt-5", label: "GPT-5" },
   { id: "gpt-5-mini", label: "GPT-5 mini" },
   { id: "gpt-5-nano", label: "GPT-5 nano" },
-  { id: "gpt-5", label: "GPT-5" },
   { id: "gpt-4.1", label: "GPT-4.1 — non-reasoning" },
   { id: "gpt-4.1-mini", label: "GPT-4.1 mini — fast" },
   { id: "gpt-4.1-nano", label: "GPT-4.1 nano — cheapest" },
-  { id: "gpt-4o", label: "GPT-4o" },
-  { id: "gpt-4o-mini", label: "GPT-4o mini — fast + cheap" },
   { id: "gpt-4o-2024-11-20", label: "GPT-4o (2024-11-20)" },
   { id: "gpt-4o-2024-08-06", label: "GPT-4o (2024-08-06)" },
   { id: "gpt-4o-2024-05-13", label: "GPT-4o (2024-05-13)" },
@@ -49,11 +47,12 @@ export const OPENAI_MODELS = [
   { id: "o3", label: "o3 — reasoning + vision" },
 ];
 
+// Speculative Gemini 3.x preview SKUs were removed — only ship IDs confirmed
+// against the Google AI model catalogue. The Rust default in
+// `provider_default_model` (lib.rs) must stay in sync with the head entry
+// here.
 export const GEMINI_MODELS = [
-  { id: "gemini-3-flash-preview", label: "Gemini 3 Flash Preview — latest" },
-  { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview" },
-  { id: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash-Lite — stable" },
-  { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash — fast + capable" },
+  { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash — recommended" },
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro — best reasoning" },
   { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite — cheapest" },
   { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },

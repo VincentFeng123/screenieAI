@@ -16,6 +16,7 @@ where
     // Same image-token cost rationale as the other cloud providers — see
     // anthropic.rs.
     let image_b64 = crate::capture::downscale_for_cloud(&req.image_b64, 1024)
+        .await
         .unwrap_or_else(|_| req.image_b64.clone());
     let contents = build_contents(&req.messages, &image_b64);
     let system = super::response_format_instructions(&req.response_profile);
@@ -41,6 +42,24 @@ where
         }
     });
 
+    // Defense-in-depth: `req.model` is interpolated into the request URL.
+    // Gemini SKU ids are always lowercase letters, digits, hyphens, and dots
+    // (e.g. `gemini-2.5-flash`). Reject anything else before it reaches
+    // `format!` so a hostile/malformed model string can't smuggle in `/`,
+    // `?`, `#`, or `:` to redirect the POST or inject query params against
+    // `generativelanguage.googleapis.com`.
+    if req.model.is_empty()
+        || !req
+            .model
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return Err(AiError::InvalidProvider(format!(
+            "invalid gemini model id: {}",
+            req.model
+        )));
+    }
+
     // `alt=sse` opts into Server-Sent Events framing instead of Google's
     // default JSON-array streaming, which lets us reuse the same `\n\n`
     // event-boundary parser shape as the Anthropic / OpenAI clients.
@@ -60,7 +79,7 @@ where
         let text = resp.text().await.unwrap_or_default();
         return Err(AiError::Api {
             status: status.as_u16(),
-            body: text,
+            body: super::sanitize_provider_error(&text, "gemini"),
         });
     }
 
@@ -81,6 +100,21 @@ where
             }
             if let Some(data) = super::sse_data(&event) {
                 if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                    // Gemini's `alt=sse` stream may yield
+                    // `data: {"error": {"code": ..., "message": ...}}` partway
+                    // through a response on quota / safety failures. Without
+                    // this branch the stream silently dies after the partial
+                    // text already sent.
+                    if let Some(err) = v.get("error") {
+                        let msg = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or(&data);
+                        return Err(AiError::Api {
+                            status: 200,
+                            body: super::sanitize_provider_error(msg, "gemini"),
+                        });
+                    }
                     if let Some(meta) = v.get("usageMetadata") {
                         if let Some(t) = meta.get("promptTokenCount").and_then(|n| n.as_u64()) {
                             input_tokens = t;

@@ -77,7 +77,24 @@ pub async fn capture_rect(
 }
 
 /// Crop a base64-encoded PNG to the given bounds (in device pixels).
-pub fn crop_png_b64(
+///
+/// Async wrapper around [`crop_png_b64_blocking`] that runs the PNG decode
+/// + crop + re-encode on the blocking pool. Calling commands are async and
+/// often share the runtime worker driving an SSE stream — running this
+/// inline pegs that worker for 50-200 ms on a Retina screenshot.
+pub async fn crop_png_b64(
+    src_b64: String,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<CroppedCapture, CaptureError> {
+    tokio::task::spawn_blocking(move || crop_png_b64_blocking(&src_b64, x, y, w, h))
+        .await
+        .map_err(|e| CaptureError::Other(format!("crop task join: {e}")))?
+}
+
+fn crop_png_b64_blocking(
     src_b64: &str,
     x: u32,
     y: u32,
@@ -119,7 +136,17 @@ pub fn crop_png_b64(
 /// this before sending images to cloud vision APIs — full-resolution Retina
 /// captures are 1500–2500 image-tokens each, but quality holds up fine at
 /// ~1024px on the long edge for screenshot-style content.
-pub fn downscale_for_cloud(b64: &str, max_long_edge: u32) -> Result<String, CaptureError> {
+/// Async wrapper. Heavy PNG decode + resize + re-encode runs on the
+/// blocking pool — provider stream() fns call this from their async path
+/// and would otherwise block a tokio worker for 100-300 ms.
+pub async fn downscale_for_cloud(b64: &str, max_long_edge: u32) -> Result<String, CaptureError> {
+    let owned = b64.to_owned();
+    tokio::task::spawn_blocking(move || downscale_for_cloud_blocking(&owned, max_long_edge))
+        .await
+        .map_err(|e| CaptureError::Other(format!("downscale task join: {e}")))?
+}
+
+fn downscale_for_cloud_blocking(b64: &str, max_long_edge: u32) -> Result<String, CaptureError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     if b64.len() > MAX_PNG_B64_CHARS {

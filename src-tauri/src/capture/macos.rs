@@ -3,19 +3,6 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::path::PathBuf;
 use tokio::process::Command;
 
-extern "C" {
-    fn CGPreflightScreenCaptureAccess() -> bool;
-}
-
-/// True when the running process is currently authorized by macOS for
-/// Screen Recording. Reads CoreGraphics's TCC-backed authorization
-/// state — the same state `screencapture` will see when we shell out.
-/// macOS caches this per-process at launch, so a toggle flipped in
-/// System Settings is reflected here only after a process restart.
-fn has_screen_recording_permission() -> bool {
-    unsafe { CGPreflightScreenCaptureAccess() }
-}
-
 /// Capture an arbitrary rectangle of the desktop in *logical* pixels via the
 /// built-in `screencapture` CLI. `-x` silences the shutter, `-R x,y,w,h`
 /// constrains the capture to a region in global screen coordinates.
@@ -50,16 +37,27 @@ pub async fn capture_rect(
     let (width, height) = png_dimensions(&bytes)
         .ok_or_else(|| CaptureError::Other("could not parse PNG dimensions".into()))?;
 
-    // Only run the all-black heuristic when the OS itself reports we do
-    // NOT have Screen Recording permission. When we do have it, the
-    // capture pixels are whatever the user pointed at — a dark
-    // terminal, a black wallpaper, a fullscreen dark-mode app — and
-    // the heuristic produces false positives that latch the recovery
-    // banner on every capture even though nothing is wrong.
-    let blank = !has_screen_recording_permission() && is_blank(&bytes);
+    // Always probe the captured pixels for the macOS TCC "Screen Recording
+    // denied" placeholder (uniform 0x00). The previous gate used
+    // `CGPreflightScreenCaptureAccess()` which is per-process cached at
+    // launch — after the user toggled the permission in System Settings,
+    // our cached value stayed `false` until restart, so the heuristic ran
+    // on every capture; the old `>= 16` threshold then false-positived dark
+    // real captures (terminals, dark wallpapers, dim windows) and locked
+    // users into the recovery banner. The strict `is_blank` below avoids
+    // both pitfalls. Run on the blocking pool — full PNG decode of a Retina
+    // screenshot is 30-80 ms.
+    let probe = bytes.clone();
+    let blank = tokio::task::spawn_blocking(move || is_blank(&probe))
+        .await
+        .unwrap_or(false);
+
+    let png_base64 = tokio::task::spawn_blocking(move || STANDARD.encode(&bytes))
+        .await
+        .map_err(|e| CaptureError::Other(format!("base64 encode task join: {e}")))?;
 
     Ok(ScreenCapture {
-        png_base64: STANDARD.encode(&bytes),
+        png_base64,
         width,
         height,
         cursor_x: None,
@@ -77,9 +75,11 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// Sparse-sample the decoded PNG and return true when no channel exceeds a
-/// near-black threshold — a strong signal that Screen Recording permission
-/// was denied (macOS hands back an all-black image in that case).
+/// Sparse-sample the decoded PNG and return true ONLY when every sampled
+/// channel is exactly 0. This matches macOS's TCC "Screen Recording
+/// denied" placeholder (uniform 0x00) without false-positives on real
+/// dark-mode / dim-content captures — even a dark terminal contains some
+/// non-zero pixels (anti-aliased text, scrollbar tracks, focus rings).
 fn is_blank(bytes: &[u8]) -> bool {
     let img = match image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
         Ok(i) => i,
@@ -96,7 +96,7 @@ fn is_blank(bytes: &[u8]) -> bool {
         let r = pixels[i * 4];
         let g = pixels[i * 4 + 1];
         let b = pixels[i * 4 + 2];
-        if r >= 16 || g >= 16 || b >= 16 {
+        if r != 0 || g != 0 || b != 0 {
             return false;
         }
     }

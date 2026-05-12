@@ -50,7 +50,12 @@ use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    GetMonitorInfoW, MonitorFromWindow, ReleaseDC, ScreenToClient, SelectObject, SetBrushOrgEx,
+    SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HALFTONE,
+    HBITMAP, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGBQUAD, SRCCOPY,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -62,14 +67,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CallNextHookEx, EnumWindows, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
-    SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GWL_EXSTYLE, HHOOK, HWND_TOPMOST,
-    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSLLHOOKSTRUCT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SYSKEYDOWN,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    AllowSetForegroundWindow, CallNextHookEx, CallWindowProcW, DefWindowProcW, EnumWindows,
+    GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
+    UnhookWindowsHookEx, GWLP_WNDPROC, GWL_EXSTYLE, HHOOK, HTTRANSPARENT, HWND_TOPMOST,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSLLHOOKSTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_NCHITTEST, WM_RBUTTONUP, WM_SYSKEYDOWN, WNDPROC, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 // `windows-rs 0.58` represents every HANDLE-style type as
@@ -117,6 +124,11 @@ static OVERLAY: OnceLock<Mutex<Option<OverlayState>>> = OnceLock::new();
 static OVERLAY_APP: OnceLock<Mutex<Option<AppHandle>>> = OnceLock::new();
 static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// Raw pointer to the original `WNDPROC` for the overlay HWND, stored after
+/// we subclass with `overlay_subclass_wndproc`. The subclass handler forwards
+/// every non-`WM_NCHITTEST` message back to this proc via `CallWindowProcW`.
+/// Non-zero only while the subclass is installed.
+static OLD_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TEXT_INPUT_FOCUSED: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_FOREGROUND_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -140,6 +152,14 @@ static CLICK_RELAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static BG_OBSERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 static BG_LAST_WINLIST_HASH: AtomicU64 = AtomicU64::new(0);
 static BG_LAST_SIGNAL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 60fps continuous backdrop capture loop. Replaces the window-list-only
+/// polling with a downsampled BitBlt + hash-based change detection, so the
+/// frosted panels show LIVE desktop content (videos, scrolling, animations
+/// in the apps underneath) instead of a stale bitmap that only refreshes
+/// when windows move. The loop tick is cheap (~1ms BitBlt + hash); the
+/// expensive PNG encode + IPC emit runs only on hash change.
+static CONTINUOUS_CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn overlay_state() -> &'static Mutex<Option<OverlayState>> {
     OVERLAY.get_or_init(|| Mutex::new(None))
@@ -216,6 +236,13 @@ pub fn configure_overlay_window(window: &WebviewWindow, app: &AppHandle) {
     if let Ok(mut g) = overlay_app().lock() {
         *g = Some(app.clone());
     }
+
+    // Install the WndProc subclass so WM_NCHITTEST drives click-through
+    // synchronously. Subclassing the brand-new HWND (which hasn't started
+    // dispatching messages yet — `window.show()` hasn't been called by
+    // `show_overlay_window` yet) avoids any race with the message pump.
+    // Idempotent: subsequent re-shows of the same HWND just return true.
+    install_overlay_wndproc_subclass(hwnd);
 }
 
 /// Bring the overlay to the topmost level without activating it. Counterpart
@@ -546,6 +573,109 @@ pub fn stop_overlay_background_observer() {
     BG_OBSERVER_RUNNING.store(false, Ordering::Release);
 }
 
+/// Long edge of the downsampled bitmap pushed to React at 60fps. Tuned so
+/// the BitBlt + GDI downsample + PNG encode + IPC payload all fit inside
+/// the ~16ms frame budget. The bitmap is stretched back to monitor size
+/// by the browser, providing implicit blur from bilinear interpolation
+/// on top of the CSS `filter: blur()` the React-side panel applies.
+const CONTINUOUS_CAPTURE_LONG_EDGE: i32 = 480;
+const CONTINUOUS_CAPTURE_INTERVAL_MS: u64 = 16;
+
+/// Start a 60fps tokio loop that captures a downsampled snapshot of the
+/// monitor the overlay sits on, hashes it for change detection, and emits
+/// `overlay-backdrop-update` with a fresh PNG base64 whenever the desktop
+/// content changes. The bitmap div in `Frosted.tsx::WindowsBlurredBackdrop`
+/// listens for this event and writes the new src directly to its
+/// `style.backgroundImage` — bypassing React reconciliation so the
+/// per-frame cost stays in the GDI capture + PNG encode, not in the JS
+/// framework.
+///
+/// Idempotent — a second call is a no-op.
+///
+/// Why a continuous loop (vs the legacy window-list-hash observer): the
+/// window list doesn't change when a video plays inside a static window,
+/// when a page scrolls, or when an animation runs. The user reported "the
+/// background of the overlay are not blurry (and it should also update
+/// constantly and smoothly with the background changes)" — the
+/// constantly/smoothly part is what this loop addresses. The old observer
+/// also caught only the move-this-window kind of changes; this one catches
+/// everything because it hashes actual pixel content.
+pub fn start_overlay_continuous_capture(app: &AppHandle) {
+    if CONTINUOUS_CAPTURE_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Wait one tick before the first capture so the WebView2 has
+        // mounted its initial bitmap from `screen.png_base64`; otherwise
+        // a slow first frame could race the live event and show empty
+        // panels for a moment.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        if !CONTINUOUS_CAPTURE_RUNNING.load(Ordering::Acquire) {
+            return;
+        }
+
+        let mut interval = tokio::time::interval(
+            std::time::Duration::from_millis(CONTINUOUS_CAPTURE_INTERVAL_MS),
+        );
+        // tokio's first tick fires immediately; skip it so our cadence is
+        // truly CONTINUOUS_CAPTURE_INTERVAL_MS.
+        interval.tick().await;
+        let mut last_hash: u64 = 0;
+
+        while CONTINUOUS_CAPTURE_RUNNING.load(Ordering::Acquire) {
+            interval.tick().await;
+            if !OVERLAY_VISIBLE.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            // GDI work blocks; run it on a blocking task so we never
+            // freeze the tokio runtime thread. The captured bitmap is
+            // moved into the next blocking task (PNG encode), so no extra
+            // copy happens.
+            let bitmap_opt = tokio::task::spawn_blocking(|| unsafe {
+                capture_downsampled_overlay_backdrop()
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(bitmap) = bitmap_opt else {
+                continue;
+            };
+
+            // Cheap content-change check. FNV-1a on the raw RGBA buffer
+            // is ~1ms for a 480-long-edge bitmap and avoids the much more
+            // expensive PNG encode when the desktop hasn't changed.
+            let h = fnv1a_hash(&bitmap.rgba);
+            if h == last_hash {
+                continue;
+            }
+            last_hash = h;
+
+            // Move the bitmap into the encode task — `encode_bitmap_png_b64`
+            // takes by value so the ~500KB RGBA buffer isn't cloned just to
+            // satisfy the borrow checker.
+            let png_b64_opt = tokio::task::spawn_blocking(move || encode_bitmap_png_b64(bitmap))
+                .await
+                .ok()
+                .flatten();
+            let Some(png_b64) = png_b64_opt else {
+                continue;
+            };
+
+            let _ = app.emit_to("overlay", "overlay-backdrop-update", png_b64);
+        }
+        CONTINUOUS_CAPTURE_RUNNING.store(false, Ordering::Release);
+    });
+}
+
+/// Stop the continuous backdrop capture loop. Called from
+/// `lib.rs::close_overlay_now`. The loop's next iteration sees the flag
+/// flip and returns; no awaiting needed.
+pub fn stop_overlay_continuous_capture() {
+    CONTINUOUS_CAPTURE_RUNNING.store(false, Ordering::Release);
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
@@ -562,6 +692,148 @@ fn get_hwnd(window: &WebviewWindow) -> Option<HWND> {
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// WndProc subclass — primary click-through mechanism (replaces the older
+// `WS_EX_TRANSPARENT` toggle from the WH_MOUSE_LL hook). Windows asks our
+// subclassed proc on every `WM_NCHITTEST` whether a given point belongs to
+// us; we return `HTTRANSPARENT` for any point outside the React-pushed
+// interaction regions, so clicks, hover, and scroll fall through to the
+// app underneath. Synchronous, race-free; no cursor poll required.
+//
+// The mouse hook still exists for two side jobs that don't fit into
+// `WM_NCHITTEST`: clearing a stuck `MOUSE_CAPTURE_ACTIVE` on mouse-up, and
+// the cursor-poll fallback `set_transparent_now` toggle that runs while
+// the subclass takes its first effect after install.
+// ---------------------------------------------------------------------------
+
+/// Subclass WndProc for the overlay HWND. Forwards everything except
+/// `WM_NCHITTEST` to the original proc via `CallWindowProcW`. The
+/// `unsafe extern "system"` signature is what Windows expects.
+unsafe extern "system" fn overlay_subclass_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_NCHITTEST {
+        if let Some(result) = overlay_hit_test(hwnd, lparam) {
+            return result;
+        }
+    }
+    let old_proc_raw = OLD_WNDPROC.load(Ordering::Acquire);
+    if old_proc_raw == 0 {
+        // Subclass uninstalled mid-message (window destroying?) — fall back
+        // to the system default so we never hang the message loop.
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let old_proc: WNDPROC = std::mem::transmute(old_proc_raw);
+    CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
+}
+
+/// Decide whether `WM_NCHITTEST` for the given lparam point should pass
+/// through to the app underneath. Returns `Some(HTTRANSPARENT)` to declare
+/// the overlay non-interactive at that point, `None` to let the original
+/// WndProc make the call (which yields `HTCLIENT` for the WebView2 child
+/// when the point is over a button / textarea / handle).
+///
+/// Three short-circuits return `None`:
+/// - Overlay hidden (hooks still installed but no real overlay to interact with).
+/// - JS is driving a drag (`MOUSE_CAPTURE_ACTIVE`) or relaying a synthetic
+///   click (`CLICK_RELAY_ACTIVE`) — those flows want the overlay to keep
+///   ownership of the cursor for their gesture.
+/// - `passthrough_enabled == false` (e.g., selecting mode, where the user
+///   needs to drag a rect anywhere on the screen).
+fn overlay_hit_test(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
+    if !OVERLAY_VISIBLE.load(Ordering::Relaxed) {
+        return None;
+    }
+    if MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed)
+        || CLICK_RELAY_ACTIVE.load(Ordering::Relaxed)
+    {
+        return None;
+    }
+
+    let (passthrough_enabled, regions) = match overlay_state().lock() {
+        Ok(g) => match g.as_ref() {
+            Some(s) => (s.passthrough_enabled, s.regions.clone()),
+            None => return None,
+        },
+        Err(_) => return None,
+    };
+    if !passthrough_enabled {
+        return None;
+    }
+
+    // lparam packs the screen-coordinate cursor: low 16 bits = x, high 16 bits
+    // = y, BOTH SIGNED 16-bit. Multi-monitor setups place secondary displays
+    // at negative screen coords; sign-extending via `as i16 as i32` is the
+    // standard Win32 idiom to recover them correctly.
+    let raw = lparam.0 as i64;
+    let x = (raw & 0xFFFF) as i16 as i32;
+    let y = ((raw >> 16) & 0xFFFF) as i16 as i32;
+    let mut pt = POINT { x, y };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    let cx = pt.x as f64;
+    let cy = pt.y as f64;
+    let in_region = regions
+        .iter()
+        .any(|r| cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h);
+
+    if !in_region {
+        // `HTTRANSPARENT` is the standard Win32 sentinel meaning "this
+        // window is not at the hit-test point; pass to the next window in
+        // z-order." Identical effect to `WS_EX_TRANSPARENT`, but evaluated
+        // synchronously per-event so there's no toggle race between the
+        // cursor poll and the actual click.
+        Some(LRESULT(HTTRANSPARENT as isize))
+    } else {
+        None
+    }
+}
+
+/// Subclass the overlay HWND's WndProc. Idempotent — second calls are
+/// no-ops. Logs to stderr so dev-mode (`npm run tauri dev`) surfaces
+/// whether the subclass took effect.
+fn install_overlay_wndproc_subclass(hwnd: HWND) -> bool {
+    if OLD_WNDPROC.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+    // Cast through `*const ()` first — Rust's `function_casts_as_integer`
+    // lint flags the direct `fn as isize` cast (the lint exists because
+    // function pointers don't have a stable numerical relationship to the
+    // address space on every target). Going through a pointer makes the
+    // intent explicit and silences the warning without changing behavior.
+    let new_proc_addr = overlay_subclass_wndproc as *const () as isize;
+    let old = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, new_proc_addr) };
+    if old == 0 {
+        eprintln!(
+            "[screenie] subclass install: SetWindowLongPtrW returned 0 (no prior proc?)"
+        );
+        return false;
+    }
+    OLD_WNDPROC.store(old, Ordering::Release);
+    // Force Windows to recompute the window frame so the new proc takes
+    // effect immediately. Without `SWP_FRAMECHANGED`, USER32 may briefly
+    // dispatch a few hit tests to the cached old proc before catching up.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND(core::ptr::null_mut()),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    eprintln!(
+        "[screenie] subclass install: WndProc subclass active (click-through via WM_NCHITTEST)"
+    );
+    true
 }
 
 fn install_keyboard_hook() -> bool {
@@ -899,7 +1171,26 @@ fn set_transparent_now(hwnd: HWND, transparent: bool) {
         } else {
             ex & !WS_EX_TRANSPARENT.0
         };
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+        if new_ex != ex {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+            // Extended-style changes via SetWindowLongPtrW don't take
+            // effect on hit testing until the window frame is re-evaluated.
+            // Without `SWP_FRAMECHANGED`, the WS_EX_TRANSPARENT bit can
+            // sit in the style mask without USER32 acknowledging it —
+            // making the click-through hook appear to do nothing. This is
+            // also the belt-and-braces guard for the WndProc subclass: if
+            // WM_NCHITTEST somehow fails, the style flip still passes
+            // clicks through.
+            let _ = SetWindowPos(
+                hwnd,
+                HWND(core::ptr::null_mut()),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
     }
 }
 
@@ -1101,4 +1392,222 @@ unsafe fn compute_winlist_hash() -> u64 {
         LPARAM(&mut state as *mut _ as isize),
     );
     hash_mix(state.hash, state.included as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Continuous backdrop capture (60fps live blur)
+// ---------------------------------------------------------------------------
+
+struct DownsampledBitmap {
+    width: u32,
+    height: u32,
+    /// Top-down RGBA8. GDI returns BGRA; we swap channels in
+    /// `capture_downsampled_overlay_backdrop` so this buffer is ready for
+    /// `image::ImageBuffer::<Rgba<u8>, _>::from_raw` without further work.
+    rgba: Vec<u8>,
+}
+
+/// FNV-1a 64-bit hash of a byte slice. Used to skip the expensive
+/// PNG-encode + IPC-emit when the desktop content hasn't changed between
+/// 60fps capture ticks. Same hash as macOS's `screenie_hash_downsampled_image`
+/// in `macos_window.m` conceptually — different implementation since here
+/// we're hashing raw RGBA, not a downsampled CG image.
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Capture the monitor under the overlay HWND, downsampled to ~480 long
+/// edge so the BitBlt + DIB read fits comfortably in a 16ms frame budget.
+/// Uses `HALFTONE` stretch mode for good downsample quality (GDI does the
+/// box-filter on our behalf, much cheaper than running it ourselves in
+/// software).
+///
+/// Returns `None` on any GDI failure — the continuous-capture loop just
+/// skips that tick. WDA_EXCLUDEFROMCAPTURE on the overlay ensures the
+/// captured bitmap doesn't include our own pixels (no feedback frosting).
+unsafe fn capture_downsampled_overlay_backdrop() -> Option<DownsampledBitmap> {
+    // Find the monitor under the overlay window. Snapshot the hwnd_raw
+    // from state with the lock held briefly so we don't keep it during
+    // GDI calls.
+    let hwnd_raw = match overlay_state().lock().ok().and_then(|g| g.as_ref().map(|s| s.hwnd_raw)) {
+        Some(h) if h != 0 => h,
+        _ => return None,
+    };
+    let hwnd = hwnd_from_raw(hwnd_raw);
+    if !IsWindow(hwnd).as_bool() {
+        return None;
+    }
+
+    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if monitor.0.is_null() {
+        return None;
+    }
+    // windows-rs 0.58 doesn't derive `Default` for `MONITORINFO`. Initialize
+    // explicitly; `RECT::default()` IS derived and zeroes all four edges.
+    let mut mon_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        rcMonitor: RECT::default(),
+        rcWork: RECT::default(),
+        dwFlags: 0,
+    };
+    if !GetMonitorInfoW(monitor, &mut mon_info).as_bool() {
+        return None;
+    }
+    let mon_left = mon_info.rcMonitor.left;
+    let mon_top = mon_info.rcMonitor.top;
+    let mon_w = mon_info.rcMonitor.right - mon_left;
+    let mon_h = mon_info.rcMonitor.bottom - mon_top;
+    if mon_w <= 0 || mon_h <= 0 {
+        return None;
+    }
+
+    // Preserve aspect ratio while clamping the long edge to keep the
+    // payload small. A 16:9 monitor → 480x270; 16:10 → 480x300; etc.
+    let scale = CONTINUOUS_CAPTURE_LONG_EDGE as f64 / mon_w.max(mon_h) as f64;
+    let dst_w = ((mon_w as f64 * scale).round() as i32).max(1);
+    let dst_h = ((mon_h as f64 * scale).round() as i32).max(1);
+
+    // RAII guards so a mid-function early-return still releases GDI
+    // handles — leaking DCs is a fast path to running out of GDI objects
+    // on Windows.
+    let null_hwnd = HWND(core::ptr::null_mut());
+    let screen_dc = GetDC(null_hwnd);
+    if screen_dc.is_invalid() {
+        return None;
+    }
+    struct DcGuard(HDC);
+    impl Drop for DcGuard {
+        fn drop(&mut self) {
+            unsafe {
+                ReleaseDC(HWND(core::ptr::null_mut()), self.0);
+            }
+        }
+    }
+    let _screen = DcGuard(screen_dc);
+
+    let mem_dc = CreateCompatibleDC(screen_dc);
+    if mem_dc.is_invalid() {
+        return None;
+    }
+    struct MemDcGuard(HDC);
+    impl Drop for MemDcGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DeleteDC(self.0);
+            }
+        }
+    }
+    let _mem = MemDcGuard(mem_dc);
+
+    let bitmap = CreateCompatibleBitmap(screen_dc, dst_w, dst_h);
+    if bitmap.is_invalid() {
+        return None;
+    }
+    struct BmpGuard(HBITMAP);
+    impl Drop for BmpGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DeleteObject(self.0);
+            }
+        }
+    }
+    let _bmp = BmpGuard(bitmap);
+
+    let old = SelectObject(mem_dc, bitmap);
+
+    // HALFTONE gives GDI permission to do a box-filter when scaling down.
+    // Without it, the default `BLACKONWHITE` mode produces a much rougher
+    // nearest-neighbor downsample that visibly aliases. Required pair:
+    // `SetBrushOrgEx(0, 0, None)` per Microsoft docs.
+    let _ = SetStretchBltMode(mem_dc, HALFTONE);
+    let _ = SetBrushOrgEx(mem_dc, 0, 0, None);
+
+    // `StretchBlt` returns `BOOL` in windows-rs 0.58 (NOT a `Result<()>`
+    // like `BitBlt` does — inconsistent windows-rs API surface). Treat
+    // FALSE as failure.
+    let stretched = StretchBlt(
+        mem_dc, 0, 0, dst_w, dst_h, screen_dc, mon_left, mon_top, mon_w, mon_h, SRCCOPY,
+    );
+    if !stretched.as_bool() {
+        SelectObject(mem_dc, old);
+        return None;
+    }
+
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: dst_w,
+            // Negative height = top-down DIB (row 0 first).
+            biHeight: -dst_h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0, // BI_RGB
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [RGBQUAD::default(); 1],
+    };
+
+    let stride = (dst_w * 4) as usize;
+    let mut buf = vec![0u8; stride * dst_h as usize];
+
+    let rows_read = GetDIBits(
+        mem_dc,
+        bitmap,
+        0,
+        dst_h as u32,
+        Some(buf.as_mut_ptr() as _),
+        &mut info,
+        DIB_RGB_COLORS,
+    );
+
+    SelectObject(mem_dc, old);
+
+    if rows_read == 0 {
+        return None;
+    }
+
+    // BGRA → RGBA in place. GDI leaves alpha undefined for opaque desktop
+    // pixels; pin it to 0xff so the PNG encoder doesn't produce a fully
+    // transparent image (a classic GDI gotcha — `capture/win.rs` has the
+    // same fix-up, kept here so the two paths stay symmetric).
+    for px in buf.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 0xff;
+    }
+
+    Some(DownsampledBitmap {
+        width: dst_w as u32,
+        height: dst_h as u32,
+        rgba: buf,
+    })
+}
+
+/// PNG-encode a `DownsampledBitmap` and return its base64. Heavy-ish
+/// (5–10ms for a 480-long-edge image on commodity hardware) — that's why
+/// the continuous-capture loop hash-checks before calling this.
+///
+/// Takes the bitmap by value so the RGBA buffer is moved into
+/// `ImageBuffer::from_raw` instead of being cloned. At 60fps that single
+/// avoidance saves ~30MB/s of allocator churn on a 1080p monitor.
+fn encode_bitmap_png_b64(bitmap: DownsampledBitmap) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let img_buf = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+        bitmap.width,
+        bitmap.height,
+        bitmap.rgba,
+    )?;
+    let mut out: Vec<u8> = Vec::with_capacity((bitmap.width * bitmap.height) as usize);
+    image::DynamicImage::ImageRgba8(img_buf)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(STANDARD.encode(&out))
 }

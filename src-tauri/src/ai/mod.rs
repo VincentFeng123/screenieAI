@@ -233,3 +233,135 @@ fn find_sse_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
+
+/// Reduce a provider's raw (non-200 or mid-stream) error body to a short,
+/// human-readable string suitable for the user-facing toast.
+///
+/// Why we sanitize on the Rust side:
+/// - Some providers echo the request's `Authorization` header or `x-api-key`
+///   into their error JSON for debugging. Forwarding that verbatim into the
+///   toast would print `sk-...` on screen.
+/// - Provider error envelopes are noisy (`request_id`, `type`, nested
+///   `details[]`, full HTML 5xx pages). The user only wants the message.
+/// - Defense in depth: even though the renderer also parses JSON, this
+///   guarantees no secret-shaped substring escapes via the tooltip path or
+///   any future consumer that prints `AiError` directly.
+pub(crate) fn sanitize_provider_error(body: &str, provider: &str) -> String {
+    let extracted = extract_provider_message(body, provider).unwrap_or_else(|| {
+        body.lines()
+            .map(|l| strip_html_tags(l).trim().to_string())
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+    });
+    let scrubbed = scrub_api_keys(&extracted);
+    let collapsed = collapse_whitespace(&scrubbed);
+    truncate_chars(&collapsed, 200)
+}
+
+fn extract_provider_message(body: &str, provider: &str) -> Option<String> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(s) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Some(s.to_string());
+        }
+        if let Some(s) = v.get("message").and_then(|m| m.as_str()) {
+            return Some(s.to_string());
+        }
+        // Gemini sometimes wraps errors in a top-level array.
+        if let Some(arr) = v.as_array() {
+            if let Some(s) = arr
+                .first()
+                .and_then(|e| e.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                return Some(s.to_string());
+            }
+        }
+        if let Some(s) = v.get("error").and_then(|e| e.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    let _ = provider;
+    None
+}
+
+fn scrub_api_keys(s: &str) -> String {
+    redact_prefix(&redact_prefix(s, "sk-", 20), "AIza", 30)
+}
+
+fn redact_prefix(s: &str, prefix: &str, min_tail_len: usize) -> String {
+    let bytes = s.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + prefix_bytes.len() <= bytes.len() && &bytes[i..i + prefix_bytes.len()] == prefix_bytes {
+            let mut j = i + prefix_bytes.len();
+            while j < bytes.len() {
+                let c = bytes[j];
+                let is_keychar = c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+                if !is_keychar {
+                    break;
+                }
+                j += 1;
+            }
+            if j - (i + prefix_bytes.len()) >= min_tail_len {
+                out.push_str(prefix);
+                out.push_str("***");
+                i = j;
+                continue;
+            }
+        }
+        out.push(char::from(bytes[i]));
+        i += 1;
+    }
+    // The byte-by-byte fallback corrupts non-ASCII. Return original if no
+    // redaction happened to preserve UTF-8.
+    if !out.contains("***") {
+        return s.to_string();
+    }
+    out
+}
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{truncated}…")
+}

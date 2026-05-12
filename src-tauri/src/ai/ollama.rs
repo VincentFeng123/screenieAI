@@ -3,9 +3,51 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 
 const API_URL: &str = "http://localhost:11434/api/chat";
 const TAGS_URL: &str = "http://localhost:11434/api/tags";
+
+/// Cached "we have confirmed localhost:11434 is genuinely Ollama" verdict for
+/// the process lifetime. We only ever cache the positive case so a transient
+/// failure (Ollama starting up, port temporarily owned by another process)
+/// can be retried; once verified, subsequent requests skip the banner check
+/// to avoid doubling the request count on the chat hot path.
+static OLLAMA_BANNER_VERIFIED: OnceLock<bool> = OnceLock::new();
+
+/// Probe `/api/tags` and confirm the response shape matches what the real
+/// Ollama daemon returns: a JSON object with a `models` field that is an
+/// array. A different process bound to 11434 (port collision with another
+/// local AI tool) would fail this check, preventing us from sending prompts
+/// + image data to the wrong endpoint.
+async fn verify_ollama_banner(client: &reqwest::Client) -> Result<(), AiError> {
+    if OLLAMA_BANNER_VERIFIED.get().copied().unwrap_or(false) {
+        return Ok(());
+    }
+    let resp = client.get(TAGS_URL).send().await.map_err(|e| {
+        AiError::Http(format!(
+            "ollama not reachable at localhost:11434 ({})",
+            e
+        ))
+    })?;
+    if !resp.status().is_success() {
+        return Err(AiError::Http(format!(
+            "localhost:11434 is not Ollama (unexpected banner: HTTP {})",
+            resp.status().as_u16()
+        )));
+    }
+    let v: Value = resp.json().await.map_err(|_| {
+        AiError::Http("localhost:11434 is not Ollama (unexpected banner)".into())
+    })?;
+    let looks_like_ollama = v.get("models").and_then(|m| m.as_array()).is_some();
+    if !looks_like_ollama {
+        return Err(AiError::Http(
+            "localhost:11434 is not Ollama (unexpected banner)".into(),
+        ));
+    }
+    let _ = OLLAMA_BANNER_VERIFIED.set(true);
+    Ok(())
+}
 
 pub async fn stream<F>(req: AskRequest, cancel: CancelFlag, mut on_event: F) -> Result<(), AiError>
 where
@@ -20,6 +62,7 @@ where
     });
 
     let client = super::local_client()?;
+    verify_ollama_banner(&client).await?;
     let resp = match client.post(API_URL).json(&body).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -35,7 +78,7 @@ where
         let text = resp.text().await.unwrap_or_default();
         return Err(AiError::Api {
             status: status.as_u16(),
-            body: text,
+            body: super::sanitize_provider_error(&text, "ollama"),
         });
     }
 
@@ -59,6 +102,15 @@ where
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<Value>(line) {
+                // Ollama emits `{"error": "..."}` lines mid-stream on partial
+                // failures (model unloaded, OOM during decode). Without this
+                // the stream just stops with no toast.
+                if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                    return Err(AiError::Api {
+                        status: 200,
+                        body: super::sanitize_provider_error(err, "ollama"),
+                    });
+                }
                 if let Some(text) = v
                     .get("message")
                     .and_then(|m| m.get("content"))

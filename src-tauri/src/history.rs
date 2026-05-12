@@ -106,13 +106,19 @@ pub fn add_entry(app_data: &Path, args: AddArgs) -> Result<HistoryEntry, History
         .map_err(|e| HistoryError::Decode(e.to_string()))?;
     std::fs::write(entry_png_path(app_data, &id), &bytes)?;
 
-    // Thumbnail: 240px on the long edge, JPEG-quality PNG. Tiny + decodes
-    // fast so the history list view doesn't stutter even on 200 entries.
-    let thumb = make_thumbnail(&bytes, 240).unwrap_or_else(|e| {
-        eprintln!("[screenie] history thumb failed: {}", e);
-        bytes.clone()
-    });
-    std::fs::write(entry_thumb_path(app_data, &id), &thumb)?;
+    // Thumbnail: 240px on the long edge. On encoder failure, skip the thumb
+    // file rather than fall back to the full PNG — a 5K screenshot can be
+    // 10+ MiB, and loading 200 of those into the history list view would
+    // freeze Settings. `load_thumb_b64` returns Io error for missing file;
+    // the frontend renders a placeholder for that case.
+    match make_thumbnail(&bytes, 240) {
+        Ok(thumb) => {
+            std::fs::write(entry_thumb_path(app_data, &id), &thumb)?;
+        }
+        Err(e) => {
+            eprintln!("[screenie] history thumb failed (skipping thumb file): {}", e);
+        }
+    }
 
     let entry = HistoryEntry {
         id,

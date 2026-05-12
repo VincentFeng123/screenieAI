@@ -116,12 +116,27 @@ export default function Chat() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const runSeqRef = useRef(0);
+  // Mirror of `streaming` for closures (hydrate/listen) that capture state
+  // once at mount.
+  const streamingRef = useRef<string | null>(null);
+  const stickToBottomRef = useRef(true);
 
   // Hydrate from Rust state (set by `open_chat_window`). The chat window is
   // reused, so also listen for reseeds after the first mount.
   useEffect(() => {
     let cancelled = false;
-    const hydrate = async () => {
+    let unlistenFn: (() => void) | null = null;
+    const hydrate = async (isReseed: boolean) => {
+      // P4-C-reseed: a reseed (new pin from the overlay) replaces the
+      // conversation, so any in-flight stream from the previous chat would
+      // otherwise keep burning tokens server-side and (per the per-window
+      // cancel slot in lib.rs) would still occupy this window's
+      // chat_ai_cancel slot. Tear it down before bumping runSeq.
+      if (isReseed && streamingRef.current !== null) {
+        invoke("cancel_ai").catch((e) => {
+          console.error("cancel_ai (reseed) failed:", e);
+        });
+      }
       const stored = readStoredChatSession();
       let fresh: ChatSeed | null = null;
       try {
@@ -148,13 +163,27 @@ export default function Chat() {
         writeStoredChatSession(s, []);
       }
     };
-    void hydrate();
-    const unlisten = listen("chat-seed-changed", () => {
-      void hydrate();
-    });
+    void hydrate(false);
+    // P4-C-listen: stash the resolved unlisten in a closure-local so the
+    // cleanup tears down deterministically even if the listener Promise
+    // resolves after the component already unmounted.
+    listen("chat-seed-changed", () => {
+      if (cancelled) return;
+      void hydrate(true);
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+          return;
+        }
+        unlistenFn = fn;
+      })
+      .catch((e) => {
+        console.error("listen(chat-seed-changed) failed:", e);
+      });
     return () => {
       cancelled = true;
-      unlisten.then((fn) => fn());
+      if (unlistenFn) unlistenFn();
     };
   }, []);
 
@@ -172,10 +201,39 @@ export default function Chat() {
     writeStoredChatSession(seed, messages);
   }, [seed, messages]);
 
+  // Mirror streaming into a ref so closures captured at mount (the
+  // chat-seed-changed listener) can see the current value.
+  useEffect(() => {
+    streamingRef.current = streaming;
+  }, [streaming]);
+
+  // P4-C-scroll: only auto-scroll when the user is already pinned to the
+  // bottom. If they scrolled up to read prior context, leave them alone
+  // until they return to within ~24px of the bottom.
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const onScroll = () => {
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+      stickToBottomRef.current = distance < 24;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (!stickToBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
   }, [messages, streaming]);
+
+  // When a brand-new conversation seeds in, force-stick to bottom so the
+  // first chunk doesn't leave the user mid-scroll on whatever the previous
+  // chat's position was.
+  useEffect(() => {
+    stickToBottomRef.current = true;
+  }, [seed?.png_b64]);
 
 
   const closeWindow = () => {
@@ -762,6 +820,8 @@ function ImageLightbox({ b64, onClose }: { b64: string; onClose: () => void }) {
   }, [onClose]);
   return (
     <div
+      role="button"
+      aria-label="Close image preview"
       onClick={onClose}
       style={{
         position: "fixed",

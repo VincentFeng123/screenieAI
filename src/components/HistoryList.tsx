@@ -109,11 +109,15 @@ export default function HistoryList({
   useEffect(() => {
     if (!pendingDeleteId) return;
     const onDown = (e: Event) => {
-      const path =
-        typeof (e as Event & { composedPath?: () => EventTarget[] })
-          .composedPath === "function"
-          ? (e as Event & { composedPath: () => EventTarget[] }).composedPath()
-          : [e.target as EventTarget];
+      const ev = e as Event & { composedPath?: () => EventTarget[] };
+      let path: EventTarget[];
+      if (typeof ev.composedPath === "function") {
+        path = ev.composedPath();
+      } else if (e.target) {
+        path = [e.target];
+      } else {
+        path = [];
+      }
       const hitPending = path.some((node) => {
         if (!(node instanceof Element)) return false;
         return node.matches?.(

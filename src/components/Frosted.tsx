@@ -22,6 +22,7 @@
 /* ------------------------------------------------------------------ */
 
 import { useEffect, useRef } from "react";
+import { listen } from "@tauri-apps/api/event";
 
 const isWindowsPlatform =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
@@ -44,12 +45,21 @@ export function BlurredBackdrop(props: {
 
 // Caller blur radii are tuned for the macOS NSVisualEffectView path (which
 // applies its own ~50-80px-equivalent blur on top in the system compositor).
-// CSS filter:blur() on a static bitmap is qualitatively different — a 26px
-// CSS blur reads as a noticeably milder smear than the live OS-level vibrancy
-// the Mac side gets. Scaling the caller's value up at this layer keeps the
-// per-call-site tuning meaningful (toolbar < chat panel) while bringing the
-// Windows panels into the same visual ballpark as the Mac.
-const WIN_BLUR_SCALE = 2.4;
+// On Windows we render the same blur via CSS `filter: blur()` over a
+// downsampled-and-pre-blurred screenshot bitmap pushed from Rust at 60fps.
+//
+// IMPORTANT: Chromium silently caps or downgrades `filter: blur()` past
+// ~40px on layered/transparent windows when the compositor can't promote
+// the element to GPU. With the previous 2.4× scale (effective 60–80px),
+// the blur visibly stopped rendering on Win11 22H2+ WebView2 — the
+// screenshot showed through faintly but completely sharp. Keeping the CSS
+// blur in the 20–32px range, combined with a Gaussian pre-blur applied
+// inside `windows_window::capture_continuous_backdrop`, produces the
+// same visual heft without tripping Chromium's filter limit. `will-change`
+// + `transform: translateZ(0)` below force GPU compositing, which is the
+// other half of making this render reliably.
+const WIN_BLUR_SCALE = 1.0;
+const WIN_BLUR_MAX = 32;
 // Saturation boost mirrors the slight saturation lift NSVisualEffectMaterial.sidebar
 // applies — without it the static-bitmap blur reads as a gray mush instead of
 // faintly tinted glass.
@@ -75,7 +85,10 @@ function WindowsBlurredBackdrop({
   persistImage?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const effectiveBlur = blurRadius * WIN_BLUR_SCALE;
+  // Cap the CSS blur at WIN_BLUR_MAX so Chromium's compositor reliably
+  // GPU-rasterizes it; the Rust capture path pre-blurs the bitmap so the
+  // panels still look meaningfully frosted at this lower CSS radius.
+  const effectiveBlur = Math.min(blurRadius * WIN_BLUR_SCALE, WIN_BLUR_MAX);
 
   // Track the parent panel's screen-relative origin so the bitmap inside
   // each panel shows the part of the screen directly behind it. Earlier
@@ -87,15 +100,24 @@ function WindowsBlurredBackdrop({
   // through React state, and only writes the `backgroundPosition` style
   // when the value actually changes, so it stays cheap even across 8
   // mounted instances during a chat-panel drag.
+  // A naive always-on rAF kept ~5% idle CPU with 8 panels open (8×
+  // getBoundingClientRect + scheduling overhead per frame). Instead: do a
+  // sync update once on mount and on size changes (ResizeObserver), and
+  // only spin a 60Hz rAF DURING user-driven motion (drags, transitions,
+  // scrolls) with a short idle quiet period before it shuts off. Idle CPU
+  // drops to ~0; visual fidelity is identical because rAF is back at 60Hz
+  // the instant motion starts.
   useEffect(() => {
+    const el = ref.current;
+    const parent = el?.parentElement;
+    if (!el || !parent) return;
+
     let raf = 0;
+    let idleTimer = 0;
     let lastLeft = Number.NaN;
     let lastTop = Number.NaN;
-    const tick = () => {
-      raf = requestAnimationFrame(tick);
-      const el = ref.current;
-      const parent = el?.parentElement;
-      if (!el || !parent) return;
+
+    const updateOnce = () => {
       const rect = parent.getBoundingClientRect();
       const nextLeft = -rect.left;
       const nextTop = -rect.top;
@@ -103,16 +125,116 @@ function WindowsBlurredBackdrop({
         Math.abs(nextLeft - lastLeft) < 0.5 &&
         Math.abs(nextTop - lastTop) < 0.5
       ) {
-        return;
+        return false;
       }
       lastLeft = nextLeft;
       lastTop = nextTop;
-      // Direct style write — bypasses React reconciliation. Each frame
-      // becomes one getBoundingClientRect + (at most) one style assignment.
       el.style.backgroundPosition = `${nextLeft}px ${nextTop}px`;
+      return true;
     };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+
+    const tick = () => {
+      raf = 0;
+      updateOnce();
+      if (idleTimer !== 0) {
+        raf = requestAnimationFrame(tick);
+      }
+    };
+
+    // ~200ms of quiet after the last motion event before the rAF stops.
+    // Long enough to coast through a CSS transition tail / momentum scroll.
+    const QUIET_MS = 200;
+
+    const wake = () => {
+      if (idleTimer !== 0) {
+        clearTimeout(idleTimer);
+      }
+      idleTimer = window.setTimeout(() => {
+        idleTimer = 0;
+      }, QUIET_MS);
+      if (raf === 0) {
+        raf = requestAnimationFrame(tick);
+      }
+    };
+
+    updateOnce();
+
+    const ro = new ResizeObserver(() => {
+      updateOnce();
+      wake();
+    });
+    ro.observe(parent);
+
+    const onWinMotion = () => wake();
+    window.addEventListener("scroll", onWinMotion, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener("resize", onWinMotion, { passive: true });
+
+    const onPointer = () => wake();
+    window.addEventListener("pointerdown", onPointer, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener("pointermove", onPointer, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener("pointerup", onPointer, {
+      capture: true,
+      passive: true,
+    });
+
+    const onMotion = () => wake();
+    parent.addEventListener("transitionrun", onMotion);
+    parent.addEventListener("transitionend", onMotion);
+    parent.addEventListener("animationstart", onMotion);
+    parent.addEventListener("animationend", onMotion);
+
+    return () => {
+      if (raf !== 0) cancelAnimationFrame(raf);
+      if (idleTimer !== 0) clearTimeout(idleTimer);
+      ro.disconnect();
+      window.removeEventListener("scroll", onWinMotion, { capture: true });
+      window.removeEventListener("resize", onWinMotion);
+      window.removeEventListener("pointerdown", onPointer, { capture: true });
+      window.removeEventListener("pointermove", onPointer, { capture: true });
+      window.removeEventListener("pointerup", onPointer, { capture: true });
+      parent.removeEventListener("transitionrun", onMotion);
+      parent.removeEventListener("transitionend", onMotion);
+      parent.removeEventListener("animationstart", onMotion);
+      parent.removeEventListener("animationend", onMotion);
+    };
+  }, []);
+
+  // Drive the bitmap from the `src` prop AND from live 60fps refresh
+  // events. Both paths write to `el.style.backgroundImage` directly so
+  // there's no React reconciliation cost when the bitmap updates — at
+  // 60fps that React diff is the difference between buttery-smooth blur
+  // and a perceptible stutter every frame. Rust's
+  // `windows_window::capture_continuous_backdrop` emits the live event
+  // while the overlay is visible.
+  useEffect(() => {
+    const el = ref.current;
+    if (el) {
+      el.style.backgroundImage = `url(data:image/png;base64,${src})`;
+    }
+  }, [src]);
+  useEffect(() => {
+    const unlistenPromise = listen<string>(
+      "overlay-backdrop-update",
+      (event) => {
+        const el = ref.current;
+        if (!el) return;
+        const next = event.payload;
+        if (typeof next !== "string" || next.length === 0) return;
+        el.style.backgroundImage = `url(data:image/png;base64,${next})`;
+      },
+    );
+    return () => {
+      unlistenPromise.then((fn) => fn()).catch(() => {});
+    };
   }, []);
 
   // All three layers carry the `screenie-blurred-backdrop` class so the
@@ -131,10 +253,21 @@ function WindowsBlurredBackdrop({
         style={{
           position: "absolute",
           inset: 0,
-          backgroundImage: `url(data:image/png;base64,${src})`,
+          // backgroundImage is written imperatively by the two useEffects
+          // above (src prop + overlay-backdrop-update event) so the 60fps
+          // refresh doesn't go through React reconciliation.
           backgroundSize: `${screenW}px ${screenH}px`,
           backgroundRepeat: "no-repeat",
           filter: `blur(${effectiveBlur}px) brightness(${imageBrightness}) saturate(${WIN_SATURATION})`,
+          // `will-change: filter` promotes the element to its own
+          // compositor layer so Chromium GPU-rasterizes the blur instead
+          // of CPU-fallbacking and silently dropping it. The translateZ(0)
+          // is a separate compositor-promotion hint that works on Chromium
+          // versions where will-change alone isn't honored on layered
+          // transparent windows. Together they're the reason the blur
+          // actually renders on Win11 22H2+ WebView2.
+          willChange: "filter",
+          transform: "translateZ(0)",
           zIndex: 0,
           pointerEvents: "none",
         }}

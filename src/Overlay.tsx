@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -257,6 +257,11 @@ function useOverlayInteractionRegions(enabled: boolean) {
   const lastSignatureRef = useRef("");
   const enabledRef = useRef(enabled);
   const rafRef = useRef<number | null>(null);
+  // Per-frame guard: useLayoutEffect runs after every commit (no deps), but
+  // during AI streaming we re-render per token. Walking the DOM + stringifying
+  // hundreds of times/sec is wasted work — the rect set can only change
+  // visibly once per paint, so coalesce same-frame calls.
+  const frameSyncedRef = useRef(false);
   enabledRef.current = enabled;
 
   const cancelScheduledSync = useCallback(() => {
@@ -288,12 +293,20 @@ function useOverlayInteractionRegions(enabled: boolean) {
     });
   }, [cancelScheduledSync, syncNow]);
 
-  // Sync SYNCHRONOUSLY after every render. useLayoutEffect runs after the DOM
-  // commits but before paint, so getClientRects() sees the new layout and the
-  // IPC fires immediately. That keeps newly visible controls from briefly
-  // passing clicks through before native knows they are interactive regions.
+  // Sync SYNCHRONOUSLY after every render — but at most once per animation
+  // frame. The first commit each frame sees the new layout and the IPC fires
+  // immediately (keeping newly visible controls from briefly passing clicks
+  // through). Subsequent commits within the same frame (token-driven
+  // re-renders during AI streaming) are no-ops here; if they actually change
+  // layout, the MutationObserver / ResizeObserver below schedules a follow-up
+  // rAF sync.
   useLayoutEffect(() => {
+    if (frameSyncedRef.current) return;
+    frameSyncedRef.current = true;
     syncNow();
+    window.requestAnimationFrame(() => {
+      frameSyncedRef.current = false;
+    });
   });
 
   useEffect(() => {
@@ -406,6 +419,8 @@ function useOverlayFrostRegions(enabled: boolean) {
   const lastSignatureRef = useRef("");
   const enabledRef = useRef(enabled);
   const rafRef = useRef<number | null>(null);
+  // Per-frame guard: see useOverlayInteractionRegions for rationale.
+  const frameSyncedRef = useRef(false);
   enabledRef.current = enabled;
 
   const cancelScheduledSync = useCallback(() => {
@@ -433,10 +448,16 @@ function useOverlayFrostRegions(enabled: boolean) {
   }, [cancelScheduledSync, syncNow]);
 
   // Sync after every render so React-driven layout changes (toolbar
-  // following the rect, chat panel placement, etc.) are pushed
-  // immediately.
+  // following the rect, chat panel placement, etc.) are pushed immediately
+  // — but at most once per animation frame, so token-driven re-renders
+  // during AI streaming don't repeatedly walk the DOM.
   useLayoutEffect(() => {
+    if (frameSyncedRef.current) return;
+    frameSyncedRef.current = true;
     syncNow();
+    window.requestAnimationFrame(() => {
+      frameSyncedRef.current = false;
+    });
   });
 
   useEffect(() => {
@@ -480,6 +501,47 @@ function useOverlayFrostRegions(enabled: boolean) {
       lastSignatureRef.current = "";
     };
   }, [cancelScheduledSync, scheduleSync]);
+}
+
+// Reactive devicePixelRatio. Reading window.devicePixelRatio inside the
+// render body returns the value at render time, but it is NOT a render
+// trigger — when the user drags the overlay between a Retina and a
+// non-Retina monitor, the previously-captured DPR stays stale until some
+// other state happens to re-render. matchMedia('(resolution: <dpr>dppx)')
+// flips when the actual DPR crosses that threshold, so we attach a listener
+// and force a refresh.  (Per MDN: this is the only portable way to observe
+// DPR changes; there is no `devicepixelratiochange` event.)
+function useDevicePixelRatio(): number {
+  const [dpr, setDpr] = useState(() =>
+    typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    let mql: MediaQueryList | null = null;
+    let cancelled = false;
+
+    const attach = () => {
+      const current = window.devicePixelRatio || 1;
+      // Re-bind on every change because the query string itself encodes
+      // the current DPR — once it flips, the matched media is gone and
+      // future changes need a fresh query.
+      mql = window.matchMedia(`(resolution: ${current}dppx)`);
+      const onChange = () => {
+        if (cancelled) return;
+        setDpr(window.devicePixelRatio || 1);
+        mql?.removeEventListener("change", onChange);
+        attach();
+      };
+      mql.addEventListener("change", onChange);
+    };
+    attach();
+
+    return () => {
+      cancelled = true;
+      mql = null;
+    };
+  }, []);
+  return dpr;
 }
 
 const PERMISSION_BANNER_DISMISSED_KEY = "screenie.permissionBannerDismissed";
@@ -907,7 +969,7 @@ export default function Overlay() {
     );
   }
 
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = useDevicePixelRatio();
 
   // Stable, stale-closure-proof setters via functional setMode.
   const setAdjustingRect = (r: Rect) =>
@@ -4135,33 +4197,34 @@ function ResultLayer({
               >
                 {messages.map((m, i) => (
                   <MessageBubble
-                    key={i}
+                    key={`msg-${i}`}
                     message={m}
                     renderDensity={preferences.aiRenderDensity}
                   />
                 ))}
                 {streaming !== null && (
                   <MessageBubble
-                    key={messages.length}
+                    key={`streaming-${messages.length}`}
                     message={{ role: "assistant", content: streaming }}
                     renderDensity={preferences.aiRenderDensity}
                     streaming
                   />
                 )}
                 {error && (
-                  <div
-                    style={{
-                      color: "#ff8a8a",
-                      fontSize: 12.5,
-                      background: "rgba(255, 80, 80, 0.08)",
-                      border: "1px solid rgba(255, 80, 80, 0.2)",
-                      padding: "8px 10px",
-                      borderRadius: 8,
-                      lineHeight: 1.45,
+                  <ErrorToast
+                    message={error}
+                    canRetry={streaming === null && messages.length > 0}
+                    onRetry={() => {
+                      setError(null);
+                      runAi(messages);
                     }}
-                  >
-                    {error}
-                  </div>
+                    onOpenSettings={() => {
+                      invoke("show_settings_window").catch((e) =>
+                        console.error("show_settings_window failed:", e),
+                      );
+                    }}
+                    onDismiss={() => setError(null)}
+                  />
                 )}
               </div>
             )}
@@ -4268,7 +4331,7 @@ function ResultLayer({
 /* Message bubble (with copy)                                          */
 /* ------------------------------------------------------------------ */
 
-function MessageBubble({
+function MessageBubbleImpl({
   message,
   renderDensity,
   streaming,
@@ -4446,6 +4509,113 @@ function MessageBubble({
               {formatUsageSummary(message.usage)}
             </span>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Memoize on the rendering inputs. The streaming parent re-renders per
+// token (setStreaming(acc) on every chunk), which would otherwise re-run
+// markdown + KaTeX + highlight.js for every existing bubble in history on
+// every chunk. Compare message identity by role + content + usage; for the
+// streaming bubble itself the parent passes a fresh object literal each
+// chunk, so we shallow-compare its fields explicitly.
+const MessageBubble = memo(MessageBubbleImpl, (prev, next) => {
+  if (prev.renderDensity !== next.renderDensity) return false;
+  if (prev.streaming !== next.streaming) return false;
+  if (prev.message.role !== next.message.role) return false;
+  if (prev.message.content !== next.message.content) return false;
+  if (prev.message.usage !== next.message.usage) return false;
+  return true;
+});
+
+/* ------------------------------------------------------------------ */
+/* Inline error toast — surfaces actionable affordances for AI errors  */
+/* (auth → Open Settings, network/transient → Retry).                  */
+/* ------------------------------------------------------------------ */
+
+function ErrorToast({
+  message,
+  canRetry,
+  onRetry,
+  onOpenSettings,
+  onDismiss,
+}: {
+  message: string;
+  canRetry: boolean;
+  onRetry: () => void;
+  onOpenSettings: () => void;
+  onDismiss: () => void;
+}) {
+  const lower = message.toLowerCase();
+  const looksAuth =
+    lower.includes("rejected the api key") ||
+    lower.includes("api key missing") ||
+    lower.includes("unauthorized") ||
+    lower.includes("invalid api key") ||
+    lower.includes("http 401") ||
+    lower.includes("http 403");
+  const looksNetwork =
+    lower.includes("network") ||
+    lower.includes("timed out") ||
+    lower.includes("timeout") ||
+    lower.includes("decoding response body") ||
+    lower.includes("connection") ||
+    lower.includes("rate-limited") ||
+    lower.includes("http 5");
+
+  const showOpenSettings = looksAuth;
+  const showRetry = canRetry && (looksNetwork || !looksAuth);
+
+  return (
+    <div
+      role="alert"
+      style={{
+        color: "#ff8a8a",
+        fontSize: 12.5,
+        background: "rgba(255, 80, 80, 0.08)",
+        border: "1px solid rgba(255, 80, 80, 0.2)",
+        padding: "8px 10px",
+        borderRadius: 8,
+        lineHeight: 1.45,
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
+      }}
+    >
+      <div>{message}</div>
+      {(showOpenSettings || showRetry) && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {showRetry && (
+            <button
+              type="button"
+              className="screenie-action"
+              onClick={onRetry}
+              style={{ fontSize: 12 }}
+            >
+              Retry
+            </button>
+          )}
+          {showOpenSettings && (
+            <button
+              type="button"
+              className="screenie-action"
+              onClick={onOpenSettings}
+              style={{ fontSize: 12 }}
+            >
+              Open Settings
+            </button>
+          )}
+          <button
+            type="button"
+            className="screenie-action"
+            onClick={onDismiss}
+            style={{ fontSize: 12, marginLeft: "auto" }}
+            aria-label="Dismiss error"
+          >
+            Dismiss
+          </button>
         </div>
       )}
     </div>

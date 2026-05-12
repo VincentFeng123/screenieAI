@@ -16,7 +16,13 @@ export default function Tutorial({
   onComplete: () => void | Promise<void>;
   onBack: () => void;
 }) {
-  const [done, setDone] = useState(false);
+  // Three-state lifecycle:
+  //   "waiting" — initial, prompting the user to press the hotkey
+  //   "confirm" — overlay closed (Rust fired tutorial-capture-complete);
+  //               could be a real capture OR an Esc-dismiss. Offer Done /
+  //               Try again so accidental Esc doesn't lock the user out.
+  //   "done"    — user explicitly confirmed the capture worked
+  const [phase, setPhase] = useState<"waiting" | "confirm" | "done">("waiting");
   const [hotkeyError, setHotkeyError] = useState<string | null>(null);
   const isMac =
     typeof navigator !== "undefined" && navigator.userAgent.includes("Mac");
@@ -29,7 +35,10 @@ export default function Tutorial({
       })
       .catch(() => {});
     const unlistenP = listen("tutorial-capture-complete", () => {
-      setDone(true);
+      // Rust fires this on overlay close regardless of whether the user
+      // actually completed a capture or just hit Esc. Don't auto-mark
+      // done — surface a confirm step the user can recover from.
+      setPhase((prev) => (prev === "done" ? prev : "confirm"));
       // Rust swaps tutorial_mode back to false when finishing the overlay
       // session. Re-arm it so a second hotkey press (before the user clicks
       // Done) still hides this onboarding window for the screenshot. Without
@@ -42,31 +51,47 @@ export default function Tutorial({
     };
   }, []);
 
+  const done = phase === "done";
+  const confirming = phase === "confirm";
+
   const handleBack = () => {
     void invoke("set_tutorial_mode", { active: false });
     onBack();
   };
 
   const handleDone = async () => {
+    setPhase("done");
     await invoke("set_tutorial_mode", { active: false }).catch(() => {});
     await onComplete();
   };
+
+  // User said "Try again" from the confirm step — drop back to waiting so
+  // they can re-press the hotkey. tutorial_mode is already re-armed by the
+  // event listener above, so a second hotkey press will hide this window.
+  const handleTryAgain = () => {
+    setPhase("waiting");
+  };
+
+  const heading = done
+    ? "You're set."
+    : confirming
+    ? "Did the capture work?"
+    : "Press the hotkey.";
+  const subtitle = hotkeyError
+    ? "The global hotkey did not register. You can finish setup, then use the menu bar icon or open Settings to resolve the shortcut."
+    : done
+    ? "Press the hotkey from any app at any time. Screenie lives in the menu bar — left-click to capture, right-click for Settings or to quit."
+    : confirming
+    ? "If you saw the overlay and got an answer, you're done. If you dismissed it (or it didn't appear), try again."
+    : "We'll get out of the way, capture the screen behind this window, and bring you back here when you close the overlay.";
 
   return (
     <div className="onboarding-step-inner tutorial">
       <span className="onboarding-eyebrow">Try it</span>
 
-      <h1 className="onboarding-h1">
-        {done ? "You're set." : "Press the hotkey."}
-      </h1>
+      <h1 className="onboarding-h1">{heading}</h1>
 
-      <p className="onboarding-subtitle">
-        {hotkeyError
-          ? "The global hotkey did not register. You can finish setup, then use the menu bar icon or open Settings to resolve the shortcut."
-          : done
-          ? "Press the hotkey from any app at any time. Screenie lives in the menu bar — left-click to capture, right-click for Settings or to quit."
-          : "We'll get out of the way, capture the screen behind this window, and bring you back here when you close the overlay."}
-      </p>
+      <p className="onboarding-subtitle">{subtitle}</p>
 
       {hotkeyError && <div className="onboarding-error">{hotkeyError}</div>}
 
@@ -80,7 +105,10 @@ export default function Tutorial({
             <Check size={42} strokeWidth={2.5} />
           </div>
         ) : (
-          <div className="onboarding-tutorial-hotkey" aria-label="Press the hotkey now">
+          <div
+            className="onboarding-tutorial-hotkey"
+            aria-label={confirming ? "Press the hotkey to retry" : "Press the hotkey now"}
+          >
             {isMac ? (
               <>
                 <span className="onboarding-key">⌘</span>
@@ -97,7 +125,13 @@ export default function Tutorial({
           </div>
         )}
         <p className="onboarding-tutorial-prompt">
-          {hotkeyError ? "Hotkey unavailable" : done ? "Capture complete" : "Press to continue"}
+          {hotkeyError
+            ? "Hotkey unavailable"
+            : done
+            ? "Capture complete"
+            : confirming
+            ? "Press again to retry"
+            : "Press to continue"}
         </p>
       </div>
 
@@ -107,7 +141,17 @@ export default function Tutorial({
           Back
         </button>
         <div className="onboarding-actions-right">
-          {done || hotkeyError ? (
+          {confirming ? (
+            <>
+              <button className="onboarding-link" onClick={handleTryAgain}>
+                Try again
+              </button>
+              <button className="onboarding-btn primary" onClick={handleDone}>
+                Done
+                <span className="arrow" aria-hidden>→</span>
+              </button>
+            </>
+          ) : done || hotkeyError ? (
             <button className="onboarding-btn primary" onClick={handleDone}>
               Done
               <span className="arrow" aria-hidden>→</span>
@@ -120,7 +164,7 @@ export default function Tutorial({
                 // tutorial mode immediately so a stray hotkey press doesn't
                 // continue to hide this window.
                 void invoke("set_tutorial_mode", { active: false });
-                setDone(true);
+                setPhase("done");
               }}
             >
               Skip the demo

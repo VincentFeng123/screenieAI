@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    This Info.plist is read by macOS in TWO scenarios:
+    1. When `tauri build` packages the .app bundle, Tauri's bundler merges
+       these keys into Contents/Info.plist alongside the auto-generated keys
+       (CFBundleVersion, CFBundleExecutable, etc.).
+    2. When `tauri dev` runs the raw binary at target/debug/screenieai, build.rs
+       embeds this file into the binary's __TEXT,__info_plist Mach-O section.
+       macOS reads it from there for TCC purposes — without that, the dev
+       binary is a "naked" executable with no usage description, and macOS
+       re-prompts for Screen Recording on every launch + invalidates grants
+       on every rebuild.
+
+    CFBundleIdentifier is duplicated here so that TCC keys grants by
+    "com.screenieai.app" regardless of whether the user is running the dev
+    binary or the bundled .app — both paths report the same identity to TCC.
+  -->
+  <key>CFBundleIdentifier</key>
+  <string>com.screenieai.app</string>
+  <key>CFBundleName</key>
+  <string>Screenie AI</string>
+  <key>CFBundleDisplayName</key>
+  <string>Screenie AI</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Screenie AI captures the screen region you select and sends it to your chosen vision AI to answer your question.</string>
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

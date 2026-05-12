@@ -29,12 +29,31 @@ use tauri::{
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 
-const MAX_AI_IMAGE_B64_CHARS: usize = 96 * 1024 * 1024;
+/// Hard cap on the base64 image-payload length accepted by `ask_ai` and
+/// `open_chat_window`. A full-screen 5K Retina capture is ~7-20 MiB base64
+/// (~25-30 MiB worst-case for photographic content); 32 MiB gives ~60%
+/// margin while bounding the worst-case allocation a malicious frontend
+/// can force the backend to perform before validation fires.
+const MAX_AI_IMAGE_B64_CHARS: usize = 32 * 1024 * 1024;
 const MAX_AI_MESSAGES: usize = 32;
 const MAX_AI_MESSAGE_CHARS: usize = 24_000;
 const MAX_AI_TOTAL_MESSAGE_CHARS: usize = 120_000;
-const ALLOWED_OLLAMA_PULL_MODELS: &[&str] = &["llama3.2-vision"];
+pub(crate) const ALLOWED_OLLAMA_PULL_MODELS: &[&str] = &["llama3.2-vision"];
 const HOTKEY_CONFIG_FILE: &str = "hotkeys.json";
+
+/// Acquire a `Mutex` guard while ignoring lock poisoning.
+///
+/// Every `Mutex` in `AppState` protects a self-consistent leaf value
+/// (`HotkeyConfig`, `Option<ChatSeed>`, etc.) — there are no
+/// invariant-bound multi-field structures. If a previous lock holder
+/// panicked, the data underneath is still valid; only the poison flag
+/// was set. Recovering with `into_inner()` lets subsequent commands
+/// (and, critically, the global-shortcut dispatcher in `run()`)
+/// continue to operate instead of cascading-panicking and silently
+/// killing the user's hotkeys for the lifetime of the process.
+fn lock_poison_safe<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -64,12 +83,6 @@ extern "C" {
         delta_x: f64,
         delta_y: f64,
         phase: std::os::raw::c_int,
-    ) -> bool;
-    fn screenie_set_overlay_capture_drag_region(
-        window: *mut std::ffi::c_void,
-        region: *const NativeOverlayInteractionRegion,
-        enabled: bool,
-        callback: extern "C" fn(dx: f64, dy: f64, ended: bool),
     ) -> bool;
     fn screenie_window_display_id(window: *mut std::ffi::c_void) -> u32;
     fn screenie_capture_display_png_excluding_self(
@@ -222,6 +235,22 @@ fn tray_icon_for_theme(theme: tauri::Theme) -> Result<tauri::image::Image<'stati
 #[cfg(target_os = "macos")]
 static OVERLAY_ESCAPE_APP: OnceLock<Mutex<Option<AppHandle>>> = OnceLock::new();
 
+/// Set to true while a capture/refresh is mid-flight. The native
+/// background-changed callback fires from the visible-window-list poll and
+/// the Space-changed observer; hiding the overlay (or the settings window)
+/// during a capture would make those signals fire spuriously and re-trigger
+/// `refresh_overlay_capture` recursively. Previously we suppressed that by
+/// uninstalling the hider entirely, but
+/// `screenie_uninstall_overlay_deactivate_hider` also drops all interaction-
+/// region / mouse-capture state (it calls
+/// `screenie_clear_overlay_mouse_passthrough` internally), so the overlay
+/// briefly went fully click-through with no defined regions, and live frost
+/// stopped updating any time `show_overlay_after_refresh` short-circuited
+/// (e.g. when `overlay_alive` was already false). A small static gate keeps
+/// the hider installed but mutes its callback for the refresh window.
+#[cfg(target_os = "macos")]
+static OVERLAY_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 #[cfg(target_os = "macos")]
 extern "C" fn handle_overlay_escape_pressed() -> bool {
     eprintln!("[screenie] esc native fired");
@@ -244,33 +273,14 @@ extern "C" fn handle_overlay_escape_pressed() -> bool {
 
 #[cfg(target_os = "macos")]
 extern "C" fn handle_overlay_background_changed() {
+    if OVERLAY_REFRESH_IN_FLIGHT.load(Ordering::Relaxed) {
+        return;
+    }
     let app = OVERLAY_ESCAPE_APP
         .get()
         .and_then(|store| store.lock().ok().and_then(|guard| guard.clone()));
     if let Some(app) = app {
         let _ = app.emit_to("overlay", "overlay-background-changed", ());
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, serde::Serialize)]
-struct OverlayCaptureDragEvent {
-    dx: f64,
-    dy: f64,
-    ended: bool,
-}
-
-#[cfg(target_os = "macos")]
-extern "C" fn handle_overlay_capture_drag(dx: f64, dy: f64, ended: bool) {
-    let app = OVERLAY_ESCAPE_APP
-        .get()
-        .and_then(|store| store.lock().ok().and_then(|guard| guard.clone()));
-    if let Some(app) = app {
-        let _ = app.emit_to("overlay", "overlay-capture-drag", OverlayCaptureDragEvent {
-            dx,
-            dy,
-            ended,
-        });
     }
 }
 
@@ -342,14 +352,29 @@ struct AppState {
     /// tasks can race to build an overlay window with the same label, which
     /// raises an Objective-C exception that aborts the process.
     capture_in_progress: AtomicBool,
+    /// Monotonic counter incremented at the start of every capture session
+    /// AND every overlay close/Settings-open path. The capture flow snapshots
+    /// the value at entry and re-checks it after each await; on mismatch it
+    /// bails before staging `pending` or re-showing the overlay. Without this,
+    /// a fast Esc + hotkey cycle could let the in-flight capture finish AFTER
+    /// the close path ran, resurrecting the overlay (and re-staging stale
+    /// `pending` for the next capture).
+    capture_generation: std::sync::atomic::AtomicU64,
     /// Set when the settings window was visible and had to be hidden
     /// before capture so the overlay can join the active fullscreen Space.
     restore_main_after_overlay: AtomicBool,
-    /// Cancellation flag for the active AI stream. Replaced on each new
-    /// `ask_ai` (which cancels any in-flight predecessor) and tripped by
-    /// `close_overlay` so closing the overlay terminates the streaming task
-    /// instead of letting it run to completion in the background.
-    ai_cancel: Mutex<Option<CancelFlag>>,
+    /// Cancellation flag for the OVERLAY's active AI stream. Replaced on each
+    /// new overlay `ask_ai` (which cancels any in-flight overlay predecessor)
+    /// and tripped by overlay teardown paths (`close_overlay`,
+    /// `show_settings_window`, recapture). Per-window slots keep closing the
+    /// overlay from cancelling the chat window's in-flight stream — they're
+    /// independent product surfaces with independent lifecycles.
+    overlay_ai_cancel: Mutex<Option<CancelFlag>>,
+    /// Cancellation flag for the CHAT window's active AI stream. Replaced on
+    /// each new chat `ask_ai`. Currently never cancelled by anything other
+    /// than the next chat ask_ai or an explicit `cancel_ai` invoke from the
+    /// chat window — opening or closing the overlay does not affect it.
+    chat_ai_cancel: Mutex<Option<CancelFlag>>,
     /// Last shortcut-registration error, persisted so React can query it even
     /// if the startup event fired before the settings/onboarding listener.
     hotkey_error: Mutex<Option<String>>,
@@ -431,20 +456,40 @@ impl Default for HotkeyConfig {
     }
 }
 
-fn replace_ai_cancel(state: &AppState) -> CancelFlag {
+fn replace_ai_cancel(state: &AppState, label: &str) -> CancelFlag {
     let next = Arc::new(AtomicBool::new(false));
-    if let Ok(mut g) = state.ai_cancel.lock() {
+    let slot = match label {
+        "chat" => &state.chat_ai_cancel,
+        // Default to the overlay slot for any unknown label so a misrouted
+        // call still cancels SOMETHING rather than silently no-op'ing.
+        _ => &state.overlay_ai_cancel,
+    };
+    if let Ok(mut g) = slot.lock() {
         if let Some(prev) = g.replace(next.clone()) {
-            prev.store(true, Ordering::Relaxed);
+            prev.store(true, Ordering::SeqCst);
         }
     }
     next
 }
 
+/// Cancel the OVERLAY's in-flight stream only. Used by overlay teardown
+/// paths (`close_overlay_now`, `show_settings_window`, recapture). The
+/// chat-window stream (if any) is intentionally left running because the
+/// chat window has its own lifecycle independent of the overlay.
 fn cancel_active_ai(state: &AppState) {
-    if let Ok(g) = state.ai_cancel.lock() {
+    if let Ok(g) = state.overlay_ai_cancel.lock() {
         if let Some(flag) = g.as_ref() {
-            flag.store(true, Ordering::Relaxed);
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Cancel the CHAT window's in-flight stream. Currently invoked via the
+/// `cancel_ai` IPC command when called from the chat window.
+fn cancel_active_chat_ai(state: &AppState) {
+    if let Ok(g) = state.chat_ai_cancel.lock() {
+        if let Some(flag) = g.as_ref() {
+            flag.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -470,8 +515,8 @@ fn secret_name_for_provider(provider: &str) -> Result<Option<&'static str>, AiEr
 fn provider_default_model(provider: &str) -> Result<&'static str, AiError> {
     match provider {
         "anthropic" => Ok("claude-sonnet-4-6"),
-        "openai" => Ok("gpt-5.5"),
-        "gemini" => Ok("gemini-3-flash-preview"),
+        "openai" => Ok("gpt-4o"),
+        "gemini" => Ok("gemini-2.5-flash"),
         "ollama" => Ok("llama3.2-vision"),
         other => Err(AiError::InvalidProvider(other.to_string())),
     }
@@ -533,6 +578,41 @@ fn validate_ai_payload(messages: &[UiMessage], image_b64: &str) -> Result<(), Ai
     Ok(())
 }
 
+/// Validate a chat-seed payload synthesized by the overlay before opening
+/// the detached chat window. Mirrors `validate_ai_payload` — same image
+/// cap, same per-message + total-history caps. Without this,
+/// `open_chat_window` stashed unbounded blobs in `AppState.chat_seed`
+/// indefinitely (until the chat window pulled them or the process exited).
+fn validate_chat_seed_payload(
+    png_b64: &str,
+    messages_json: &str,
+) -> Result<(), String> {
+    if png_b64.len() > MAX_AI_IMAGE_B64_CHARS {
+        return Err("image payload too large".into());
+    }
+    let max_json = MAX_AI_TOTAL_MESSAGE_CHARS.saturating_mul(2);
+    if messages_json.len() > max_json {
+        return Err("chat history too long".into());
+    }
+    let parsed: Vec<UiMessage> = serde_json::from_str(messages_json)
+        .map_err(|e| format!("messages_json invalid: {e}"))?;
+    if parsed.len() > MAX_AI_MESSAGES {
+        return Err("too many chat messages".into());
+    }
+    let mut total = 0usize;
+    for m in &parsed {
+        let len = m.content.chars().count();
+        if len > MAX_AI_MESSAGE_CHARS {
+            return Err("message too long".into());
+        }
+        total = total.saturating_add(len);
+    }
+    if total > MAX_AI_TOTAL_MESSAGE_CHARS {
+        return Err("chat history too long".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn take_pending_capture(state: tauri::State<'_, AppState>) -> Option<ScreenCapture> {
     state.pending.lock().ok().and_then(|mut g| g.take())
@@ -546,7 +626,9 @@ async fn crop_capture(
     w: u32,
     h: u32,
 ) -> Result<CroppedCapture, CaptureError> {
-    capture::crop_png_b64(&src_b64, x, y, w, h)
+    // `capture::crop_png_b64` is itself an async wrapper that ships the
+    // PNG decode + crop + re-encode work to spawn_blocking internally.
+    capture::crop_png_b64(src_b64, x, y, w, h).await
 }
 
 #[tauri::command]
@@ -556,12 +638,25 @@ async fn refresh_overlay_capture(
 ) -> Result<ScreenCapture, CaptureError> {
     require_window(&window, "overlay").map_err(CaptureError::Other)?;
 
+    // While the hide-and-recapture dance below is in flight, mute the native
+    // background-changed callback so the Space/visible-window-list poll
+    // doesn't re-trigger this command recursively. The earlier code achieved
+    // this by calling `screenie_uninstall_overlay_deactivate_hider`, but that
+    // helper also tears down the entire mouse-passthrough / interaction-region
+    // state — leaving live frost frozen and the overlay fully click-through
+    // with no regions defined. The static guard below is reset in every exit
+    // path via the RAII helper.
     #[cfg(target_os = "macos")]
-    {
-        let _ = app.run_on_main_thread(|| unsafe {
-            screenie_uninstall_overlay_deactivate_hider();
-        });
-    }
+    let _refresh_guard = {
+        struct RefreshInFlightGuard;
+        impl Drop for RefreshInFlightGuard {
+            fn drop(&mut self) {
+                OVERLAY_REFRESH_IN_FLIGHT.store(false, Ordering::Relaxed);
+            }
+        }
+        OVERLAY_REFRESH_IN_FLIGHT.store(true, Ordering::Relaxed);
+        RefreshInFlightGuard
+    };
 
     let monitor = window
         .current_monitor()
@@ -749,7 +844,13 @@ async fn ask_ai(
     let api_key = match secret_name_for_provider(&provider)? {
         Some(name) => secrets::get(name)
             .map_err(|e| AiError::Keyring(e.to_string()))?
-            .unwrap_or_default(),
+            // No key in the keychain — fail FAST with a structured `NoKey`
+            // error so the frontend can surface a "no key configured" CTA
+            // (Open Settings) rather than letting the cloud provider answer
+            // with a raw 401, which is what happens when the user skips the
+            // onboarding ApiKeys step (provider defaults to "anthropic" but
+            // no key is present).
+            .ok_or(AiError::NoKey)?,
         None => String::new(),
     };
     let response_profile = normalize_response_profile(response_profile);
@@ -759,14 +860,16 @@ async fn ask_ai(
     // The provider stream functions check this between chunks, so closing the
     // overlay or starting a new ask_ai stops the previous network task instead
     // of letting it drain to the end in the background.
-    let cancel = replace_ai_cancel(&state);
+    // Per-window cancel slots: closing the overlay no longer cancels an
+    // in-flight chat stream and vice versa.
+    let cancel = replace_ai_cancel(&state, window.label());
     let cancel_for_send = cancel.clone();
     let send = |event: AskEvent| {
-        if cancel_for_send.load(std::sync::atomic::Ordering::Relaxed) {
+        if cancel_for_send.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         if matches!(event, AskEvent::Chunk { .. }) {
-            chunk_count_inner.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            chunk_count_inner.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         if let Err(e) = on_chunk.send(event) {
             eprintln!("[screenie] ask_ai on_chunk.send failed: {:?}", e);
@@ -815,12 +918,12 @@ async fn ask_ai(
         }
         other => Err(AiError::InvalidProvider(other.to_string())),
     };
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         // Cancellation isn't a user-visible error — the overlay either closed
         // or kicked off a new request. Swallow the result silently.
         return Ok(());
     }
-    if result.is_ok() && chunk_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    if result.is_ok() && chunk_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         result = Err(AiError::EmptyResponse {
             provider: provider.clone(),
         });
@@ -891,6 +994,11 @@ async fn close_overlay(app: AppHandle) {
 fn close_overlay_now(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         state.overlay_alive.store(false, Ordering::Relaxed);
+        // Bump the capture generation so any in-flight capture task sees
+        // its snapshot is now stale and bails before re-showing the overlay.
+        state
+            .capture_generation
+            .fetch_add(1, Ordering::SeqCst);
         cancel_active_ai(&state);
     }
     #[cfg(target_os = "macos")]
@@ -914,7 +1022,9 @@ fn close_overlay_now(app: &AppHandle) {
         // foreground app, and stop the background-change observer. Without
         // these, the low-level hooks would keep intercepting Esc system-wide
         // while the overlay is hidden and the poll task would keep emitting
-        // refresh events into the void.
+        // refresh events into the void. Also halt the 60fps backdrop
+        // capture loop so it stops doing GDI work for an invisible overlay.
+        windows_window::stop_overlay_continuous_capture();
         windows_window::stop_overlay_background_observer();
         windows_window::clear_overlay_interaction_regions();
         windows_window::forget_previous_app();
@@ -1070,35 +1180,21 @@ fn relay_overlay_wheel(
     Ok(())
 }
 
-#[tauri::command]
-fn set_overlay_capture_drag_region(
-    window: WebviewWindow,
-    region: Option<OverlayInteractionRegion>,
-    enabled: bool,
-) -> Result<(), String> {
-    require_window(&window, "overlay")?;
-    #[cfg(target_os = "macos")]
-    {
-        set_overlay_capture_drag_region_on_main(&window, region, enabled);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (region, enabled);
-    }
-    Ok(())
-}
-
 /// Stop the in-flight AI stream without closing the overlay. Trips the same
 /// cancel flag `close_overlay` does — the streaming task in `ask_ai` returns
 /// `Ok(())` between chunks, so the JS-side success path commits whatever
 /// text accumulated so far as the final assistant message.
 #[tauri::command]
 fn cancel_ai(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
-    if window.label() != "overlay" && window.label() != "chat" {
+    let label = window.label();
+    if label != "overlay" && label != "chat" {
         return Err("command not allowed from this window".into());
     }
     if let Some(state) = app.try_state::<AppState>() {
-        cancel_active_ai(&state);
+        match label {
+            "chat" => cancel_active_chat_ai(&state),
+            _ => cancel_active_ai(&state),
+        }
     }
     Ok(())
 }
@@ -1175,17 +1271,25 @@ fn restart_app(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
 }
 
 fn restore_main_window(app: &AppHandle, emit_tutorial_complete: bool) {
-    #[cfg(target_os = "macos")]
-    let _ = app.set_activation_policy(ActivationPolicy::Regular);
+    // Patch 21 spawns `finish_overlay_session` (our caller) onto the async
+    // runtime, so by the time we get here we are NOT on the main thread.
+    // Wrap the AppKit interaction in `run_on_main_thread` so the
+    // activation-policy flip + show/focus sequence happen on a single
+    // main-loop iteration with no risk of partial reorder under load.
+    let app_clone = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        #[cfg(target_os = "macos")]
+        let _ = app_clone.set_activation_policy(ActivationPolicy::Regular);
 
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.show();
-        let _ = main.unminimize();
-        let _ = main.set_focus();
-        if emit_tutorial_complete {
-            let _ = main.emit("tutorial-capture-complete", ());
+        if let Some(main) = app_clone.get_webview_window("main") {
+            let _ = main.show();
+            let _ = main.unminimize();
+            let _ = main.set_focus();
+            if emit_tutorial_complete {
+                let _ = main.emit("tutorial-capture-complete", ());
+            }
         }
-    }
+    });
 }
 
 fn finish_overlay_session(app: &AppHandle) {
@@ -1214,6 +1318,12 @@ async fn show_settings_window(app: AppHandle) -> Result<(), String> {
         if overlay.is_visible().unwrap_or(false) {
             if let Some(state) = app.try_state::<AppState>() {
                 state.overlay_alive.store(false, Ordering::Relaxed);
+                // Same race fix as `close_overlay_now`: invalidate any
+                // in-flight capture so it doesn't re-show the overlay
+                // after Settings has taken focus.
+                state
+                    .capture_generation
+                    .fetch_add(1, Ordering::SeqCst);
                 cancel_active_ai(&state);
             }
             #[cfg(target_os = "macos")]
@@ -1554,53 +1664,6 @@ fn relay_overlay_wheel_on_main(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn set_overlay_capture_drag_region_on_main(
-    window: &tauri::WebviewWindow,
-    region: Option<OverlayInteractionRegion>,
-    enabled: bool,
-) {
-    let window_clone = window.clone();
-    if let Err(e) = window.run_on_main_thread(move || {
-        let raw = match window_clone.ns_window() {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!(
-                    "[screenie] set_overlay_capture_drag_region: ns_window err: {}",
-                    err
-                );
-                return;
-            }
-        };
-        let native = region.map(|r| NativeOverlayInteractionRegion {
-            x: r.x,
-            y: r.y,
-            w: r.w,
-            h: r.h,
-        });
-        let ptr = native
-            .as_ref()
-            .map(|r| r as *const NativeOverlayInteractionRegion)
-            .unwrap_or(std::ptr::null());
-        let ok = unsafe {
-            screenie_set_overlay_capture_drag_region(
-                raw.cast(),
-                ptr,
-                enabled,
-                handle_overlay_capture_drag,
-            )
-        };
-        if !ok && enabled {
-            eprintln!("[screenie] set_overlay_capture_drag_region: native helper failed");
-        }
-    }) {
-        eprintln!(
-            "[screenie] set_overlay_capture_drag_region: dispatch failed: {}",
-            e
-        );
-    }
-}
-
 /// Initial/manual capture path: show/order the overlay without focusing it.
 #[cfg(target_os = "macos")]
 fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
@@ -1664,6 +1727,10 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     windows_window::configure_overlay_window(window, app);
     let _ = window.show();
     windows_window::order_overlay_window(window);
+    // Continuous-capture loop is a tokio task and doesn't need to run on
+    // the message-pump thread, so kick it off here regardless of the
+    // main-thread dispatch result below.
+    windows_window::start_overlay_continuous_capture(app);
     if let Err(e) = app.run_on_main_thread(|| {
         let _ = windows_window::install_overlay_escape_monitor();
         // Background observer doesn't share the hook's message-loop
@@ -1686,17 +1753,44 @@ fn show_overlay_window(_app: &AppHandle, window: &tauri::WebviewWindow) {
     let _ = window.show();
 }
 
+/// Drop-on-exit guard that clears `AppState::capture_in_progress` on every
+/// path out of `trigger_capture_flow`, including panics. Without this, a
+/// panic anywhere inside `capture_and_show_overlay` (e.g. an Objective-C
+/// exception that escapes a native helper, or a tokio panic in the SCK
+/// blocking task) would leave the flag stuck true and silently kill every
+/// future hotkey press until the user restarted the app. We hold the
+/// AppHandle and re-fetch the managed state on drop so the guard owns no
+/// borrows tied to the function-scope `tauri::State` wrapper.
+struct CaptureInProgressGuard {
+    app: AppHandle,
+}
+
+impl Drop for CaptureInProgressGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.app.try_state::<AppState>() {
+            state.capture_in_progress.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Public entry point. Acquires a reentry guard so a fast double-trigger
 /// can't race two async tasks into building two overlay windows with the
 /// same label — that race was the source of "Rust cannot catch foreign
 /// exceptions" aborts when the second WebviewWindowBuilder hit Cocoa.
 async fn trigger_capture_flow(app: AppHandle) {
-    if let Some(state) = app.try_state::<AppState>() {
-        if state.capture_in_progress.swap(true, Ordering::SeqCst) {
-            eprintln!("[screenie] trigger_capture_flow: already in flight, skipping");
-            return;
+    // Acquire-and-arm: only build the guard once we win the
+    // compare-exchange. If another capture is already in flight, return
+    // without arming so we don't accidentally clear someone else's flag.
+    let _capture_guard = match app.try_state::<AppState>() {
+        Some(state) => {
+            if state.capture_in_progress.swap(true, Ordering::SeqCst) {
+                eprintln!("[screenie] trigger_capture_flow: already in flight, skipping");
+                return;
+            }
+            Some(CaptureInProgressGuard { app: app.clone() })
         }
-    }
+        None => None,
+    };
 
     // Snapshot whichever app is frontmost RIGHT NOW (before we hide our
     // settings window or build the overlay panel and steal any focus).
@@ -1714,14 +1808,25 @@ async fn trigger_capture_flow(app: AppHandle) {
     }
 
     capture_and_show_overlay(app.clone()).await;
-
-    if let Some(state) = app.try_state::<AppState>() {
-        state.capture_in_progress.store(false, Ordering::SeqCst);
-    }
+    // _capture_guard's Drop clears capture_in_progress here.
 }
 
 async fn capture_and_show_overlay(app: AppHandle) {
     eprintln!("[screenie] trigger_capture_flow: start");
+
+    // Snapshot the capture generation now and bail out at every await
+    // checkpoint if the value moves underneath us — that means the user
+    // pressed Esc (or opened Settings) while the capture was in flight,
+    // and we must not resurrect the overlay afterward.
+    let session_generation = app
+        .try_state::<AppState>()
+        .map(|s| s.capture_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1))
+        .unwrap_or(0);
+    let session_cancelled = |app: &AppHandle| -> bool {
+        app.try_state::<AppState>()
+            .map(|s| s.capture_generation.load(Ordering::SeqCst) != session_generation)
+            .unwrap_or(false)
+    };
 
     // A new capture invalidates whatever the user was looking at — cancel
     // the in-flight stream (if any) so it stops eating bandwidth + tokens.
@@ -1745,6 +1850,11 @@ async fn capture_and_show_overlay(app: AppHandle) {
         // Windows hides synchronously; no settle time needed.
         #[cfg(target_os = "macos")]
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        if session_cancelled(&app) {
+            eprintln!("[screenie] capture cancelled during tutorial-hide settle");
+            finish_overlay_session(&app);
+            return;
+        }
     } else if let Some(w) = app.get_webview_window("main") {
         if w.is_visible().unwrap_or(false) {
             if let Some(state) = app.try_state::<AppState>() {
@@ -1761,6 +1871,11 @@ async fn capture_and_show_overlay(app: AppHandle) {
             // Spaces concept and hide is synchronous, so we skip the wait.
             #[cfg(target_os = "macos")]
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            if session_cancelled(&app) {
+                eprintln!("[screenie] capture cancelled during settings-hide settle");
+                finish_overlay_session(&app);
+                return;
+            }
         }
     }
 
@@ -1775,11 +1890,16 @@ async fn capture_and_show_overlay(app: AppHandle) {
     // blur-triggered `show_overlay_after_refresh` from the frontend doesn't
     // race the new capture and reveal the overlay before the fresh shot is
     // ready. We set it back to true below once `pending` is staged.
+    // We deliberately do NOT clear `overlay_alive` here even though the
+    // overlay is briefly hidden during a re-capture — that flag is the
+    // JS-visible "is the overlay open" signal, and we want it to stay true
+    // across the hide+show cycle so `show_overlay_after_refresh` can still
+    // fire. The generation gate above handles the cancellation case (the
+    // close path bumps the generation; our own hide here does not).
     if let Some(overlay) = app.get_webview_window("overlay") {
         if overlay.is_visible().unwrap_or(false) {
             if let Some(state) = app.try_state::<AppState>() {
                 cancel_active_ai(&state);
-                state.overlay_alive.store(false, Ordering::Relaxed);
             }
             let _ = overlay.hide();
             // macOS needs a beat for AppKit to finish the hide before the
@@ -1791,6 +1911,11 @@ async fn capture_and_show_overlay(app: AppHandle) {
             // re-trigger.
             #[cfg(target_os = "macos")]
             tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+            if session_cancelled(&app) {
+                eprintln!("[screenie] capture cancelled during recapture-hide settle");
+                finish_overlay_session(&app);
+                return;
+            }
         }
     }
 
@@ -1837,6 +1962,15 @@ async fn capture_and_show_overlay(app: AppHandle) {
     if let Ok(cursor) = app.cursor_position() {
         cap.cursor_x = Some(((cursor.x - pos.x as f64) / scale).clamp(0.0, logical_w as f64));
         cap.cursor_y = Some(((cursor.y - pos.y as f64) / scale).clamp(0.0, logical_h as f64));
+    }
+
+    // Final cancellation gate before we commit `pending` and re-show the
+    // overlay. If the user dismissed the session while we were capturing,
+    // do nothing — the close path already cleared `overlay_alive`.
+    if session_cancelled(&app) {
+        eprintln!("[screenie] capture cancelled before stage+show; discarding shot");
+        finish_overlay_session(&app);
+        return;
     }
 
     // 3. Stash for the overlay frontend to fetch.
@@ -1900,7 +2034,21 @@ async fn capture_and_show_overlay(app: AppHandle) {
             ));
             let app_for_event = app.clone();
             w.on_window_event(move |event| match event {
-                WindowEvent::Destroyed => finish_overlay_session(&app_for_event),
+                WindowEvent::Destroyed => {
+                    // Window-event callbacks fire on the main loop on macOS,
+                    // but `finish_overlay_session` flips the activation
+                    // policy and re-shows the main settings window — non-
+                    // trivial AppKit work that we don't want running
+                    // synchronously inside the event-loop tick. Defer to the
+                    // async runtime so this callback returns immediately and
+                    // the queued AppKit messages are serviced on the next
+                    // loop iteration (`restore_main_window` below then re-
+                    // enters the main thread via `run_on_main_thread`).
+                    let app_for_task = app_for_event.clone();
+                    tauri::async_runtime::spawn(async move {
+                        finish_overlay_session(&app_for_task);
+                    });
+                }
                 _ => {}
             });
             show_overlay_window(&app, &w);
@@ -2019,8 +2167,10 @@ async fn repeat_last_capture(app: AppHandle) {
 
 /// Append a finished capture+chat to history. The frontend calls this once
 /// per turn (or once per capture session, depending on UX preference).
+/// Async + spawn_blocking so the PNG decode + thumb encode + sync I/O don't
+/// wedge the IPC dispatcher (one sync command at a time on a single thread).
 #[tauri::command]
-fn add_history_entry(
+async fn add_history_entry(
     app: AppHandle,
     window: WebviewWindow,
     png_b64: String,
@@ -2037,48 +2187,62 @@ fn add_history_entry(
         ));
     }
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
-    history::add_entry(
-        &dir,
-        history::AddArgs {
-            png_b64,
-            width,
-            height,
-            provider,
-            model,
-            prompt,
-            response,
-        },
-    )
+    tokio::task::spawn_blocking(move || {
+        history::add_entry(
+            &dir,
+            history::AddArgs {
+                png_b64,
+                width,
+                height,
+                provider,
+                model,
+                prompt,
+                response,
+            },
+        )
+    })
+    .await
+    .map_err(|e| HistoryError::Io(format!("add_history task join: {e}")))?
 }
 
 #[tauri::command]
-fn list_history(app: AppHandle) -> Result<Vec<HistoryEntry>, HistoryError> {
+async fn list_history(app: AppHandle) -> Result<Vec<HistoryEntry>, HistoryError> {
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
-    history::load_index(&dir)
+    tokio::task::spawn_blocking(move || history::load_index(&dir))
+        .await
+        .map_err(|e| HistoryError::Io(format!("list_history task join: {e}")))?
 }
 
 #[tauri::command]
-fn delete_history_entry(app: AppHandle, id: String) -> Result<(), HistoryError> {
+async fn delete_history_entry(app: AppHandle, id: String) -> Result<(), HistoryError> {
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
-    history::delete_entry(&dir, &id)
+    tokio::task::spawn_blocking(move || history::delete_entry(&dir, &id))
+        .await
+        .map_err(|e| HistoryError::Io(format!("delete_history task join: {e}")))?
 }
 
 #[tauri::command]
-fn clear_history(app: AppHandle) -> Result<(), HistoryError> {
+async fn clear_history(app: AppHandle) -> Result<(), HistoryError> {
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
-    history::clear_all(&dir)
+    tokio::task::spawn_blocking(move || history::clear_all(&dir))
+        .await
+        .map_err(|e| HistoryError::Io(format!("clear_history task join: {e}")))?
 }
 
 #[tauri::command]
-fn load_history_image(app: AppHandle, id: String) -> Result<String, HistoryError> {
+async fn load_history_image(app: AppHandle, id: String) -> Result<String, HistoryError> {
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
-    history::load_image_b64(&dir, &id)
+    tokio::task::spawn_blocking(move || history::load_image_b64(&dir, &id))
+        .await
+        .map_err(|e| HistoryError::Io(format!("load_history_image task join: {e}")))?
 }
 
 #[tauri::command]
-fn load_history_thumb(app: AppHandle, id: String) -> Result<String, HistoryError> {
+async fn load_history_thumb(app: AppHandle, id: String) -> Result<String, HistoryError> {
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
-    history::load_thumb_b64(&dir, &id)
+    tokio::task::spawn_blocking(move || history::load_thumb_b64(&dir, &id))
+        .await
+        .map_err(|e| HistoryError::Io(format!("load_history_thumb task join: {e}")))?
 }
 
 /// Run on-device OCR on the supplied PNG. Returns the recognized text or
@@ -2092,42 +2256,51 @@ fn load_history_thumb(app: AppHandle, id: String) -> Result<String, HistoryError
 /// In both cases the work is fully offline — no AI provider tokens, no
 /// network round-trip, no extra binary or model file to bundle.
 #[tauri::command]
-fn ocr_image_local(window: WebviewWindow, png_b64: String) -> Result<String, String> {
+async fn ocr_image_local(window: WebviewWindow, png_b64: String) -> Result<String, String> {
     if window.label() != "overlay" {
         return Err("command not allowed from this window".into());
     }
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let bytes = STANDARD
-        .decode(&png_b64)
-        .map_err(|e| format!("base64 decode: {e}"))?;
+    // Vision (macOS) and OcrEngine (Windows) both perform a full PNG decode
+    // followed by neural-net text recognition. On a Retina full-screen shot
+    // this runs ~200 ms - 2 s, which is long enough to wedge the IPC
+    // dispatcher and starve tray clicks, hotkey handlers, and other
+    // in-flight commands. Move to the dedicated blocking pool.
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let bytes = STANDARD
+            .decode(&png_b64)
+            .map_err(|e| format!("base64 decode: {e}"))?;
 
-    #[cfg(target_os = "macos")]
-    {
-        // Vision's request handler does not require the main thread; running
-        // in the Tauri command thread (separate from the UI thread) is fine.
-        let ptr = unsafe { screenie_ocr_png(bytes.as_ptr(), bytes.len()) };
-        if ptr.is_null() {
-            return Err(
-                "Vision OCR failed (image could not be decoded or recognition errored)".into(),
-            );
+        #[cfg(target_os = "macos")]
+        {
+            // Vision's request handler does not require the main thread.
+            let ptr = unsafe { screenie_ocr_png(bytes.as_ptr(), bytes.len()) };
+            if ptr.is_null() {
+                return Err(
+                    "Vision OCR failed (image could not be decoded or recognition errored)".into(),
+                );
+            }
+            // SAFETY: the C side guarantees a NUL-terminated UTF-8 string
+            // when the pointer is non-null. We copy into a Rust String, then
+            // free.
+            let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { screenie_free_string(ptr) };
+            Ok(s)
         }
-        // SAFETY: the C side guarantees a NUL-terminated UTF-8 string when
-        // the pointer is non-null. We copy into a Rust String, then free.
-        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { screenie_free_string(ptr) };
-        Ok(s)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        windows_ocr_png(&bytes)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = bytes;
-        Err("Local OCR isn't available on this platform yet.".into())
-    }
+        #[cfg(target_os = "windows")]
+        {
+            windows_ocr_png(&bytes)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = bytes;
+            Err("Local OCR isn't available on this platform yet.".into())
+        }
+    })
+    .await
+    .map_err(|e| format!("ocr task join: {e}"))?
 }
 
 /// Windows on-device OCR via WinRT. Loads the PNG into an
@@ -2208,7 +2381,7 @@ fn windows_ocr_png(bytes: &[u8]) -> Result<String, String> {
 /// suffixed filename, returning the absolute path so the frontend can
 /// surface a "Saved to …" toast.
 #[tauri::command]
-fn save_annotated_image(
+async fn save_annotated_image(
     app: AppHandle,
     window: WebviewWindow,
     png_b64: String,
@@ -2216,23 +2389,30 @@ fn save_annotated_image(
     if window.label() != "overlay" {
         return Err("command not allowed from this window".into());
     }
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let bytes = STANDARD
-        .decode(&png_b64)
-        .map_err(|e| format!("base64 decode: {e}"))?;
     let pictures = app
         .path()
         .picture_dir()
         .map_err(|e| format!("picture_dir: {e}"))?
         .join("Screenie");
-    std::fs::create_dir_all(&pictures).map_err(|e| format!("mkdir: {e}"))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = pictures.join(format!("Screenie-{}.png", now));
-    std::fs::write(&path, &bytes).map_err(|e| format!("write: {e}"))?;
-    Ok(path.to_string_lossy().into_owned())
+    // Base64 decode of a many-megabyte annotated PNG plus a sync filesystem
+    // write are both candidates for blocking the IPC dispatcher. Run on the
+    // blocking pool so other commands keep flowing.
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let bytes = STANDARD
+            .decode(&png_b64)
+            .map_err(|e| format!("base64 decode: {e}"))?;
+        std::fs::create_dir_all(&pictures).map_err(|e| format!("mkdir: {e}"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = pictures.join(format!("Screenie-{}.png", now));
+        std::fs::write(&path, &bytes).map_err(|e| format!("write: {e}"))?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| format!("save task join: {e}"))?
 }
 
 #[derive(serde::Serialize)]
@@ -2254,7 +2434,7 @@ impl From<&HotkeyConfig> for HotkeyConfigDto {
 
 #[tauri::command]
 fn get_hotkey_config(state: tauri::State<'_, AppState>) -> HotkeyConfigDto {
-    let cfg = state.hotkeys.lock().unwrap();
+    let cfg = lock_poison_safe(&state.hotkeys);
     HotkeyConfigDto::from(&*cfg)
 }
 
@@ -2291,7 +2471,7 @@ fn apply_hotkey_config(
 
     // Unregister the previous accelerators (read from state).
     let state = app.state::<AppState>();
-    let prev: HotkeyConfig = state.hotkeys.lock().unwrap().clone();
+    let prev: HotkeyConfig = lock_poison_safe(&state.hotkeys).clone();
     for s in [&prev.capture, &prev.repeat, &prev.settings] {
         if let Ok(sc) = Shortcut::from_str(s) {
             let _ = app.global_shortcut().unregister(sc);
@@ -2318,7 +2498,7 @@ fn apply_hotkey_config(
             settings,
         };
         {
-            let mut cfg = state.hotkeys.lock().unwrap();
+            let mut cfg = lock_poison_safe(&state.hotkeys);
             *cfg = saved.clone();
         }
         save_hotkey_config(app, &saved)?;
@@ -2377,9 +2557,13 @@ async fn open_chat_window(
     if window.label() != "overlay" {
         return Err("command not allowed from this window".into());
     }
+    // Mirror `ask_ai`'s payload validation. Without this, a buggy or
+    // malicious overlay could stash gigabytes in `AppState.chat_seed`
+    // until the chat window pulled them.
+    validate_chat_seed_payload(&png_b64, &messages_json)?;
     {
         let state = app.state::<AppState>();
-        let mut g = state.chat_seed.lock().unwrap();
+        let mut g = lock_poison_safe(&state.chat_seed);
         *g = Some(ChatSeed {
             png_b64,
             width,
@@ -2453,7 +2637,7 @@ fn take_chat_seed(
         return None;
     }
     let state = app.state::<AppState>();
-    let seed = state.chat_seed.lock().unwrap().take();
+    let seed = lock_poison_safe(&state.chat_seed).take();
     seed
 }
 
@@ -2508,7 +2692,6 @@ pub fn run() {
             set_overlay_mouse_capture,
             relay_overlay_pointer_click,
             relay_overlay_wheel,
-            set_overlay_capture_drag_region,
             cancel_ai,
             open_screen_settings,
             quit_app,
@@ -2559,7 +2742,7 @@ pub fn run() {
                     // state on every press is cheap (string compares) and
                     // keeps the handler in sync with `set_hotkey_config`.
                     let cfg = match app.try_state::<AppState>() {
-                        Some(s) => s.hotkeys.lock().unwrap().clone(),
+                        Some(s) => lock_poison_safe(&s.hotkeys).clone(),
                         None => return,
                     };
                     let cap = Shortcut::from_str(&cfg.capture).ok();
@@ -2654,11 +2837,11 @@ pub fn run() {
             {
                 let loaded = load_hotkey_config(handle);
                 let state = handle.state::<AppState>();
-                let mut cfg = state.hotkeys.lock().unwrap();
+                let mut cfg = lock_poison_safe(&state.hotkeys);
                 *cfg = loaded;
             }
             let state = handle.state::<AppState>();
-            let cfg: HotkeyConfig = state.hotkeys.lock().unwrap().clone();
+            let cfg: HotkeyConfig = lock_poison_safe(&state.hotkeys).clone();
             let mut hotkey_failures: Vec<String> = Vec::new();
             for (acc, label) in [
                 (&cfg.capture, "capture"),

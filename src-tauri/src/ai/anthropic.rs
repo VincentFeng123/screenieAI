@@ -19,6 +19,7 @@ where
     // 1024px long edge keeps quality fine for screenshot-style content
     // and cuts cost roughly 3–4×.
     let image_b64 = crate::capture::downscale_for_cloud(&req.image_b64, 1024)
+        .await
         .unwrap_or_else(|_| req.image_b64.clone());
     let messages = build_messages(&req.messages, &image_b64);
     let system = super::response_format_instructions(&req.response_profile);
@@ -54,7 +55,7 @@ where
         let text = resp.text().await.unwrap_or_default();
         return Err(AiError::Api {
             status: status.as_u16(),
-            body: text,
+            body: super::sanitize_provider_error(&text, "anthropic"),
         });
     }
 
@@ -76,6 +77,23 @@ where
         while let Some(event) = super::drain_sse_event(&mut buf)? {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
+            }
+            // Anthropic streams emit `event: error\ndata: {...}` when something
+            // breaks mid-stream (overload, rate-limit, content moderation).
+            // Without this branch the stream just stops with no explanation.
+            // Surface it as a 200-status `Api` error so the existing toast
+            // path renders it.
+            if sse_event_field(&event).as_deref() == Some("error") {
+                if let Some(data) = super::sse_data(&event) {
+                    return Err(AiError::Api {
+                        status: 200,
+                        body: super::sanitize_provider_error(&data, "anthropic"),
+                    });
+                }
+                return Err(AiError::Api {
+                    status: 200,
+                    body: "anthropic stream error".to_string(),
+                });
             }
             if let Some(data) = super::sse_data(&event) {
                 if let Some(text) = extract_text_delta(&data) {
@@ -103,6 +121,19 @@ where
                         {
                             output_tokens = t;
                         }
+                    } else if kind == "error" {
+                        // Some Anthropic responses put the error inside a
+                        // `data:` block typed as `error` rather than via the
+                        // SSE `event:` field. Handle both shapes.
+                        let msg = v
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or(&data);
+                        return Err(AiError::Api {
+                            status: 200,
+                            body: super::sanitize_provider_error(msg, "anthropic"),
+                        });
                     }
                 }
             }
@@ -173,6 +204,18 @@ fn build_messages(history: &[UiMessage], image_b64: &str) -> Vec<Value> {
         }));
     }
     out
+}
+
+/// Return the value of the `event:` field of an SSE block, if present.
+/// Anthropic uses this to flag error events; OpenAI / Gemini do not.
+fn sse_event_field(event: &str) -> Option<String> {
+    let normalized = event.replace("\r\n", "\n").replace('\r', "\n");
+    for line in normalized.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
 }
 
 fn extract_text_delta(data: &str) -> Option<String> {

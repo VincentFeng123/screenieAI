@@ -182,7 +182,7 @@ export default function ApiKeys({
 
         <div className="onboarding-field">
           <label className="onboarding-label">
-            <span>OpenAI · GPT-5.5</span>
+            <span>OpenAI · GPT</span>
           </label>
           <div className="onboarding-input-row">
             <input

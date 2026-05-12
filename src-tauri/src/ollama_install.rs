@@ -19,7 +19,6 @@ const DOWNLOAD_URL: &str = "https://ollama.com/download/Ollama-darwin.zip";
 #[cfg(target_os = "windows")]
 const WINDOWS_DOWNLOAD_URL: &str = "https://ollama.com/download/OllamaSetup.exe";
 const OLLAMA_PULL_URL: &str = "http://localhost:11434/api/pull";
-const ALLOWED_PULL_MODELS: &[&str] = &["llama3.2-vision"];
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -592,7 +591,7 @@ pub async fn pull_model(
     model: String,
     on_progress: Channel<PullStatus>,
 ) -> Result<(), InstallError> {
-    if !ALLOWED_PULL_MODELS.contains(&model.as_str()) {
+    if !crate::ALLOWED_OLLAMA_PULL_MODELS.contains(&model.as_str()) {
         return Err(InstallError::Other("model pull is not allowed".into()));
     }
     let _ = on_progress.send(PullStatus::Connecting);

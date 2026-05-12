@@ -1186,6 +1186,14 @@ function CloudProviderCard({
           ariaLabel={`${title} model`}
         />
       </PreferenceRow>
+      {modelValue &&
+        !modelOptions.some((o) => o.value === modelValue) &&
+        !looksLikeVisionModel(modelValue) && (
+          <p className="settings-note" style={{ color: "var(--error-text)" }}>
+            Heads up: <code>{modelValue}</code> isn't in the curated list and
+            doesn't look vision-capable. Capture will fail if it's text-only.
+          </p>
+        )}
     </SettingsCard>
   );
 }

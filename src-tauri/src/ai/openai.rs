@@ -33,6 +33,7 @@ where
     // Cap the long edge at 1024px before sending — see anthropic.rs for the
     // token-cost rationale.
     let image_b64 = crate::capture::downscale_for_cloud(&req.image_b64, 1024)
+        .await
         .unwrap_or_else(|_| req.image_b64.clone());
     let reasoning = is_reasoning_model(&req.model);
     let system = super::response_format_instructions(&req.response_profile);
@@ -88,7 +89,7 @@ where
         let text = resp.text().await.unwrap_or_default();
         return Err(AiError::Api {
             status: status.as_u16(),
-            body: text,
+            body: super::sanitize_provider_error(&text, "openai"),
         });
     }
 
@@ -119,6 +120,20 @@ where
                     return Ok(());
                 }
                 if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                    // OpenAI emits `data: {"error": {...}}` mid-stream when a
+                    // request that started fine later fails (rate limit,
+                    // model overload, content filter). Surface it instead of
+                    // letting the stream silently end.
+                    if let Some(err) = v.get("error") {
+                        let msg = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or(&data);
+                        return Err(AiError::Api {
+                            status: 200,
+                            body: super::sanitize_provider_error(msg, "openai"),
+                        });
+                    }
                     if let Some(usage) = v.get("usage") {
                         if let Some(t) = usage.get("prompt_tokens").and_then(|n| n.as_u64()) {
                             input_tokens = t;

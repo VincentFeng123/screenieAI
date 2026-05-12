@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Empty entitlements = minimum-privilege hardened runtime.
+
+    Apple notarization requires hardened runtime (`codesign --options runtime`).
+    Tauri's macOS bundler invokes codesign with this file when
+    `bundle.macOS.entitlements` is set, so an empty <dict/> opts the app into
+    hardened runtime + library validation + DYLD-env-var protection without
+    granting any additional capabilities.
+
+    DO NOT add `com.apple.security.app-sandbox` here — it would break
+    ScreenCaptureKit (the Screen Recording TCC prompt requires unsandboxed
+    access to the system-wide capture API used in capture/macos.rs and
+    macos_window.m) and would also break history writes outside the sandbox
+    container.
+
+    DO NOT add `com.apple.security.cs.allow-jit` or
+    `com.apple.security.cs.allow-unsigned-executable-memory` — Tauri 2 uses
+    WKWebView (JIT lives in Apple's already-entitled WebContent helper); the
+    main process is native code with no JIT.
+
+    DO NOT add `com.apple.security.cs.disable-library-validation` — Cargo.toml
+    links only system frameworks; no third-party dylibs are loaded.
+
+    Add entitlements here only with concrete justification.
+  -->
+</dict>
+</plist>
