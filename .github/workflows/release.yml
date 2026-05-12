@@ -77,9 +77,15 @@ jobs:
       - name: Ensure Rust cross-compile targets are installed
         if: matrix.rust-targets != ''
         shell: bash
+        env:
+          RUST_TARGETS: ${{ matrix.rust-targets }}
         run: |
-          for t in ${{ matrix.rust-targets }}; do
-            rustup target add "${t//,/}"
+          # Comma-separated → space-separated so `for` actually iterates.
+          # (The literal `for t in foo,bar; do` treats the whole comma-
+          # separated string as a single token — silently no-ops the
+          # second target.)
+          for t in ${RUST_TARGETS//,/ }; do
+            rustup target add "$t"
           done
 
       - name: Cache Rust build artifacts
