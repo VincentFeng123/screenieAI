@@ -77,13 +77,20 @@ jobs:
       - name: Ensure Rust cross-compile targets are installed
         if: matrix.rust-targets != ''
         shell: bash
+        # Run from src-tauri/ so rustup honors the pinned channel in
+        # `src-tauri/rust-toolchain.toml` (currently 1.93.1). Without
+        # this, `rustup target add` would attach the targets to
+        # `stable` while tauri-action later compiles with 1.93.1 — the
+        # x86_64 half of the universal binary would then "vanish"
+        # mid-build because it was installed on a different toolchain.
+        working-directory: src-tauri
         env:
           RUST_TARGETS: ${{ matrix.rust-targets }}
         run: |
-          # Comma-separated → space-separated so `for` actually iterates.
-          # (The literal `for t in foo,bar; do` treats the whole comma-
-          # separated string as a single token — silently no-ops the
-          # second target.)
+          # rustup show first forces the pinned toolchain to install
+          # before we try to add targets onto it (otherwise the target
+          # add fails on toolchains that aren't downloaded yet).
+          rustup show active-toolchain || rustup show
           for t in ${RUST_TARGETS//,/ }; do
             rustup target add "$t"
           done
