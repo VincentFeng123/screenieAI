@@ -208,7 +208,15 @@ static void screenie_enable_first_mouse_for_view(NSView *view) {
   Class cls = object_getClass(view);
   if (cls != Nil) {
     if (screenieFirstMousePatchedClasses == nil) {
-      screenieFirstMousePatchedClasses = [NSMutableSet set];
+      // `[NSMutableSet set]` returns an autoreleased instance — when the
+      // pool drains, the set is freed and this static becomes a dangling
+      // pointer. macOS's CFPreferences subsystem then reuses the memory
+      // for a `__CFPrefsWeakObservers`, and the next `containsObject:`
+      // throws `NSInvalidArgumentException -[__CFPrefsWeakObservers
+      // containsObject:]: unrecognized selector`. This file is compiled
+      // without ARC (build.rs uses cc with -fblocks + -fobjc-exceptions
+      // but no -fobjc-arc), so we need an explicit +1 retained instance.
+      screenieFirstMousePatchedClasses = [[NSMutableSet alloc] init];
     }
     const char *className = class_getName(cls);
     NSString *key = className != NULL
@@ -1020,6 +1028,15 @@ static bool screenie_relay_overlay_scroll(double deltaX,
   if (screenieOverlayWindow == nil || ![screenieOverlayWindow isVisible]) {
     return false;
   }
+  // P-C-R10: scroll relay uses CGEventPost, which is gated by Accessibility
+  // (kAXTrustedCheckOptionPrompt). On a Mac without that grant,
+  // screenie_post_scroll returns false and the underlying app gets nothing.
+  // If we flip ignoresMouseEvents:YES before checking, every wheel tick
+  // flickers the overlay through the click-relay state with no actual
+  // scroll being delivered. Preflight; bail before mutating state.
+  if (!screenie_can_post_mouse_events()) {
+    return false;
+  }
 
   uint64_t generation = ++screenieOverlayClickRelayGeneration;
   screenieOverlayClickRelayActive = true;
@@ -1703,6 +1720,14 @@ static bool screenie_handle_overlay_escape_event(NSEvent *event,
   return screenieOverlayEscapeCallback();
 }
 
+// P-C-B3: defined in lib.rs as `#[no_mangle] pub extern "C"`. True while
+// `refresh_overlay_capture` is mid-flight — the overlay is intentionally
+// hidden for ~300-500 ms but the user's intent is still "this Esc closes
+// the overlay", so the tap must keep consuming it. Without this gate, an
+// Esc landing in the hide window leaks to the app underneath (fullscreen
+// Safari unfullscreens, slide presentations exit).
+extern bool screenie_is_overlay_refresh_in_flight(void);
+
 static CGEventRef screenie_overlay_escape_event_tap(CGEventTapProxy proxy,
                                                     CGEventType type,
                                                     CGEventRef event,
@@ -1718,9 +1743,18 @@ static CGEventRef screenie_overlay_escape_event_tap(CGEventTapProxy proxy,
     return event;
   }
 
+  // The window-visibility gate was the original short-circuit so the tap
+  // wouldn't consume Esc after the overlay had been dismissed. But
+  // `refresh_overlay_capture` hides the overlay for the duration of the
+  // recapture — during that window the visibility gate fires falsely and
+  // lets Esc through to the underlying app. Allow the tap to proceed
+  // whenever the overlay is visible OR a refresh is mid-flight.
+  bool overlay_active =
+      screenieOverlayWindow != nil &&
+      ([screenieOverlayWindow isVisible] ||
+       screenie_is_overlay_refresh_in_flight());
   if (type != kCGEventKeyDown ||
-      screenieOverlayWindow == nil ||
-      ![screenieOverlayWindow isVisible] ||
+      !overlay_active ||
       screenieOverlayEscapeCallback == NULL) {
     return event;
   }
@@ -2403,7 +2437,10 @@ bool screenie_set_overlay_vibrancy_regions(
       // (titlebar, contentBackground, underWindowBackground) are
       // window-content fills, NOT vibrancy backers — they render as
       // opaque solid panels here. `sidebar` is the working baseline.
-      v.material = NSVisualEffectMaterialSidebar;
+      // HUDWindow = the heaviest practical vibrancy material on macOS.
+      // Matches the ChatGPT / Linear / Notion floating-panel look — colors
+      // bleed through but content is gaussian-blurred to soft blobs.
+      v.material = NSVisualEffectMaterialHUDWindow;
       // `behindWindow` blurs what is BEHIND the window in the OS
       // compositor (the desktop + other apps' windows).
       v.blendingMode = NSVisualEffectBlendingModeBehindWindow;

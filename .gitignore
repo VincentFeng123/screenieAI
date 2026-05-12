@@ -27,3 +27,14 @@ src-tauri/gen/schemas
 
 # Per-user Claude Code state (scheduled tasks, etc.) — not project-shared.
 .claude/
+
+# P-F: build artifacts that should never land in the repo. The release
+# workflow produces these in the runner; they go straight to the GitHub
+# Release. If someone copies one into a checkout (e.g. testing the resign
+# script against an installed app), don't track it.
+*.dmg
+*.msi
+*.exe
+*.app/
+*.AppImage
+*.deb

@@ -29,4 +29,23 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+
+  // P-E: split the chunky markdown/math/highlight chunks out of the main
+  // entry. Each chunk is independently parsed and cached by the WebView, so
+  // a single 1 MB monolith becomes several smaller parses on first paint
+  // (and the Settings window's React/Tauri code path no longer waits on a
+  // ~280 KB KaTeX parse it never uses). Still ships every chunk on first
+  // load — full lazy loading is a follow-up that requires `React.lazy`
+  // around the markdown component.
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          katex: ["katex", "rehype-katex", "remark-math"],
+          highlight: ["highlight.js", "rehype-highlight"],
+          markdown: ["react-markdown", "remark-gfm"],
+        },
+      },
+    },
+  },
 }));

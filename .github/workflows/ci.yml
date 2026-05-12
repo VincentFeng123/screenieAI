@@ -1,0 +1,55 @@
+# P-F: per-PR smoke. `npm ci` catches lockfile drift, `npm run build`
+# catches TypeScript regressions, `cargo check` catches Rust regressions.
+# Doesn't run the full bundler — that lives in release.yml and only fires
+# on tagged commits.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel an older in-progress run on the same ref when a new commit lands —
+# saves runner minutes when someone force-pushes / rebases a PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & typecheck (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust toolchain
+        # rust-toolchain.toml at src-tauri/ pins the exact channel.
+        # `dtolnay/rust-toolchain@stable` honors that file.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend (tsc + vite)
+        run: npm run build
+
+      - name: Cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml

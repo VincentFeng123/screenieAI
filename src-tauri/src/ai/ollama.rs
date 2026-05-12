@@ -1,5 +1,4 @@
 use super::{AiError, AskEvent, AskRequest, CancelFlag, UiMessage};
-use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
@@ -86,7 +85,11 @@ where
     // emoji that splits codepoints across chunks. See anthropic.rs.
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
+    // P-E-R8: cancel-aware chunk wait drops idle Ollama streams on overlay
+    // close within ~50 ms instead of waiting up to the 180 s local-read
+    // timeout. Especially important for local models that can pause
+    // mid-generation while warming up GPU memory.
+    while let Some(chunk) = super::cancel_aware_next(&mut stream, &cancel).await {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }

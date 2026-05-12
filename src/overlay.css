@@ -46,7 +46,7 @@ textarea,
 .screenie-toolbar,
 .screenie-hint {
   position: relative;
-  background: rgba(220, 222, 220, 0.20);
+  background: rgba(220, 222, 220, 0.04);
   border: none;
   outline: none;
   box-shadow: none;
@@ -145,6 +145,11 @@ textarea,
    The X glyph is intentionally small inside the pill (the click target
    stays 22px, but the glyph reads as a delicate hint, not a heavy mark).
    Hover only nudges the background a touch darker so it doesn't flash. */
+/* P-D-B9: the chat-panel inline close button. Hit target stays 16×16
+   so it doesn't crowd the titlebar; the X glyph is bumped to size-10
+   stroke-2 (rendered in Chat.tsx + Overlay.tsx) so it's actually
+   readable. Settings has its own 24×24/size-12 button at
+   `.settings-close-btn` since it's the only chrome on that surface. */
 .screenie-close-btn {
   width: 16px;
   height: 16px;
@@ -238,7 +243,7 @@ textarea,
   color: rgba(255, 255, 255, 0.95);
   /* Native NSVisualEffectView is mounted behind this pill; the bg here
      is just a tint over the live vibrancy. */
-  background: rgba(220, 222, 220, 0.20);
+  background: rgba(220, 222, 220, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.14);
   cursor: pointer;
   isolation: isolate;

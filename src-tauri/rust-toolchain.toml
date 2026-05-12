@@ -1,0 +1,7 @@
+# P-F: pin the Rust toolchain so two successive releases don't ship with
+# subtly different rustc versions. `dtolnay/rust-toolchain` and `rustup`
+# both honor this file — CI installs exactly this channel even though the
+# step is written as `@stable`. Bump deliberately when upgrading.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]

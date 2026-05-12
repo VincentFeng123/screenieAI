@@ -1,5 +1,4 @@
 use super::{AiError, AskEvent, AskRequest, CancelFlag, UiMessage};
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 
@@ -68,7 +67,9 @@ where
     let mut buf: Vec<u8> = Vec::new();
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
-    while let Some(chunk) = stream.next().await {
+    // P-E-R8: see openai.rs — cancel-aware chunk wait drops idle streams
+    // on overlay close within ~50 ms instead of after the 90 s read timeout.
+    while let Some(chunk) = super::cancel_aware_next(&mut stream, &cancel).await {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }

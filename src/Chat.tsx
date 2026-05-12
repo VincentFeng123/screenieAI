@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -146,7 +146,11 @@ export default function Chat() {
         // command. The sessionStorage fallback below still lets a reload
         // recover the last detached chat.
       }
-      const s = fresh ?? stored?.seed ?? null;
+      // P-A-R2: on a reseed (chat-seed-changed event), only the freshly-
+      // taken Rust seed is trustworthy — the sessionStorage copy is the
+      // previous chat's data. Falling back to stored there would silently
+      // show the user a stale image with a new conversation thread.
+      const s = isReseed ? fresh : (fresh ?? stored?.seed ?? null);
       if (cancelled || !s) return;
       runSeqRef.current += 1;
       setSeed(s);
@@ -192,7 +196,12 @@ export default function Chat() {
       setLoadStalled(false);
       return;
     }
-    const t = window.setTimeout(() => setLoadStalled(true), 2500);
+    // P-D: chat window is reused — `take_chat_seed` resolves nearly
+    // instantly under normal use. The prior 2500 ms gate read as "stuck"
+    // when the user reopened the window via Mission Control without a
+    // fresh pin. 800 ms still hides the placeholder for the IPC happy
+    // path while surfacing the "No chat data" recovery state quickly.
+    const t = window.setTimeout(() => setLoadStalled(true), 800);
     return () => window.clearTimeout(t);
   }, [seed]);
 
@@ -210,6 +219,13 @@ export default function Chat() {
   // P4-C-scroll: only auto-scroll when the user is already pinned to the
   // bottom. If they scrolled up to read prior context, leave them alone
   // until they return to within ~24px of the bottom.
+  //
+  // P-A-B2: the `seed` dep is load-bearing. On first paint `seed` is null
+  // and the JSX renders the "Loading chat…" placeholder — scrollRef.current
+  // is null and the effect bails. Once the seed hydrates and the chat
+  // container mounts, the effect must re-run to actually attach the
+  // listener; otherwise stickToBottomRef stays true forever and the user
+  // can never scroll up mid-stream.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -219,7 +235,7 @@ export default function Chat() {
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
-  }, []);
+  }, [seed]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -513,10 +529,11 @@ export default function Chat() {
             data-tauri-drag-region="false"
             onClick={closeWindow}
             aria-label="Close chat window"
+            title="Close chat window"
             onMouseDown={(e) => e.stopPropagation()}
             style={{ transform: "translate(0, 0)" }}
           >
-            <X size={8} strokeWidth={2.5} aria-hidden />
+            <X size={10} strokeWidth={2} aria-hidden />
           </button>
           <div style={{ display: "flex", gap: 4 }} data-tauri-drag-region="false">
             <button
@@ -525,6 +542,7 @@ export default function Chat() {
               data-tauri-drag-region="false"
               onClick={() => setChatView((v) => (v === "history" ? "chat" : "history"))}
               aria-label={chatView === "history" ? "Back to chat" : "Open history"}
+              title={chatView === "history" ? "Back to chat" : "Open history"}
               data-active={chatView === "history"}
               onMouseDown={(e) => e.stopPropagation()}
             >
@@ -536,6 +554,7 @@ export default function Chat() {
               data-tauri-drag-region="false"
               onClick={copyConversation}
               aria-label="Copy conversation"
+              title="Copy conversation"
               onMouseDown={(e) => e.stopPropagation()}
             >
               <Copy size={13} strokeWidth={1.85} aria-hidden />
@@ -546,6 +565,7 @@ export default function Chat() {
               data-tauri-drag-region="false"
               onClick={newChat}
               aria-label="Start new chat"
+              title="Start new chat"
               onMouseDown={(e) => e.stopPropagation()}
             >
               <MessageSquarePlus size={13} strokeWidth={1.85} aria-hidden />
@@ -846,7 +866,15 @@ function ImageLightbox({ b64, onClose }: { b64: string; onClose: () => void }) {
   );
 }
 
-function ChatBubble({
+// P-E: `ChatBubble` is rendered for every message in the conversation. When
+// the latest assistant message is streaming, React used to re-render EVERY
+// bubble in the list per chunk (often 200+ Hz on a fast network), since the
+// `messages` prop array identity changed when the streaming buffer was
+// appended. The custom comparator skips re-render for any bubble whose
+// content + usage + role + streaming flag haven't changed. The active
+// streaming bubble still re-renders correctly because its `message.content`
+// changes each chunk; older bubbles are stable.
+function ChatBubbleImpl({
   message,
   streaming,
   isLastAssistant,
@@ -860,6 +888,12 @@ function ChatBubble({
   const [copied, setCopied] = useState(false);
   const isAssistant = message.role === "assistant";
   const formatted = isAssistant ? formatAiMarkdown(message.content) : message.content;
+  // P-E: deprioritize the markdown render during streaming. Same rationale
+  // as Overlay.tsx — the ReactMarkdown + remark + rehype-katex + rehype-
+  // highlight chain re-parses the entire accumulated stream on every chunk
+  // (often 200+ Hz), and useDeferredValue lets React schedule that work at
+  // low priority so the UI stays responsive.
+  const deferredFormatted = useDeferredValue(formatted);
 
   if (!isAssistant) {
     // User bubble — round white pill, right-aligned, like the screenshot.
@@ -900,7 +934,7 @@ function ChatBubble({
             remarkPlugins={[remarkGfm, remarkMath]}
             rehypePlugins={[[rehypeKatex, SCREENIE_KATEX_OPTIONS], rehypeHighlight]}
           >
-            {formatted}
+            {deferredFormatted}
           </ReactMarkdown>
         ) : (
           streaming && (
@@ -957,3 +991,17 @@ function ChatBubble({
     </div>
   );
 }
+
+const ChatBubble = memo(ChatBubbleImpl, (prev, next) => {
+  // Stable when role + content + streaming flag + isLastAssistant + usage
+  // + onRegenerate identity all match. Streaming bubble re-renders correctly
+  // because its `message.content` mutates each chunk.
+  return (
+    prev.message.role === next.message.role &&
+    prev.message.content === next.message.content &&
+    prev.message.usage === next.message.usage &&
+    prev.streaming === next.streaming &&
+    prev.isLastAssistant === next.isLastAssistant &&
+    prev.onRegenerate === next.onRegenerate
+  );
+});

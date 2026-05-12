@@ -26,6 +26,14 @@
   <string>Screenie AI</string>
   <key>NSScreenCaptureUsageDescription</key>
   <string>Screenie AI captures the screen region you select and sends it to your chosen vision AI to answer your question.</string>
+  <!--
+    Accessibility is requested by macos_window.m's AXIsProcessTrustedWithOptions
+    call. The Esc-suppression CGEventTap and the previously-frontmost-app
+    keystroke forwarding both depend on it. Without a usage string macOS shows
+    a generic prompt and Apple's notarization review may flag the bundle.
+  -->
+  <key>NSAccessibilityUsageDescription</key>
+  <string>Screenie AI uses Accessibility to capture Esc while the result overlay is visible (so it dismisses the overlay instead of, e.g., exiting fullscreen in the app behind it) and to return focus to the app you were using before the capture.</string>
   <key>LSUIElement</key>
   <true/>
 </dict>

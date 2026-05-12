@@ -28,7 +28,14 @@ export default function Tutorial({
     typeof navigator !== "undefined" && navigator.userAgent.includes("Mac");
 
   useEffect(() => {
-    void invoke("set_tutorial_mode", { active: true });
+    // P-A-B11: `void invoke(...)` only discards the resolved value, not the
+    // rejection. set_tutorial_mode is load-bearing for the capture flow
+    // (Rust hides this window so the screenshot isn't of the tutorial UI
+    // itself) — chain `.catch` everywhere so a transient IPC failure surfaces
+    // in console.error instead of as an unhandled rejection.
+    invoke("set_tutorial_mode", { active: true }).catch((e) =>
+      console.error("set_tutorial_mode(true) failed:", e),
+    );
     invoke<string | null>("get_hotkey_registration_error")
       .then((msg) => {
         if (msg) setHotkeyError(msg);
@@ -43,11 +50,17 @@ export default function Tutorial({
       // session. Re-arm it so a second hotkey press (before the user clicks
       // Done) still hides this onboarding window for the screenshot. Without
       // this, a retry would capture the onboarding window itself.
-      void invoke("set_tutorial_mode", { active: true });
+      invoke("set_tutorial_mode", { active: true }).catch((e) =>
+        console.error("set_tutorial_mode(true) re-arm failed:", e),
+      );
     });
     return () => {
-      void invoke("set_tutorial_mode", { active: false });
-      unlistenP.then((fn) => fn());
+      invoke("set_tutorial_mode", { active: false }).catch((e) =>
+        console.error("set_tutorial_mode(false) cleanup failed:", e),
+      );
+      // P-A-B10: chain `.catch` on the listen cleanup so a rejected promise
+      // doesn't bubble as an unhandled rejection on HMR / IPC teardown.
+      unlistenP.then((fn) => fn()).catch(() => {});
     };
   }, []);
 
@@ -55,7 +68,9 @@ export default function Tutorial({
   const confirming = phase === "confirm";
 
   const handleBack = () => {
-    void invoke("set_tutorial_mode", { active: false });
+    invoke("set_tutorial_mode", { active: false }).catch((e) =>
+      console.error("set_tutorial_mode(false) on back failed:", e),
+    );
     onBack();
   };
 
@@ -163,7 +178,9 @@ export default function Tutorial({
                 // The user opted out of demoing the hotkey — disable
                 // tutorial mode immediately so a stray hotkey press doesn't
                 // continue to hide this window.
-                void invoke("set_tutorial_mode", { active: false });
+                invoke("set_tutorial_mode", { active: false }).catch((e) =>
+                  console.error("set_tutorial_mode(false) on skip failed:", e),
+                );
                 setPhase("done");
               }}
             >

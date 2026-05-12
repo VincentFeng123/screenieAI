@@ -137,11 +137,13 @@
 }
 
 /* === Close affordance — top-right of the entire app =============== */
-/* Pinned to viewport via `position: fixed` so it sits above both the
-   sidebar and main content. The 24x24 hit target is generous, the X
-   glyph is slightly larger than the chat panel's inline close (size 11
-   vs 8) since this button is the only chrome on the panel and needs to
-   read clearly without crowding. */
+/* P-D-B9: 24x24 hit target with a size-12 X glyph. This is the only
+   chrome on the panel — Apple HIG / WCAG 2.5.5 expect ≥24px hit; the
+   shrunken 16×16 + size-8 prior values were under that and the glyph
+   read as a near-invisible gray dot. The chat panel's inline close
+   (Chat.tsx / overlay.css `.screenie-close-btn`) is a separate, smaller
+   button that lives inside a busier titlebar and stays at 16×16 with
+   a slightly bumped size-10 glyph for consistency. */
 .settings-close-btn {
   position: fixed;
   top: 14px;

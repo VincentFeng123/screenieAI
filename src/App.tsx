@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import SettingsPanel from "./settings/SettingsPanel";
 import Onboarding from "./onboarding/Onboarding";
 import { applyStoredPreferences } from "./settings/preferences";
@@ -27,6 +28,20 @@ export default function App() {
         .catch((e) => console.error("show_settings_window failed:", e))
         .finally(() => setView("onboarding"));
     }
+  }, []);
+
+  // P-A-B13: surface capture-failure events so they don't silently disappear.
+  // Rust emits `capture-error` when monitor pickup, screencapture, or overlay
+  // window creation fails. Today we log to console (always-mounted main
+  // window receives the event even while hidden); a richer toast UX can come
+  // in Phase D.
+  useEffect(() => {
+    const unlistenP = listen<string>("capture-error", (event) => {
+      console.error("[screenie] capture-error:", event.payload);
+    });
+    return () => {
+      unlistenP.then((fn) => fn()).catch(() => {});
+    };
   }, []);
 
   if (view === "loading") return null;

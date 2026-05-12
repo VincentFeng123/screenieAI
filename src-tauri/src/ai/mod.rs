@@ -25,6 +25,33 @@ pub mod gemini;
 pub mod ollama;
 pub mod openai;
 
+/// P-E-R8: cancel-aware wrapper around `stream.next().await`. Polls the
+/// cancel flag every 50 ms while waiting for the next chunk. Without this,
+/// an idle provider stream blocks for up to `read_timeout` (90 s cloud,
+/// 180 s local) after the user closes the overlay — wasting tokens, time,
+/// and an HTTP connection. Returns `None` if cancelled OR if the stream
+/// ended naturally.
+pub(crate) async fn cancel_aware_next<S>(
+    stream: &mut S,
+    cancel: &CancelFlag,
+) -> Option<<S as futures_util::Stream>::Item>
+where
+    S: futures_util::Stream + Unpin,
+{
+    use futures_util::StreamExt;
+    use std::sync::atomic::Ordering;
+    loop {
+        tokio::select! {
+            chunk = stream.next() => return chunk,
+            () = tokio::time::sleep(Duration::from_millis(50)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// Shared cancellation flag passed into each provider's stream function.
 /// `lib.rs` replaces this on every new `ask_ai` (cancelling any predecessor)
 /// and trips it on `close_overlay`. Stream loops poll it between chunks.
@@ -171,6 +198,11 @@ pub(crate) fn cloud_client() -> Result<reqwest::Client, AiError> {
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(300))
+        // P-B-R1: cloud provider POST endpoints don't legitimately 30x. A
+        // hijacked DNS / proxy that returned `302 -> http://attacker/…` would
+        // otherwise prompt reqwest to retry with the Authorization header
+        // attached. Refuse all redirects so any 30x surfaces as an error.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(AiError::from)
 }
@@ -290,7 +322,18 @@ fn extract_provider_message(body: &str, provider: &str) -> Option<String> {
 }
 
 fn scrub_api_keys(s: &str) -> String {
-    redact_prefix(&redact_prefix(s, "sk-", 20), "AIza", 30)
+    // P-B-R1: defense-in-depth. The `sk-` rule already catches Anthropic
+    // `sk-ant-…` by accident (the longer key is consumed as the tail of the
+    // shorter prefix). The explicit `sk-ant-` and `ant-api03-` rules cover
+    // the trimmed cases an error message might surface. The `Bearer ` rule
+    // catches any future provider whose error JSON echoes the request
+    // Authorization header verbatim, regardless of key shape — JWT-style
+    // tokens, opaque tokens, etc.
+    let s = redact_prefix(s, "sk-ant-", 20);
+    let s = redact_prefix(&s, "ant-api03-", 16);
+    let s = redact_prefix(&s, "sk-", 20);
+    let s = redact_prefix(&s, "AIza", 30);
+    redact_prefix(&s, "Bearer ", 20)
 }
 
 fn redact_prefix(s: &str, prefix: &str, min_tail_len: usize) -> String {
@@ -364,4 +407,236 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
     let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{truncated}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- drain_sse_event ----------
+
+    #[test]
+    fn drain_sse_event_splits_on_lf_lf() {
+        let mut buf: Vec<u8> = b"data: hello\n\nleftover".to_vec();
+        let event = drain_sse_event(&mut buf).unwrap().unwrap();
+        assert_eq!(event, "data: hello");
+        assert_eq!(buf, b"leftover");
+    }
+
+    #[test]
+    fn drain_sse_event_splits_on_crlf_crlf() {
+        let mut buf: Vec<u8> = b"data: hi\r\n\r\nrest".to_vec();
+        let event = drain_sse_event(&mut buf).unwrap().unwrap();
+        assert_eq!(event, "data: hi");
+        assert_eq!(buf, b"rest");
+    }
+
+    #[test]
+    fn drain_sse_event_none_when_no_delimiter() {
+        let mut buf: Vec<u8> = b"data: partial".to_vec();
+        assert!(drain_sse_event(&mut buf).unwrap().is_none());
+        // Buffer must be preserved so the next chunk can complete the event.
+        assert_eq!(buf, b"data: partial");
+    }
+
+    #[test]
+    fn drain_sse_event_does_not_split_on_lone_cr_cr() {
+        // Regression: an earlier version split on \r\r, which could fragment
+        // a JSON-encoded \r inside a `data:` payload. Per the SSE spec, only
+        // `\n\n` and `\r\n\r\n` are event delimiters.
+        let mut buf: Vec<u8> = b"data: foo\r\rbar".to_vec();
+        assert!(drain_sse_event(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn drain_sse_event_preserves_multibyte_utf8() {
+        // A 4-byte emoji immediately before the delimiter must decode cleanly.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice("data: 🦀".as_bytes());
+        buf.extend_from_slice(b"\n\n");
+        let event = drain_sse_event(&mut buf).unwrap().unwrap();
+        assert_eq!(event, "data: 🦀");
+    }
+
+    // ---------- sse_data ----------
+
+    #[test]
+    fn sse_data_strips_one_leading_space() {
+        assert_eq!(sse_data("data: hello").as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn sse_data_no_space_after_colon() {
+        assert_eq!(sse_data("data:hello").as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn sse_data_joins_multiple_data_lines_with_newline() {
+        let event = "data: line1\ndata: line2";
+        assert_eq!(sse_data(event).as_deref(), Some("line1\nline2"));
+    }
+
+    #[test]
+    fn sse_data_none_when_no_data_field() {
+        assert!(sse_data("event: ping").is_none());
+        assert!(sse_data("").is_none());
+    }
+
+    // ---------- sanitize_provider_error ----------
+
+    #[test]
+    fn sanitize_extracts_nested_error_message() {
+        let body = r#"{"error":{"message":"rate limit exceeded"}}"#;
+        assert_eq!(
+            sanitize_provider_error(body, "openai"),
+            "rate limit exceeded"
+        );
+    }
+
+    #[test]
+    fn sanitize_extracts_top_level_message() {
+        let body = r#"{"message":"unavailable"}"#;
+        assert_eq!(sanitize_provider_error(body, "anthropic"), "unavailable");
+    }
+
+    #[test]
+    fn sanitize_extracts_gemini_array_form() {
+        let body = r#"[{"error":{"message":"quota"}}]"#;
+        assert_eq!(sanitize_provider_error(body, "gemini"), "quota");
+    }
+
+    #[test]
+    fn sanitize_strips_html_on_non_json_body() {
+        let body = "<html><body><b>502 Bad Gateway</b></body></html>";
+        let out = sanitize_provider_error(body, "openai");
+        assert!(out.contains("502"));
+        assert!(!out.contains("<"));
+    }
+
+    #[test]
+    fn sanitize_truncates_with_ellipsis() {
+        // 500-char message inside an OpenAI shape — should be truncated to 200
+        // chars with a trailing ellipsis.
+        let body = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(500));
+        let out = sanitize_provider_error(&body, "openai");
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 200);
+    }
+
+    #[test]
+    fn sanitize_redacts_leaked_key_in_message() {
+        // Defense-in-depth: a provider that ever echoes the request
+        // Authorization header verbatim must not leak the tail into the toast.
+        let body = r#"{"error":{"message":"unauthorized: Bearer sk-ant-api03-AAAAAAAAAAAAAAAAAAAA"}}"#;
+        let out = sanitize_provider_error(body, "anthropic");
+        assert!(!out.contains("AAAAAAAA"));
+        assert!(out.contains("***"));
+    }
+
+    // ---------- scrub_api_keys ----------
+
+    #[test]
+    fn scrub_redacts_sk_prefix() {
+        let s = "key: sk-1234567890abcdefghij something";
+        let out = scrub_api_keys(s);
+        assert!(out.contains("sk-***"));
+        assert!(!out.contains("1234567890"));
+    }
+
+    #[test]
+    fn scrub_redacts_aiza_prefix() {
+        let s = "AIzaSy1234567890ABCDEFGHIJKLMNOPQRSTUV";
+        let out = scrub_api_keys(s);
+        assert!(out.contains("AIza***"));
+    }
+
+    #[test]
+    fn scrub_redacts_sk_ant_prefix() {
+        // P-B regression guard: Anthropic-shaped key.
+        let s = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAA fail";
+        let out = scrub_api_keys(s);
+        assert!(out.contains("sk-ant-***"));
+        assert!(!out.contains("AAAAAAAA"));
+    }
+
+    #[test]
+    fn scrub_redacts_bearer_token() {
+        // P-B regression guard: opaque bearer.
+        let s = "Authorization: Bearer abcdefghij1234567890XYZ rest";
+        let out = scrub_api_keys(s);
+        assert!(out.contains("Bearer ***"));
+        assert!(!out.contains("abcdefghij1234567890"));
+    }
+
+    #[test]
+    fn scrub_leaves_short_keys_alone() {
+        let s = "sk-abc"; // tail < min_tail_len of 20
+        let out = scrub_api_keys(s);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn scrub_preserves_non_ascii_when_no_redaction() {
+        let s = "日本語 (no key here)";
+        assert_eq!(scrub_api_keys(s), s);
+    }
+
+    #[test]
+    fn scrub_redacts_around_non_ascii_when_match_exists() {
+        let s = "日本 AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 終わり";
+        let out = scrub_api_keys(s);
+        assert!(out.contains("AIza***"));
+        // ASCII surrounds get pushed byte-by-byte; CJK is preserved only when
+        // the outer fallback short-circuits, so for partial redactions the
+        // CJK bytes may be re-interpreted. Pin current behavior:
+        let _ = out; // documenting; redact_prefix doc-comments this limitation
+    }
+
+    // ---------- truncate_chars ----------
+
+    #[test]
+    fn truncate_chars_under_limit_unchanged() {
+        assert_eq!(truncate_chars("short", 10), "short");
+    }
+
+    #[test]
+    fn truncate_chars_over_limit_ellipsis() {
+        let out = truncate_chars("abcdefghij", 5);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 5);
+    }
+
+    #[test]
+    fn truncate_chars_cjk_preserved() {
+        // Each CJK char is 3 bytes UTF-8. Char-aware truncation must not panic
+        // on a non-char boundary and must keep valid UTF-8.
+        let out = truncate_chars("日本語テスト", 4);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 4);
+    }
+
+    // ---------- strip_html_tags ----------
+
+    #[test]
+    fn strip_html_removes_balanced_tags() {
+        assert_eq!(strip_html_tags("<b>Hi</b>"), "Hi");
+        assert_eq!(strip_html_tags("a<br/>b"), "ab");
+    }
+
+    // ---------- response_format_instructions ----------
+
+    #[test]
+    fn response_format_includes_base_and_detail() {
+        let s = response_format_instructions("balanced");
+        assert!(s.contains("Markdown with KaTeX"));
+        assert!(s.contains("Response detail"));
+    }
+
+    #[test]
+    fn response_format_unknown_falls_back_to_concise() {
+        let s = response_format_instructions("garbage");
+        assert!(s.contains("Markdown with KaTeX"));
+        // The concise branch's signature phrase:
+        assert!(s.contains("answer directly and briefly"));
+    }
 }

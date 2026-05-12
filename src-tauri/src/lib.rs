@@ -251,6 +251,18 @@ static OVERLAY_ESCAPE_APP: OnceLock<Mutex<Option<AppHandle>>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static OVERLAY_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// P-C-B3: exported so the ObjC Esc CGEventTap callback in macos_window.m
+/// can decide whether to keep consuming Esc while the overlay is briefly
+/// hidden during the recapture-refresh dance. Without this gate, the tap
+/// short-circuits on `![overlay isVisible]` and Esc leaks through to the
+/// app beneath us during the 300-500 ms hide window — fullscreen Safari
+/// unfullscreens, slide presentations exit, etc.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn screenie_is_overlay_refresh_in_flight() -> bool {
+    OVERLAY_REFRESH_IN_FLIGHT.load(Ordering::Relaxed)
+}
+
 #[cfg(target_os = "macos")]
 extern "C" fn handle_overlay_escape_pressed() -> bool {
     eprintln!("[screenie] esc native fired");
@@ -1919,8 +1931,17 @@ async fn capture_and_show_overlay(app: AppHandle) {
         }
     }
 
-    // 1. Pick the monitor where the cursor currently lives.
-    let monitor = match pick_cursor_monitor(&app) {
+    // P-C-R9: snapshot the cursor position ONCE at trigger time. The same
+    // reading is used for both the monitor pick (so we capture the screen
+    // the user pointed to) and the cursor metadata embedded in the captured
+    // frame (so the overlay's cursor callout lands at the same logical
+    // pixel). Re-reading after capture introduced a ~50-150 ms gap during
+    // which the cursor could move to a different monitor, and the callout
+    // would drift / land off-screen.
+    let cursor_snapshot = app.cursor_position().ok();
+
+    // 1. Pick the monitor where the cursor was at trigger time.
+    let monitor = match pick_cursor_monitor(&app, cursor_snapshot) {
         Some(m) => m,
         None => {
             eprintln!("[screenie] no monitor found");
@@ -1959,7 +1980,7 @@ async fn capture_and_show_overlay(app: AppHandle) {
             return;
         }
     };
-    if let Ok(cursor) = app.cursor_position() {
+    if let Some(cursor) = cursor_snapshot {
         cap.cursor_x = Some(((cursor.x - pos.x as f64) / scale).clamp(0.0, logical_w as f64));
         cap.cursor_y = Some(((cursor.y - pos.y as f64) / scale).clamp(0.0, logical_h as f64));
     }
@@ -2206,7 +2227,11 @@ async fn add_history_entry(
 }
 
 #[tauri::command]
-async fn list_history(app: AppHandle) -> Result<Vec<HistoryEntry>, HistoryError> {
+async fn list_history(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<Vec<HistoryEntry>, HistoryError> {
+    require_window(&window, "main").map_err(HistoryError::Io)?;
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
     tokio::task::spawn_blocking(move || history::load_index(&dir))
         .await
@@ -2214,7 +2239,12 @@ async fn list_history(app: AppHandle) -> Result<Vec<HistoryEntry>, HistoryError>
 }
 
 #[tauri::command]
-async fn delete_history_entry(app: AppHandle, id: String) -> Result<(), HistoryError> {
+async fn delete_history_entry(
+    app: AppHandle,
+    window: WebviewWindow,
+    id: String,
+) -> Result<(), HistoryError> {
+    require_window(&window, "main").map_err(HistoryError::Io)?;
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
     tokio::task::spawn_blocking(move || history::delete_entry(&dir, &id))
         .await
@@ -2222,7 +2252,8 @@ async fn delete_history_entry(app: AppHandle, id: String) -> Result<(), HistoryE
 }
 
 #[tauri::command]
-async fn clear_history(app: AppHandle) -> Result<(), HistoryError> {
+async fn clear_history(app: AppHandle, window: WebviewWindow) -> Result<(), HistoryError> {
+    require_window(&window, "main").map_err(HistoryError::Io)?;
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
     tokio::task::spawn_blocking(move || history::clear_all(&dir))
         .await
@@ -2230,7 +2261,12 @@ async fn clear_history(app: AppHandle) -> Result<(), HistoryError> {
 }
 
 #[tauri::command]
-async fn load_history_image(app: AppHandle, id: String) -> Result<String, HistoryError> {
+async fn load_history_image(
+    app: AppHandle,
+    window: WebviewWindow,
+    id: String,
+) -> Result<String, HistoryError> {
+    require_window(&window, "main").map_err(HistoryError::Io)?;
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
     tokio::task::spawn_blocking(move || history::load_image_b64(&dir, &id))
         .await
@@ -2238,7 +2274,12 @@ async fn load_history_image(app: AppHandle, id: String) -> Result<String, Histor
 }
 
 #[tauri::command]
-async fn load_history_thumb(app: AppHandle, id: String) -> Result<String, HistoryError> {
+async fn load_history_thumb(
+    app: AppHandle,
+    window: WebviewWindow,
+    id: String,
+) -> Result<String, HistoryError> {
+    require_window(&window, "main").map_err(HistoryError::Io)?;
     let dir = app_data_dir(&app).map_err(HistoryError::Io)?;
     tokio::task::spawn_blocking(move || history::load_thumb_b64(&dir, &id))
         .await
@@ -2502,6 +2543,12 @@ fn apply_hotkey_config(
             *cfg = saved.clone();
         }
         save_hotkey_config(app, &saved)?;
+        // P-A-B12: clear any stale startup-failure error so the tutorial
+        // banner and Settings error chip clear once the user has successfully
+        // re-bound the shortcut.
+        if let Ok(mut g) = state.hotkey_error.lock() {
+            *g = None;
+        }
         Ok(())
     } else {
         // Roll back to the previous config so the app stays in a working state.
@@ -2596,14 +2643,13 @@ async fn open_chat_window(
     .transparent(true)
     .decorations(false)
     .shadow(false)
-    // macOS NSVisualEffectView "sidebar" vibrancy + 24px corner
-    // radius matching the chat panel's CSS border-radius. This gives
-    // the window a LIVE blurred-glass background (whatever desktop
-    // content is behind it) instead of the previous static captured
-    // screenshot bitmap — moving other windows behind the chat now
-    // updates the frost in real time.
+    // macOS NSVisualEffectView "hudWindow" vibrancy — heaviest practical
+    // material, matches the overlay's frost panes + the floating-panel
+    // look (ChatGPT / Linear / Notion style: heavy gaussian blur with
+    // colors bleeding through). 24px corner radius matches the chat
+    // panel's CSS border-radius.
     .effects(WindowEffectsConfig {
-        effects: vec![WindowEffect::Sidebar],
+        effects: vec![WindowEffect::HudWindow],
         state: Some(WindowEffectState::Active),
         radius: Some(24.0),
         color: None,
@@ -2615,6 +2661,18 @@ async fn open_chat_window(
     let chat_win = chat_builder
         .build()
         .map_err(|e| format!("chat window: {e}"))?;
+    // P-A-B7: cancel any in-flight chat AI stream when the user closes the
+    // chat window. Without this, closing mid-stream leaves the request
+    // running on a destroyed webview (Channel::send errors silently, the
+    // stream loop only exits between chunks via the cancel flag).
+    let app_for_event = app.clone();
+    chat_win.on_window_event(move |event| {
+        if let WindowEvent::Destroyed = event {
+            if let Some(state) = app_for_event.try_state::<AppState>() {
+                cancel_active_chat_ai(&state);
+            }
+        }
+    });
     #[cfg(target_os = "windows")]
     {
         // Tauri's `WindowEffect::Sidebar` above is macOS-only; on Windows it's
@@ -2653,8 +2711,19 @@ struct ChatSeed {
 
 /// Find the monitor whose physical bounds contain the cursor. Falls back to
 /// the primary monitor if the cursor lookup fails.
-fn pick_cursor_monitor(app: &AppHandle) -> Option<tauri::Monitor> {
-    let cursor = app.cursor_position().ok();
+/// Find the monitor whose physical bounds contain the cursor. Falls back to
+/// the primary monitor if the cursor lookup fails.
+///
+/// P-C-R9: takes the cursor as a caller-supplied snapshot so the *same*
+/// reading is used for both monitor selection and the post-capture cursor
+/// metadata. Re-reading cursor_position 50-150 ms later could otherwise
+/// return a position on a different monitor (multi-display setup, user
+/// moved during capture) and the overlay's cursor callout would land on
+/// the wrong screen.
+fn pick_cursor_monitor(
+    app: &AppHandle,
+    cursor: Option<tauri::PhysicalPosition<f64>>,
+) -> Option<tauri::Monitor> {
     let monitors = app.available_monitors().ok()?;
     if let Some(c) = cursor {
         for m in &monitors {
@@ -2880,4 +2949,133 @@ pub fn run() {
     builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> UiMessage {
+        UiMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    // ---------- validate_ai_payload ----------
+
+    #[test]
+    fn validate_ai_payload_happy_path() {
+        let msgs = vec![msg("user", "hello")];
+        assert!(validate_ai_payload(&msgs, "base64data").is_ok());
+    }
+
+    #[test]
+    fn validate_ai_payload_rejects_oversized_image() {
+        let huge = "x".repeat(MAX_AI_IMAGE_B64_CHARS + 1);
+        let result = validate_ai_payload(&[], &huge);
+        assert!(matches!(result, Err(AiError::RequestTooLarge(_))));
+    }
+
+    #[test]
+    fn validate_ai_payload_rejects_too_many_messages() {
+        let msgs: Vec<UiMessage> =
+            (0..=MAX_AI_MESSAGES).map(|_| msg("user", "x")).collect();
+        let result = validate_ai_payload(&msgs, "");
+        assert!(matches!(result, Err(AiError::RequestTooLarge(_))));
+    }
+
+    #[test]
+    fn validate_ai_payload_rejects_long_single_message() {
+        let long = "x".repeat(MAX_AI_MESSAGE_CHARS + 1);
+        let msgs = vec![msg("user", &long)];
+        let result = validate_ai_payload(&msgs, "");
+        assert!(matches!(result, Err(AiError::RequestTooLarge(_))));
+    }
+
+    #[test]
+    fn validate_ai_payload_rejects_total_chars() {
+        // Each message is at the per-message cap; enough of them push the
+        // total past MAX_AI_TOTAL_MESSAGE_CHARS.
+        let big = "x".repeat(MAX_AI_MESSAGE_CHARS);
+        let n = (MAX_AI_TOTAL_MESSAGE_CHARS / MAX_AI_MESSAGE_CHARS) + 1;
+        let n = n.min(MAX_AI_MESSAGES); // keep below the count cap
+        let msgs: Vec<UiMessage> = (0..n).map(|_| msg("user", &big)).collect();
+        let result = validate_ai_payload(&msgs, "");
+        assert!(matches!(result, Err(AiError::RequestTooLarge(_))));
+    }
+
+    // ---------- secret_name_for_provider ----------
+
+    #[test]
+    fn secret_name_for_provider_known() {
+        assert_eq!(
+            secret_name_for_provider("anthropic").unwrap(),
+            Some("anthropic_api_key")
+        );
+        assert_eq!(
+            secret_name_for_provider("openai").unwrap(),
+            Some("openai_api_key")
+        );
+        assert_eq!(
+            secret_name_for_provider("gemini").unwrap(),
+            Some("gemini_api_key")
+        );
+        // Ollama is local and has no secret slot.
+        assert_eq!(secret_name_for_provider("ollama").unwrap(), None);
+    }
+
+    #[test]
+    fn secret_name_for_provider_rejects_unknown() {
+        assert!(matches!(
+            secret_name_for_provider("evil"),
+            Err(AiError::InvalidProvider(_))
+        ));
+    }
+
+    // ---------- provider_default_model ----------
+
+    #[test]
+    fn provider_default_model_all_known() {
+        assert!(provider_default_model("anthropic").is_ok());
+        assert!(provider_default_model("openai").is_ok());
+        assert!(provider_default_model("gemini").is_ok());
+        assert!(provider_default_model("ollama").is_ok());
+    }
+
+    #[test]
+    fn provider_default_model_unknown_rejected() {
+        assert!(matches!(
+            provider_default_model("evil"),
+            Err(AiError::InvalidProvider(_))
+        ));
+    }
+
+    // ---------- normalize_response_profile ----------
+
+    #[test]
+    fn normalize_profile_balanced_and_detailed_pass_through() {
+        assert_eq!(
+            normalize_response_profile(Some("balanced".into())),
+            "balanced"
+        );
+        assert_eq!(
+            normalize_response_profile(Some("detailed".into())),
+            "detailed"
+        );
+    }
+
+    #[test]
+    fn normalize_profile_unknown_collapses_to_concise() {
+        assert_eq!(normalize_response_profile(None), "concise");
+        assert_eq!(
+            normalize_response_profile(Some("nonsense".into())),
+            "concise"
+        );
+        // Pin the case-sensitivity: an explicit "CONCISE" does NOT match.
+        assert_eq!(
+            normalize_response_profile(Some("CONCISE".into())),
+            "concise"
+        );
+    }
 }

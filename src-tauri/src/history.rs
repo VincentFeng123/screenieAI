@@ -148,7 +148,19 @@ pub fn add_entry(app_data: &Path, args: AddArgs) -> Result<HistoryEntry, History
     Ok(entry)
 }
 
+/// Reject any caller-supplied `id` that isn't a UUID. All ids issued by
+/// `add_entry` are v4 UUIDs, so a non-UUID id can only come from a
+/// malicious or buggy caller. Without this guard, an id like `"../config"`
+/// would compose into `<app_data>/history/../config.png` and read or
+/// delete files outside the history directory.
+fn validate_id(id: &str) -> Result<(), HistoryError> {
+    uuid::Uuid::parse_str(id)
+        .map(|_| ())
+        .map_err(|_| HistoryError::Io("invalid history id".into()))
+}
+
 pub fn delete_entry(app_data: &Path, id: &str) -> Result<(), HistoryError> {
+    validate_id(id)?;
     let mut index = load_index(app_data).unwrap_or_default();
     let before = index.len();
     index.retain(|e| e.id != id);
@@ -177,6 +189,7 @@ pub fn clear_all(app_data: &Path) -> Result<(), HistoryError> {
 /// "open this entry in chat" flow to re-hydrate the cropped image.
 pub fn load_image_b64(app_data: &Path, id: &str) -> Result<String, HistoryError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    validate_id(id)?;
     let bytes = std::fs::read(entry_png_path(app_data, id))?;
     Ok(STANDARD.encode(&bytes))
 }
@@ -184,6 +197,7 @@ pub fn load_image_b64(app_data: &Path, id: &str) -> Result<String, HistoryError>
 /// Read the thumbnail bytes, base64-encoded — used by the history list view.
 pub fn load_thumb_b64(app_data: &Path, id: &str) -> Result<String, HistoryError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    validate_id(id)?;
     let bytes = std::fs::read(entry_thumb_path(app_data, id))?;
     Ok(STANDARD.encode(&bytes))
 }
@@ -210,4 +224,28 @@ fn make_thumbnail(src_png: &[u8], max_long_edge: u32) -> Result<Vec<u8>, String>
         .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_id_accepts_real_uuid() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(validate_id(&id).is_ok());
+    }
+
+    #[test]
+    fn validate_id_rejects_path_traversal() {
+        // P-A-B1 regression guard. Any id that isn't a UUID-v4 string is
+        // rejected; the load/delete paths previously composed the id into
+        // `<app_data>/history/{id}.png` without validation.
+        assert!(validate_id("../config").is_err());
+        assert!(validate_id("foo:bar").is_err());
+        assert!(validate_id("/etc/passwd").is_err());
+        assert!(validate_id("").is_err());
+        assert!(validate_id("not-a-uuid").is_err());
+        assert!(validate_id("00000000-0000-0000-0000").is_err());
+    }
 }

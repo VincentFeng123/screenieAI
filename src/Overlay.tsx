@@ -1,4 +1,13 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { flushSync } from "react-dom";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -209,6 +218,12 @@ const OVERLAY_INTERACTION_REGION_SELECTOR = [
   ".screenie-action",
   ".screenie-action-group",
   ".screenie-edit-text-input",
+  // B15 reverted: `.screenie-md` lives inside `.screenie-chat-panel` (the
+  // only mount sites for `MessageBubble`), and that parent is already in
+  // this selector. The panel's getClientRects union already covers the
+  // markdown body + any <a> link descendants, so adding `.screenie-md`
+  // entries here was redundant. If a future feature mounts markdown
+  // outside the chat panel, add the appropriate parent class then.
 ].join(", ");
 
 function collectOverlayInteractionRegions(): OverlayInteractionRegion[] {
@@ -310,7 +325,25 @@ function useOverlayInteractionRegions(enabled: boolean) {
   });
 
   useEffect(() => {
-    const observer = new MutationObserver(scheduleSync);
+    // P-E: filter out mutations that are entirely confined to the
+    // streamed AI response body (`.screenie-md` and descendants). During
+    // a fast cloud stream that subtree mutates thousands of times per
+    // second as KaTeX / highlight.js paint, and re-walking the interaction-
+    // region selector each time is a measurable hot spot. The markdown
+    // body's interaction region is dictated by its `.screenie-md` /
+    // `.screenie-chat-panel` parent rect, which doesn't change with these
+    // internal mutations.
+    const observer = new MutationObserver((mutations) => {
+      let meaningful = false;
+      for (const m of mutations) {
+        const target = m.target as Element | null;
+        if (!target?.closest?.(".screenie-md")) {
+          meaningful = true;
+          break;
+        }
+      }
+      if (meaningful) scheduleSync();
+    });
     observer.observe(document.body, {
       attributes: true,
       childList: true,
@@ -472,8 +505,12 @@ function useOverlayFrostRegions(enabled: boolean) {
       .forEach((el) => ro.observe(el));
 
     const observer = new MutationObserver((mutations) => {
-      // Re-observe newly-added panels so freshly mounted toasts/popovers
-      // get tracked through their CSS animations.
+      // P-E: same `.screenie-md` filter as the interaction-region
+      // observer above — KaTeX / highlight.js mutations don't move
+      // frost panes, so we can skip the scheduleSync. Newly-added
+      // frost-region elements are still picked up because addedNodes
+      // run regardless of the meaningful flag.
+      let meaningful = false;
       for (const m of mutations) {
         m.addedNodes.forEach((n) => {
           if (!(n instanceof HTMLElement)) return;
@@ -482,8 +519,13 @@ function useOverlayFrostRegions(enabled: boolean) {
             ro.observe(el),
           );
         });
+        if (meaningful) continue;
+        const target = m.target as Element | null;
+        if (!target?.closest?.(".screenie-md")) {
+          meaningful = true;
+        }
       }
-      scheduleSync();
+      if (meaningful) scheduleSync();
     });
     observer.observe(document.body, {
       attributes: true,
@@ -566,6 +608,14 @@ export default function Overlay() {
       }
     },
   );
+  // Reactive devicePixelRatio. MUST be called unconditionally at the top of
+  // the component — placing it after the early returns below violates React's
+  // Rules of Hooks (first render returns null before reaching it; second
+  // render reaches it; React then sees a "new hook" and crashes the component
+  // silently — symptom: overlay window is created and shown by Rust, but
+  // renders nothing visible to the user).
+  const dpr = useDevicePixelRatio();
+
   // Edit controller is lifted to the overlay root so strokes survive the
   // adjusting → result transition (and the user's open/tool state survives an
   // explicit Esc-to-collapse).
@@ -968,8 +1018,6 @@ export default function Overlay() {
       />
     );
   }
-
-  const dpr = useDevicePixelRatio();
 
   // Stable, stale-closure-proof setters via functional setMode.
   const setAdjustingRect = (r: Rect) =>
@@ -1950,7 +1998,7 @@ function AdjustingLayer({
         />
       )}
       <Hint
-        text="Drag the box · Resize via handles · Enter to send · Esc to redraw · Esc Esc to close"
+        text="Drag to recrop · Enter to send · Esc to redraw"
         screen={screen}
         dpr={dpr}
       />
@@ -2096,6 +2144,26 @@ function Toolbar({
     ta.style.height = Math.min(Math.max(ta.scrollHeight, MIN_INPUT_H), MAX_INPUT_H) + "px";
   };
   useEffect(adjustHeight, [prompt]);
+
+  // P-D: streaming elapsed-time pill. Surface a small "Ns" hint after
+  // ~1.5s of streaming so the user can tell the request hasn't stalled
+  // when the provider goes idle between chunks. Updates every 250 ms
+  // (interval, not rAF) so React doesn't re-render on every frame; the
+  // timer is cleared when streaming flips back to false.
+  const [elapsedMs, setElapsedMs] = useState(0);
+  useEffect(() => {
+    if (!streaming) {
+      setElapsedMs(0);
+      return;
+    }
+    const startedAt = Date.now();
+    setElapsedMs(0);
+    const id = window.setInterval(
+      () => setElapsedMs(Date.now() - startedAt),
+      250,
+    );
+    return () => window.clearInterval(id);
+  }, [streaming]);
 
   const PAD = OVERLAY_PAD;
   // Worst-case height — chips row + maxed textarea + paddings. Used only for
@@ -2316,6 +2384,21 @@ function Toolbar({
             overflow: "auto",
           }}
         />
+        {streaming && elapsedMs >= 1500 && (
+          <span
+            aria-live="polite"
+            style={{
+              fontSize: 11,
+              color: "rgba(255, 255, 255, 0.5)",
+              alignSelf: "center",
+              marginRight: 2,
+              fontVariantNumeric: "tabular-nums",
+              userSelect: "none",
+            }}
+          >
+            {Math.round(elapsedMs / 1000)}s
+          </span>
+        )}
         <button
           className="screenie-send"
           // While streaming the button is the stop control — never disabled.
@@ -4122,6 +4205,7 @@ function ResultLayer({
                   onClick={() => setChatView((v) => (v === "history" ? "chat" : "history"))}
                   onMouseDown={(e) => e.stopPropagation()}
                   aria-label={chatView === "history" ? "Back to chat" : "Open history"}
+                  title={chatView === "history" ? "Back to chat" : "Open history"}
                   data-active={chatView === "history"}
                 >
                   <Clock size={13} strokeWidth={1.85} aria-hidden />
@@ -4132,6 +4216,7 @@ function ResultLayer({
                   onClick={pinToDetachedWindow}
                   onMouseDown={(e) => e.stopPropagation()}
                   aria-label="Pin chat to detached window"
+                  title="Pin chat to detached window"
                   style={{ marginRight: 8 }}
                 >
                   <ExternalLink size={13} strokeWidth={1.85} aria-hidden />
@@ -4144,8 +4229,9 @@ function ResultLayer({
                   }}
                   onMouseDown={(e) => e.stopPropagation()}
                   aria-label="Close chat panel"
+                  title="Close chat panel"
                 >
-                  <X size={8} strokeWidth={2.5} aria-hidden />
+                  <X size={10} strokeWidth={2} aria-hidden />
                 </button>
               </div>
             </div>
@@ -4253,9 +4339,7 @@ function ResultLayer({
             console.error("cancel_ai failed:", e),
           );
         }}
-        avoidPanel={
-          chatPanelVisible && panel?.overlapsCapture ? panel : null
-        }
+        avoidPanel={chatPanelVisible && panel?.overlapsCapture ? panel : null}
         allowEmpty={preferences.overlayAllowEmptySend}
         showPresets={preferences.overlayShowPresets}
       />
@@ -4286,6 +4370,7 @@ function ResultLayer({
               setChatVisible(true);
             }}
             aria-label="Show chat"
+            title="Show chat"
             style={{
               width: SHOW_CHAT_W,
               height: SHOW_CHAT_H,
@@ -4417,6 +4502,13 @@ function MessageBubbleImpl({
       return displayContent;
     }
   }, [displayContent, isAssistant]);
+  // P-E: deprioritize the (expensive) ReactMarkdown + remark + rehype-katex
+  // + rehype-highlight re-parse during streaming. React schedules the
+  // markdown render at low priority so a fast chunk burst doesn't pin the
+  // main thread — the typewriter cursor + UI controls stay responsive.
+  // After streaming completes, the deferred value catches up within one
+  // commit, so the final rendered answer is unchanged.
+  const deferredFormattedContent = useDeferredValue(formattedContent);
 
   const copy = () => {
     if (!message.content) return;
@@ -4474,7 +4566,7 @@ function MessageBubbleImpl({
             remarkPlugins={[remarkGfm, remarkMath]}
             rehypePlugins={[[rehypeKatex, SCREENIE_KATEX_OPTIONS], rehypeHighlight]}
           >
-            {formattedContent}
+            {deferredFormattedContent}
           </ReactMarkdown>
         ) : null}
         {showCursor && (
@@ -4497,6 +4589,7 @@ function MessageBubbleImpl({
             className={`screenie-copy-btn ${copied ? "copied" : ""}`}
             onClick={copy}
             aria-label="Copy response"
+            title="Copy response"
           >
             {copied ? (
               <Check size={15} strokeWidth={2} aria-hidden />
@@ -4644,8 +4737,8 @@ function PermissionBanner({
   const isMac =
     typeof navigator !== "undefined" && navigator.userAgent.includes("Mac");
   const explanation = isMac
-    ? "If you've already enabled Screen Recording for Screenie AI in System Settings → Privacy & Security, you still need to quit and reopen the app — macOS caches the permission state per running process and only re-checks at launch. Use Quit & relaunch below. If you haven't granted it yet, open System Settings first."
-    : "This usually means the region you captured contained DRM-protected content (Netflix, some banking apps, fullscreen games) or a window that opts out of capture. If the screen is intentionally black, close this banner and retry on a different region.";
+    ? "Open System Settings → Privacy & Security → Screen Recording, enable Screenie AI, then click Quit & relaunch below. macOS only re-checks permissions when the app launches."
+    : "The region you captured likely contained DRM-protected content (Netflix, some banking apps, fullscreen games) or a window that opts out of capture. Retry on a different region.";
   const settingsLabel = isMac
     ? "Open System Settings ↗"
     : "Open Privacy Settings ↗";

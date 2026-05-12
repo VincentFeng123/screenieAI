@@ -203,7 +203,10 @@ export default function SettingsPanel({
       setHotkeyError(event.payload);
     });
     return () => {
-      unlistenP.then((fn) => fn());
+      // P-A-B10: chain a no-op `.catch` so a rejected `listen()` promise
+      // (HMR teardown, IPC bridge not ready, dev preview without Tauri)
+      // doesn't surface as an unhandled rejection.
+      unlistenP.then((fn) => fn()).catch(() => {});
     };
   }, []);
 
@@ -450,7 +453,7 @@ export default function SettingsPanel({
           );
         }}
       >
-        <X size={11} strokeWidth={2.25} aria-hidden />
+        <X size={12} strokeWidth={2.25} aria-hidden />
       </button>
       <aside className="settings-sidebar" aria-label="Settings navigation">
         {/* No separate BlurredBackdrop here — the sidebar is now a
