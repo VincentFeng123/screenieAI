@@ -66,6 +66,22 @@ jobs:
         with:
           targets: ${{ matrix.rust-targets }}
 
+      # Defensive: `dtolnay/rust-toolchain` no-ops when the requested
+      # toolchain is already pre-installed on the runner image, and in
+      # that case it doesn't run `rustup target add` for the
+      # `targets:` list either. macos-latest images now ship with only
+      # `aarch64-apple-darwin` pre-installed, which silently leaves the
+      # `x86_64-apple-darwin` half of the universal binary missing.
+      # Explicit `target add` is idempotent and cheap — fixes the
+      # missing-target failure without relying on runner image contents.
+      - name: Ensure Rust cross-compile targets are installed
+        if: matrix.rust-targets != ''
+        shell: bash
+        run: |
+          for t in ${{ matrix.rust-targets }}; do
+            rustup target add "${t//,/}"
+          done
+
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
         with:
