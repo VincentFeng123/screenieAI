@@ -468,7 +468,10 @@ pub fn relay_overlay_wheel(delta_x: f64, delta_y: f64) -> bool {
         unsafe {
             post_synthetic_wheel(delta_x, delta_y);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(24)).await;
+        // Keep the overlay transparent for a short scroll burst so repeated
+        // mouse-wheel ticks can reach the underlying app directly instead of
+        // bouncing through JS/Rust for every notch.
+        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
         if CLICK_RELAY_GENERATION.load(Ordering::Acquire) == generation {
             CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
             update_passthrough_from_cursor();

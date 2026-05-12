@@ -129,52 +129,30 @@ function relayOverlayPointerClick(button: number) {
   });
 }
 
-// Track scroll-gesture phase so the macOS synthetic CGEvents the relay
-// posts carry the same Began/Changed/Ended sequence a real trackpad
-// gesture would. Without these, the receiving app treats each event as
-// a discrete mouse-wheel tick (instant jump, no momentum), and the
-// stream mixes phaseless synth ticks with phased real-passthrough
-// events — the result reads as choppy scrolling. Phase values match
-// kCGScrollPhase: 1=Began, 2=Changed, 4=Ended. The Rust side just
-// forwards the int to native; Windows ignores it (Win32 SendInput has
-// no phase concept).
+// Track scroll-gesture phase for the first tick that JS relays. Native then
+// keeps the overlay mouse-transparent for the rest of the scroll burst, so
+// follow-up trackpad/mouse-wheel events reach the app underneath directly.
+// Phase values match kCGScrollPhase: 1=Began, 2=Changed. Windows ignores the
+// phase value because Win32 SendInput has no gesture-phase concept.
 const WHEEL_PHASE_BEGAN = 1;
 const WHEEL_PHASE_CHANGED = 2;
-const WHEEL_PHASE_ENDED = 4;
-const WHEEL_IDLE_END_MS = 100;
+const WHEEL_NEW_GESTURE_IDLE_MS = 160;
 let wheelLastEventMs = 0;
-let wheelEndedTimer: number | null = null;
 
 function relayOverlayWheel(deltaX: number, deltaY: number) {
   const now = performance.now();
   const sinceLast = now - wheelLastEventMs;
   wheelLastEventMs = now;
-  if (wheelEndedTimer !== null) {
-    window.clearTimeout(wheelEndedTimer);
-    wheelEndedTimer = null;
-  }
   // First event after an idle period starts a new gesture. JS WheelEvent
   // doesn't expose phase info directly, so we infer Began vs Changed
   // from the gap between events.
   const phase =
-    sinceLast > WHEEL_IDLE_END_MS ? WHEEL_PHASE_BEGAN : WHEEL_PHASE_CHANGED;
+    sinceLast > WHEEL_NEW_GESTURE_IDLE_MS
+      ? WHEEL_PHASE_BEGAN
+      : WHEEL_PHASE_CHANGED;
   invoke("relay_overlay_wheel", { deltaX, deltaY, phase }).catch((e) => {
     console.error("relay_overlay_wheel failed:", e);
   });
-  // Synth an Ended event after a brief idle so the receiving app
-  // terminates its scroll gesture cleanly. The user's real Ended event
-  // may or may not have passed through (depends on the relay/passthrough
-  // alternation); the timer ensures the app always sees one.
-  wheelEndedTimer = window.setTimeout(() => {
-    wheelEndedTimer = null;
-    invoke("relay_overlay_wheel", {
-      deltaX: 0,
-      deltaY: 0,
-      phase: WHEEL_PHASE_ENDED,
-    }).catch((e) => {
-      console.error("relay_overlay_wheel (ended) failed:", e);
-    });
-  }, WHEEL_IDLE_END_MS);
 }
 
 type Handle =

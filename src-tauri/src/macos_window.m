@@ -133,6 +133,10 @@ static bool screenieOverlayOutsideClickStarted = false;
 static bool screenieOverlayMouseCaptureActive = false;
 static bool screenieOverlayClickRelayActive = false;
 static uint64_t screenieOverlayClickRelayGeneration = 0;
+static bool screenieOverlayScrollRelayActive = false;
+static bool screenieOverlayScrollRelaySawPassthrough = false;
+static uint64_t screenieOverlayScrollRelayGeneration = 0;
+static NSTimer *screenieOverlayScrollRelayTimer = nil;
 static bool screenieOverlayCaptureDragEnabled = false;
 static bool screenieOverlayCaptureDragTracking = false;
 static bool screenieOverlayCaptureDragActive = false;
@@ -840,7 +844,14 @@ static bool screenie_post_mouse_click(CGPoint point, CGMouseButton button) {
   return true;
 }
 
-static bool screenie_post_scroll(double deltaX, double deltaY, int phase) {
+static const NSTimeInterval SCREENIE_SCROLL_RELAY_IDLE_SECONDS = 0.14;
+static const int SCREENIE_CG_SCROLL_PHASE_ENDED = 4;
+static const int64_t SCREENIE_SYNTHETIC_SCROLL_USER_DATA = 0x5343524f4c4cLL;
+
+static bool screenie_post_scroll(double deltaX,
+                                 double deltaY,
+                                 int phase,
+                                 bool tagSynthetic) {
   if (!screenie_can_post_mouse_events()) {
     return false;
   }
@@ -874,9 +885,86 @@ static bool screenie_post_scroll(double deltaX, double deltaY, int phase) {
   if (phase != 0) {
     CGEventSetIntegerValueField(scroll, kCGScrollWheelEventScrollPhase, phase);
   }
+  if (tagSynthetic) {
+    CGEventSetIntegerValueField(scroll,
+                                kCGEventSourceUserData,
+                                SCREENIE_SYNTHETIC_SCROLL_USER_DATA);
+  }
   CGEventPost(kCGHIDEventTap, scroll);
   CFRelease(scroll);
   return true;
+}
+
+static void screenie_cancel_overlay_scroll_relay(void) {
+  screenieOverlayScrollRelayGeneration++;
+  screenieOverlayScrollRelayActive = false;
+  screenieOverlayScrollRelaySawPassthrough = false;
+  if (screenieOverlayScrollRelayTimer != nil) {
+    [screenieOverlayScrollRelayTimer invalidate];
+    screenieOverlayScrollRelayTimer = nil;
+  }
+}
+
+static void screenie_schedule_overlay_scroll_relay_idle(bool sawPassthrough) {
+  if (sawPassthrough) {
+    screenieOverlayScrollRelaySawPassthrough = true;
+  }
+  if (screenieOverlayScrollRelayTimer != nil) {
+    [screenieOverlayScrollRelayTimer invalidate];
+    screenieOverlayScrollRelayTimer = nil;
+  }
+
+  uint64_t generation = screenieOverlayScrollRelayGeneration;
+  screenieOverlayScrollRelayTimer =
+      [NSTimer timerWithTimeInterval:SCREENIE_SCROLL_RELAY_IDLE_SECONDS
+                              repeats:NO
+                                block:^(NSTimer *timer) {
+    (void)timer;
+    screenieOverlayScrollRelayTimer = nil;
+    if (generation != screenieOverlayScrollRelayGeneration) {
+      return;
+    }
+
+    // If the initial JS-relayed tick was the whole gesture, close the
+    // synthetic phase. For real pass-through bursts, the underlying app sees
+    // the hardware Changed/Ended events directly, so don't inject another end.
+    if (!screenieOverlayScrollRelaySawPassthrough &&
+        screenieOverlayWindow != nil &&
+        [screenieOverlayWindow isVisible]) {
+      (void)screenie_post_scroll(0.0,
+                                 0.0,
+                                 SCREENIE_CG_SCROLL_PHASE_ENDED,
+                                 true);
+    }
+
+    screenieOverlayScrollRelayActive = false;
+    screenieOverlayScrollRelaySawPassthrough = false;
+    screenie_update_overlay_mouse_passthrough();
+  }];
+  [[NSRunLoop mainRunLoop] addTimer:screenieOverlayScrollRelayTimer
+                            forMode:NSRunLoopCommonModes];
+}
+
+static bool screenie_event_is_synthetic_overlay_scroll(NSEvent *event) {
+  if (event == nil || [event type] != NSEventTypeScrollWheel) {
+    return false;
+  }
+  CGEventRef cg = [event CGEvent];
+  if (cg == NULL) {
+    return false;
+  }
+  return CGEventGetIntegerValueField(cg, kCGEventSourceUserData) ==
+         SCREENIE_SYNTHETIC_SCROLL_USER_DATA;
+}
+
+static void screenie_note_overlay_scroll_passthrough_event(NSEvent *event) {
+  if (!screenieOverlayScrollRelayActive ||
+      event == nil ||
+      [event type] != NSEventTypeScrollWheel ||
+      screenie_event_is_synthetic_overlay_scroll(event)) {
+    return;
+  }
+  screenie_schedule_overlay_scroll_relay_idle(true);
 }
 
 /// PID of the topmost layer-0 window under `point` (CG / top-left coords)
@@ -989,6 +1077,7 @@ static bool screenie_relay_overlay_click_at_current_mouse(NSInteger buttonNumber
   pid_t targetPid = screenie_app_pid_at_cg_point(point);
 
   CGMouseButton button = screenie_cg_button_from_number(buttonNumber);
+  screenie_cancel_overlay_scroll_relay();
   uint64_t generation = ++screenieOverlayClickRelayGeneration;
   screenieOverlayClickRelayActive = true;
   screenieOverlayMouseCaptureActive = false;
@@ -1038,24 +1127,26 @@ static bool screenie_relay_overlay_scroll(double deltaX,
     return false;
   }
 
-  uint64_t generation = ++screenieOverlayClickRelayGeneration;
-  screenieOverlayClickRelayActive = true;
+  screenieOverlayScrollRelayGeneration++;
+  uint64_t generation = screenieOverlayScrollRelayGeneration;
+  screenieOverlayScrollRelayActive = true;
+  screenieOverlayScrollRelaySawPassthrough = false;
   screenieOverlayMouseCaptureActive = false;
   screenie_overlay_set_ignores_mouse(true);
 
-  // Post immediately — the click-relay path waits 1ms for WindowServer to
-  // settle `ignoresMouseEvents:YES` before the injected click is
-  // hit-tested, but a scroll only needs the cursor position (handled by
-  // CGEventPost regardless of overlay state), so the delay just added
-  // jitter between events in the gesture stream.
-  (void)screenie_post_scroll(deltaX, deltaY, phase);
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 24 * NSEC_PER_MSEC),
-                 dispatch_get_main_queue(), ^{
-    if (screenieOverlayClickRelayGeneration == generation) {
-      screenieOverlayClickRelayActive = false;
-      screenie_update_overlay_mouse_passthrough();
-    }
-  });
+  // Post the first tick immediately, then leave the overlay transparent until
+  // the scroll stream goes idle. That lets WindowServer deliver the rest of a
+  // trackpad/mouse-wheel burst directly to the app underneath instead of
+  // alternating between synthetic events and overlay hit-testing.
+  bool posted = screenie_post_scroll(deltaX, deltaY, phase, true);
+  if (!posted) {
+    screenie_cancel_overlay_scroll_relay();
+    screenie_update_overlay_mouse_passthrough();
+    return false;
+  }
+  if (screenieOverlayScrollRelayGeneration == generation) {
+    screenie_schedule_overlay_scroll_relay_idle(false);
+  }
   return true;
 }
 
@@ -1075,7 +1166,8 @@ static void screenie_handle_overlay_capture_drag_observed_event(
       screenieOverlayCaptureDragCallback == NULL ||
       screenieOverlayWindow == nil ||
       ![screenieOverlayWindow isVisible] ||
-      screenieOverlayClickRelayActive) {
+      screenieOverlayClickRelayActive ||
+      screenieOverlayScrollRelayActive) {
     return;
   }
 
@@ -1144,7 +1236,8 @@ static CGEventRef screenie_overlay_capture_drag_event_tap(
       screenieOverlayCaptureDragCallback == NULL ||
       screenieOverlayWindow == nil ||
       ![screenieOverlayWindow isVisible] ||
-      screenieOverlayClickRelayActive) {
+      screenieOverlayClickRelayActive ||
+      screenieOverlayScrollRelayActive) {
     return event;
   }
 
@@ -1312,6 +1405,7 @@ static bool screenie_should_relay_overlay_mouse_down(NSEvent *event) {
       !screenieOverlayPassthroughEnabled ||
       screenieOverlayMouseCaptureActive ||
       screenieOverlayClickRelayActive ||
+      screenieOverlayScrollRelayActive ||
       [event window] != screenieOverlayWindow ||
       !screenie_event_is_mouse_down([event type])) {
     return false;
@@ -1375,25 +1469,33 @@ static void screenie_activate_app_on_passthrough_click(NSEvent *event) {
   if (!screenie_event_is_mouse_down([event type])) {
     return;
   }
+  bool clickDuringScrollRelay = screenieOverlayScrollRelayActive;
   // Inside an overlay region → overlay handles the click via the local
   // monitor; nothing for us to do. Belt-and-braces: the global monitor
   // only fires for events delivered to OTHER apps, so reaching here
   // already implies the click went through.
-  if (screenie_overlay_mouse_is_inside_region([NSEvent mouseLocation])) {
+  if (!clickDuringScrollRelay &&
+      screenie_overlay_mouse_is_inside_region([NSEvent mouseLocation])) {
     return;
+  }
+  if (clickDuringScrollRelay) {
+    screenie_cancel_overlay_scroll_relay();
   }
 
   CGPoint cg;
   if (!screenie_current_cg_mouse_location(&cg)) {
+    screenie_update_overlay_mouse_passthrough();
     return;
   }
   pid_t targetPid = screenie_app_pid_at_cg_point(cg);
   if (targetPid <= 0 || targetPid == getpid()) {
+    screenie_update_overlay_mouse_passthrough();
     return;
   }
   NSRunningApplication *target =
       [NSRunningApplication runningApplicationWithProcessIdentifier:targetPid];
   if (target == nil || [target isActive]) {
+    screenie_update_overlay_mouse_passthrough();
     return;
   }
   // `activateWithOptions:0` does NOT raise the target's windows — our
@@ -1402,6 +1504,7 @@ static void screenie_activate_app_on_passthrough_click(NSEvent *event) {
   // follow the click. Same call shape as the explicit click-relay path
   // (`screenie_relay_overlay_click_at_current_mouse`).
   [target activateWithOptions:0];
+  screenie_update_overlay_mouse_passthrough();
 }
 
 static void screenie_enable_overlay_mouse_for_interaction(void) {
@@ -1458,7 +1561,7 @@ static void screenie_update_overlay_mouse_passthrough(void) {
     return;
   }
 
-  if (screenieOverlayClickRelayActive) {
+  if (screenieOverlayClickRelayActive || screenieOverlayScrollRelayActive) {
     screenie_overlay_set_ignores_mouse(true);
     return;
   }
@@ -1537,6 +1640,7 @@ static void screenie_install_overlay_mouse_monitors(void) {
     screenieOverlayMouseGlobalMonitor =
         [NSEvent addGlobalMonitorForEventsMatchingMask:mask
                                                handler:^(NSEvent *event) {
+      screenie_note_overlay_scroll_passthrough_event(event);
       screenie_update_overlay_mouse_passthrough();
       screenie_note_global_mouse_click_for_refresh(event);
       // Hand key-window status to whichever app the user just clicked
@@ -1555,6 +1659,7 @@ static void screenie_clear_overlay_mouse_passthrough(void) {
   screenieOverlayMouseCaptureActive = false;
   screenieOverlayClickRelayActive = false;
   screenieOverlayClickRelayGeneration++;
+  screenie_cancel_overlay_scroll_relay();
   screenieOverlayCaptureDragEnabled = false;
   screenieOverlayCaptureDragCallback = NULL;
   screenieOverlayCaptureDragRegion =
@@ -1595,6 +1700,7 @@ bool screenie_set_overlay_mouse_capture(void *window_ptr, bool active) {
     if (active) {
       screenieOverlayClickRelayActive = false;
       screenieOverlayClickRelayGeneration++;
+      screenie_cancel_overlay_scroll_relay();
     }
     screenieOverlayMouseCaptureActive = active;
     screenie_update_overlay_mouse_passthrough();
@@ -1637,7 +1743,7 @@ bool screenie_relay_overlay_wheel(void *window_ptr,
   } @catch (NSException *exception) {
     NSLog(@"[screenie] relay overlay wheel exception: %@ %@",
           [exception name], [exception reason]);
-    screenieOverlayClickRelayActive = false;
+    screenie_cancel_overlay_scroll_relay();
     screenie_update_overlay_mouse_passthrough();
     return false;
   }
