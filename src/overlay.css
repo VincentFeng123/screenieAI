@@ -312,6 +312,16 @@ textarea,
   box-shadow: none;
 }
 
+.screenie-input-shell-win-frost {
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.screenie-input-shell-win-frost > :not(.screenie-blurred-backdrop) {
+  position: relative;
+  z-index: 1;
+}
+
 .screenie-textarea::placeholder {
   color: rgba(255, 255, 255, 0.46);
 }

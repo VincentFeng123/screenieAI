@@ -67,8 +67,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CallNextHookEx, CallWindowProcW, DefWindowProcW, EnumWindows,
-    GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+    AllowSetForegroundWindow, CallNextHookEx, CallWindowProcW, DefWindowProcW, EnumChildWindows,
+    EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetForegroundWindow,
     SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
     UnhookWindowsHookEx, GWLP_WNDPROC, GWL_EXSTYLE, HHOOK, HTTRANSPARENT, HWND_TOPMOST,
@@ -284,20 +284,25 @@ pub fn uninstall_overlay_escape_monitor() {
     uninstall_keyboard_hook();
     uninstall_mouse_hook();
     // Clear any leftover transparency state so the next show starts clean.
-    if let Ok(mut g) = overlay_state().lock() {
+    let hwnd_to_clear = if let Ok(mut g) = overlay_state().lock() {
         if let Some(s) = g.as_mut() {
             if s.transparent_now {
-                let hwnd = hwnd_from_raw(s.hwnd_raw);
-                unsafe {
-                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-                    SetWindowLongPtrW(
-                        hwnd,
-                        GWL_EXSTYLE,
-                        (ex & !WS_EX_TRANSPARENT.0) as isize,
-                    );
-                }
                 s.transparent_now = false;
+                Some(s.hwnd_raw)
+            } else {
+                None
             }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(hwnd_raw) = hwnd_to_clear {
+        let hwnd = hwnd_from_raw(hwnd_raw);
+        unsafe {
+            set_hwnd_transparent_style(hwnd, false);
+            set_child_windows_transparent_style(hwnd, false);
         }
     }
 }
@@ -1168,33 +1173,58 @@ fn set_transparent_now(hwnd: HWND, transparent: bool) {
         }
     }
     unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        let new_ex = if transparent {
-            ex | WS_EX_TRANSPARENT.0
-        } else {
-            ex & !WS_EX_TRANSPARENT.0
-        };
-        if new_ex != ex {
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
-            // Extended-style changes via SetWindowLongPtrW don't take
-            // effect on hit testing until the window frame is re-evaluated.
-            // Without `SWP_FRAMECHANGED`, the WS_EX_TRANSPARENT bit can
-            // sit in the style mask without USER32 acknowledging it —
-            // making the click-through hook appear to do nothing. This is
-            // also the belt-and-braces guard for the WndProc subclass: if
-            // WM_NCHITTEST somehow fails, the style flip still passes
-            // clicks through.
-            let _ = SetWindowPos(
-                hwnd,
-                HWND(core::ptr::null_mut()),
-                0,
-                0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
+        // WebView2 is hosted in child HWNDs beneath Tauri's top-level
+        // overlay HWND. Toggling WS_EX_TRANSPARENT only on the parent leaves
+        // those child windows eligible for hit-testing, so the overlay still
+        // eats clicks even though the parent says it is transparent. Apply
+        // the same style to the full child tree whenever passthrough flips.
+        set_hwnd_transparent_style(hwnd, transparent);
+        set_child_windows_transparent_style(hwnd, transparent);
     }
+}
+
+unsafe fn set_child_windows_transparent_style(root: HWND, transparent: bool) {
+    struct ChildStyleState {
+        transparent: bool,
+    }
+
+    unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &*(lparam.0 as *const ChildStyleState);
+        set_hwnd_transparent_style(hwnd, state.transparent);
+        TRUE
+    }
+
+    let state = ChildStyleState { transparent };
+    let _ = EnumChildWindows(root, Some(enum_child), LPARAM(&state as *const _ as isize));
+}
+
+unsafe fn set_hwnd_transparent_style(hwnd: HWND, transparent: bool) {
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    let new_ex = if transparent {
+        ex | WS_EX_TRANSPARENT.0
+    } else {
+        ex & !WS_EX_TRANSPARENT.0
+    };
+    if new_ex == ex {
+        return;
+    }
+
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+    // Extended-style changes via SetWindowLongPtrW don't take effect on hit
+    // testing until the frame is re-evaluated. This matters for both the
+    // top-level overlay and WebView2's child HWNDs.
+    let _ = SetWindowPos(
+        hwnd,
+        HWND(core::ptr::null_mut()),
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
 }
 
 fn apply_mica_backdrop(hwnd: HWND) {

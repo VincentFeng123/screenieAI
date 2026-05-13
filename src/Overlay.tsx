@@ -204,6 +204,9 @@ const OVERLAY_INTERACTION_REGION_SELECTOR = [
   // outside the chat panel, add the appropriate parent class then.
 ].join(", ");
 
+const IS_WINDOWS_PLATFORM =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+
 function collectOverlayInteractionRegions(): OverlayInteractionRegion[] {
   const regions: OverlayInteractionRegion[] = [];
   const viewportW = window.innerWidth;
@@ -2349,7 +2352,9 @@ function Toolbar({
         else submit(t.prompt);
       }} />}
       <div
-        className="screenie-input-shell"
+        className={`screenie-input-shell${
+          IS_WINDOWS_PLATFORM ? " screenie-input-shell-win-frost" : ""
+        }`}
         style={{
           display: "flex",
           alignItems: "flex-end",
@@ -2362,6 +2367,18 @@ function Toolbar({
           minHeight: 32,
         }}
       >
+        {IS_WINDOWS_PLATFORM && (
+          <BlurredBackdrop
+            src={screen.png_base64}
+            screenW={screen.width / dpr}
+            screenH={screen.height / dpr}
+            blurRadius={CHAT_PANEL_FROST.blurRadius}
+            imageBrightness={CHAT_PANEL_FROST.imageBrightness}
+            tint={CHAT_PANEL_FROST.tint}
+            fill={CHAT_PANEL_FROST.fill}
+            persistImage
+          />
+        )}
         <textarea
           ref={taRef}
           rows={1}
