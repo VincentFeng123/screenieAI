@@ -757,6 +757,27 @@ function ShapeControls({ ctl }: { ctl: EditController }) {
         value={ctl.shape.style.color}
         onChange={(c) => ctl.setShape({ style: { color: c } })}
       />
+      <div className="screenie-edit-popover-row">
+        <span className="screenie-edit-popover-label">Fill</span>
+        <div className="screenie-edit-segment">
+          <button
+            type="button"
+            className="screenie-edit-segment-btn"
+            data-active={!ctl.shape.style.fill}
+            onClick={() => ctl.setShape({ style: { fill: false } })}
+          >
+            Hollow
+          </button>
+          <button
+            type="button"
+            className="screenie-edit-segment-btn"
+            data-active={!!ctl.shape.style.fill}
+            onClick={() => ctl.setShape({ style: { fill: true } })}
+          >
+            Filled
+          </button>
+        </div>
+      </div>
       <WidthRow
         label="Stroke"
         value={ctl.shape.style.width}

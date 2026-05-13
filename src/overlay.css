@@ -411,9 +411,8 @@ textarea,
   position: relative;
   /* Frost comes from the per-panel NSVisualEffectView (see
      macos_window.m). Keep this background as a faint tint so the
-     vibrancy reads as a slightly darker frosted glass, matching the
-     toolbar/chat-panel recipe above. */
-  background: rgba(220, 222, 220, 0.20);
+     vibrancy matches the toolbar/textfield surface exactly. */
+  background: rgba(220, 222, 220, 0.04);
   border: none;
   outline: none;
   box-shadow: none;

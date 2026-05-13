@@ -14,6 +14,10 @@ export type StrokeStyle = {
   opacity?: number;
 };
 
+export type ShapeStyle = StrokeStyle & {
+  fill?: boolean;
+};
+
 export type Tool = "marker" | "eraser" | "text" | "shape" | "colorpicker";
 
 export type Shape = "rect" | "ellipse" | "line" | "arrow";
@@ -45,7 +49,7 @@ export type ShapeStroke = {
   kind: Shape;
   a: Point2;
   b: Point2;
-  style: StrokeStyle;
+  style: ShapeStyle;
 };
 
 export type TextStroke = {
@@ -103,10 +107,11 @@ export const DEFAULT_MARKER_STYLE: StrokeStyle = {
   opacity: 1,
 };
 
-export const DEFAULT_SHAPE_STYLE: StrokeStyle = {
+export const DEFAULT_SHAPE_STYLE: ShapeStyle = {
   color: "#ef4444",
   width: 3,
   opacity: 1,
+  fill: false,
 };
 
 export const DEFAULT_TEXT_STYLE: StrokeStyle & { fontSize: number } = {

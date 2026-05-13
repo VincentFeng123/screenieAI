@@ -1107,10 +1107,16 @@ type RectDragOptions = {
   relayClickThrough?: boolean;
 };
 
+type RectDragCallbacks = {
+  onStart?: (kind: "move" | Handle, start: Rect) => void;
+  onCancel?: (kind: "move" | Handle, start: Rect, current: Rect) => void;
+};
+
 function useRectDrag(
   rect: Rect,
   setRect: (r: Rect) => void,
   onEnd?: (next: Rect, start: Rect) => void,
+  callbacks?: RectDragCallbacks,
 ) {
   // Refs that always reflect the latest props — let the registered-once
   // listener read fresh state without re-attaching every render.
@@ -1120,6 +1126,8 @@ function useRectDrag(
   setRectRef.current = setRect;
   const onEndRef = useRef(onEnd);
   onEndRef.current = onEnd;
+  const callbacksRef = useRef(callbacks);
+  callbacksRef.current = callbacks;
 
   const dragRef = useRef<DragSession | null>(null);
 
@@ -1140,7 +1148,8 @@ function useRectDrag(
       // Keep the rect inside the screen — moves stop at edges, resizes
       // shrink the dimension that crosses one.
       const bounds = { W: window.innerWidth, H: window.innerHeight };
-      setRectRef.current(applyDrag(d.start, d.kind, dx, dy, bounds));
+      const next = applyDrag(d.start, d.kind, dx, dy, bounds);
+      setRectRef.current(next);
     };
     const onUp = (e: MouseEvent) => {
       const d = dragRef.current;
@@ -1169,8 +1178,10 @@ function useRectDrag(
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       if (dragRef.current) {
+        const d = dragRef.current;
         dragRef.current = null;
         setOverlayMouseCapture(false);
+        callbacksRef.current?.onCancel?.(d.kind, d.start, rectRef.current);
       }
     };
   }, []);
@@ -1188,6 +1199,7 @@ function useRectDrag(
         relayClickThrough: kind === "move" && !!options?.relayClickThrough,
         dragging: false,
       };
+      callbacksRef.current?.onStart?.(kind, rectRef.current);
       setOverlayMouseCapture(true);
     },
     [],
@@ -1724,6 +1736,12 @@ function AdjustingLayer({
   editCtl: EditController;
   onSend: (prompt: string) => void;
 }) {
+  const [rectDragPreview, setRectDragPreview] = useState<{
+    kind: "move" | Handle;
+    start: Rect;
+    dims: { width: number; height: number };
+  } | null>(null);
+
   // The cropped image dimensions for editing in this phase = scaled rect,
   // since we haven't actually called crop_capture yet. Use device-pixel
   // dimensions so strokes survive the scale into the final cropped PNG.
@@ -1732,35 +1750,51 @@ function AdjustingLayer({
     height: Math.max(1, Math.round(rect.h * dpr)),
   };
 
-  // When the user drags rect handles after annotating, translate the strokes
-  // through screenshot-space so they stay anchored to the underlying pixels.
-  // ResultLayer does the same against its `cropped` image; here the "crop" is
-  // simply the current rect.
+  // Moving the rect carries annotations with the captured zone. Resizing keeps
+  // existing annotations visually fixed on screen and trims anything that no
+  // longer fits in the new crop.
   const onRectDragEnd = useCallback(
     (next: Rect, start: Rect) => {
-      if (!editCtl.hasStrokes) return;
       if (
         next.x === start.x &&
         next.y === start.y &&
         next.w === start.w &&
         next.h === start.h
       ) {
+        setRectDragPreview(null);
         return;
       }
-      const newDims = {
-        width: Math.max(1, Math.round(next.w * dpr)),
-        height: Math.max(1, Math.round(next.h * dpr)),
-      };
-      const oldDims = {
-        width: Math.max(1, Math.round(start.w * dpr)),
-        height: Math.max(1, Math.round(start.h * dpr)),
-      };
-      editCtl.remapForCrop(start, next, oldDims, newDims);
+      if (editCtl.hasStrokes) {
+        const newDims = {
+          width: Math.max(1, Math.round(next.w * dpr)),
+          height: Math.max(1, Math.round(next.h * dpr)),
+        };
+        const oldDims = {
+          width: Math.max(1, Math.round(start.w * dpr)),
+          height: Math.max(1, Math.round(start.h * dpr)),
+        };
+        editCtl.remapForCrop(start, next, oldDims, newDims);
+      }
+      setRectDragPreview(null);
     },
     [editCtl, dpr],
   );
 
-  const beginDrag = useRectDrag(rect, setRect, onRectDragEnd);
+  const beginDrag = useRectDrag(rect, setRect, onRectDragEnd, {
+    onStart: (kind, start) => {
+      setRectDragPreview({
+        kind,
+        start,
+        dims: {
+          width: Math.max(1, Math.round(start.w * dpr)),
+          height: Math.max(1, Math.round(start.h * dpr)),
+        },
+      });
+    },
+    onCancel: () => setRectDragPreview(null),
+  });
+  const resizePreview =
+    rectDragPreview && rectDragPreview.kind !== "move" ? rectDragPreview : null;
 
   // Toolbar bbox + edit anchor, recomputed from rect on every render. The
   // editor lives only in the foreground here (no chat panel during adjusting).
@@ -1899,7 +1933,12 @@ function AdjustingLayer({
         ctl={editCtl}
         rect={rect}
         cropped={editDims}
+        renderRect={resizePreview?.start}
+        renderCropped={resizePreview?.dims}
         active={editCtl.tool !== null}
+        screenPngB64={screen.png_base64}
+        screenW={screen.width / dpr}
+        screenH={screen.height / dpr}
         colorPickerSource={{
           b64: screen.png_base64,
           offsetX: Math.round(rect.x * dpr),
@@ -3365,6 +3404,11 @@ function ResultLayer({
   const [overlapPanelRect, setOverlapPanelRect] = useState<Rect | null>(null);
   const [overlapPanelCursor, setOverlapPanelCursor] = useState("default");
   const [historyPreviewB64, setHistoryPreviewB64] = useState<string | null>(null);
+  const [rectDragPreview, setRectDragPreview] = useState<{
+    kind: "move" | Handle;
+    start: Rect;
+    dims: { width: number; height: number };
+  } | null>(null);
   const overlapPanelSessionRef = useRef<FloatingPanelSession | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -3734,8 +3778,8 @@ function ResultLayer({
   // After a rect drag completes, re-crop so the next user-sent message
   // automatically attaches the new region. The seq guard ensures rapid
   // back-to-back drags don't see an out-of-order crop result clobber the
-  // latest one. Strokes are translated into the new image-space; any that
-  // fall fully outside the new crop are trimmed.
+  // latest one. Moving the rect carries annotations with the captured zone;
+  // resizing keeps existing annotations visually fixed on screen.
   const cropSeqRef = useRef(0);
   const recropAfterDrag = async (newRect: Rect, startRect: Rect) => {
     // No real move — a click on a handle without dragging. Skip the crop work.
@@ -3745,10 +3789,14 @@ function ResultLayer({
       newRect.w === startRect.w &&
       newRect.h === startRect.h
     ) {
+      setRectDragPreview(null);
       return;
     }
     const seq = ++cropSeqRef.current;
-    const oldDims = { width: cropped.width, height: cropped.height };
+    const oldDims = rectDragPreview?.dims ?? {
+      width: cropped.width,
+      height: cropped.height,
+    };
     try {
       const c = await invoke<CroppedCapture>("crop_capture", {
         srcB64: screen.png_base64,
@@ -3766,11 +3814,24 @@ function ResultLayer({
         oldDims,
         { width: c.width, height: c.height },
       );
+      setRectDragPreview(null);
     } catch (e) {
       console.error("recrop failed:", e);
+      if (seq === cropSeqRef.current) setRectDragPreview(null);
     }
   };
-  const beginRectDrag = useRectDrag(rect, setRect, recropAfterDrag);
+  const beginRectDrag = useRectDrag(rect, setRect, recropAfterDrag, {
+    onStart: (kind, start) => {
+      setRectDragPreview({
+        kind,
+        start,
+        dims: { width: cropped.width, height: cropped.height },
+      });
+    },
+    onCancel: () => setRectDragPreview(null),
+  });
+  const resizePreview =
+    rectDragPreview && rectDragPreview.kind !== "move" ? rectDragPreview : null;
 
   // The panel is derived from the capture rect. It uses non-overlapping slots
   // first: right/left, then above/below while reserving space for the prompt
@@ -4030,7 +4091,12 @@ function ResultLayer({
         ctl={editCtl}
         rect={rect}
         cropped={{ width: cropped.width, height: cropped.height }}
+        renderRect={resizePreview?.start}
+        renderCropped={resizePreview?.dims}
         active={editCtl.tool !== null}
+        screenPngB64={screen.png_base64}
+        screenW={screen.width / dpr}
+        screenH={screen.height / dpr}
         colorPickerSource={{
           b64: cropped.png_base64,
           offsetX: 0,

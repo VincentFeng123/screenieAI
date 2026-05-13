@@ -9,6 +9,7 @@ import {
   type EraserStroke,
   type ShapeStroke,
   type Shape,
+  type ShapeStyle,
   type Stroke,
   type StrokeStyle,
   type TextStroke,
@@ -34,7 +35,7 @@ export type EditController = {
   marker: StrokeStyle;
   eraserWidth: number;
   eraserMode: EraserMode;
-  shape: { kind: Shape; style: StrokeStyle };
+  shape: { kind: Shape; style: ShapeStyle };
   text: StrokeStyle & { fontSize: number };
 
   // Trim notification (for the "N marks were trimmed" toast).
@@ -51,9 +52,10 @@ export type EditController = {
   setMarker: (next: Partial<StrokeStyle>) => void;
   setEraserWidth: (next: number) => void;
   setEraserMode: (next: EraserMode) => void;
-  setShape: (next: { kind?: Shape; style?: Partial<StrokeStyle> }) => void;
+  setShape: (next: { kind?: Shape; style?: Partial<ShapeStyle> }) => void;
   setText: (next: Partial<StrokeStyle & { fontSize: number }>) => void;
   addStroke: (s: Stroke) => void;
+  updateStroke: (s: Stroke) => void;
   removeStrokes: (ids: ReadonlySet<string>) => void;
   undo: () => void;
   clear: () => void;
@@ -83,7 +85,7 @@ export function useEditController(): EditController {
   const [marker, setMarkerState] = useState<StrokeStyle>(DEFAULT_MARKER_STYLE);
   const [eraserWidth, setEraserWidthState] = useState<number>(EDIT_ERASER_WIDTHS[1]);
   const [eraserMode, setEraserModeState] = useState<EraserMode>("pixel");
-  const [shape, setShapeState] = useState<{ kind: Shape; style: StrokeStyle }>({
+  const [shape, setShapeState] = useState<{ kind: Shape; style: ShapeStyle }>({
     kind: "rect",
     style: DEFAULT_SHAPE_STYLE,
   });
@@ -126,7 +128,7 @@ export function useEditController(): EditController {
   }, []);
 
   const setShape = useCallback(
-    (next: { kind?: Shape; style?: Partial<StrokeStyle> }) => {
+    (next: { kind?: Shape; style?: Partial<ShapeStyle> }) => {
       setShapeState((prev) => ({
         kind: next.kind ?? prev.kind,
         style: next.style ? { ...prev.style, ...next.style } : prev.style,
@@ -146,6 +148,24 @@ export function useEditController(): EditController {
         return np.length > UNDO_LIMIT ? np.slice(np.length - UNDO_LIMIT) : np;
       });
       return [...prev, s];
+    });
+  }, []);
+
+  /// Object edit path: replace a text/shape stroke after a move or text edit,
+  /// pushing the prior list onto the undo stack as a single step.
+  const updateStroke = useCallback((nextStroke: Stroke) => {
+    setStrokes((prev) => {
+      const idx = prev.findIndex((s) => s.id === nextStroke.id);
+      if (idx === -1) return prev;
+      const prevStroke = prev[idx];
+      if (JSON.stringify(prevStroke) === JSON.stringify(nextStroke)) return prev;
+      setPast((p) => {
+        const np = [...p, prev];
+        return np.length > UNDO_LIMIT ? np.slice(np.length - UNDO_LIMIT) : np;
+      });
+      const next = prev.slice();
+      next[idx] = nextStroke;
+      return next;
     });
   }, []);
 
@@ -182,10 +202,10 @@ export function useEditController(): EditController {
 
   const dismissTrimmedNotice = useCallback(() => setTrimmedNotice(null), []);
 
-  // After the rect is dragged to a new region, translate every stroke from
-  // the old cropped image-space → screenshot-space → new cropped image-space.
-  // Strokes whose bounding box ends up entirely outside the new crop are
-  // dropped. Partially-clipped strokes are kept (canvas clipping handles them).
+  // After the capture rect changes, keep annotations visually stable on resize
+  // and local to the capture zone on pure moves. In practice: dragging the
+  // whole zone carries annotations with it; resizing an edge does not slide
+  // existing annotations across the screen.
   const remapForCrop = useCallback(
     (
       oldRect: { x: number; y: number; w: number; h: number },
@@ -193,20 +213,37 @@ export function useEditController(): EditController {
       oldDims: { width: number; height: number },
       newDims: { width: number; height: number },
     ) => {
-      if (oldRect.w <= 0 || oldRect.h <= 0 || oldDims.width <= 0 || oldDims.height <= 0) {
+      if (
+        oldRect.w <= 0 ||
+        oldRect.h <= 0 ||
+        newRect.w <= 0 ||
+        newRect.h <= 0 ||
+        oldDims.width <= 0 ||
+        oldDims.height <= 0
+      ) {
         return;
       }
-      // Old image-space → screenshot-space scale factors.
-      const sxOld = oldRect.w / oldDims.width;
-      const syOld = oldRect.h / oldDims.height;
-      // Screenshot-space → new image-space scale factors.
-      const sxNew = newDims.width / newRect.w;
-      const syNew = newDims.height / newRect.h;
+      const oldDensityX = oldDims.width / oldRect.w;
+      const oldDensityY = oldDims.height / oldRect.h;
+      const newDensityX = newDims.width / newRect.w;
+      const newDensityY = newDims.height / newRect.h;
+      const resized =
+        Math.abs(newRect.w - oldRect.w) > 0.5 ||
+        Math.abs(newRect.h - oldRect.h) > 0.5;
 
       const remapPt = (p: readonly [number, number]): [number, number] => {
-        const screenX = oldRect.x + p[0] * sxOld;
-        const screenY = oldRect.y + p[1] * syOld;
-        return [(screenX - newRect.x) * sxNew, (screenY - newRect.y) * syNew];
+        if (!resized) {
+          return [
+            p[0] * (newDensityX / oldDensityX),
+            p[1] * (newDensityY / oldDensityY),
+          ];
+        }
+        const screenX = oldRect.x + p[0] / oldDensityX;
+        const screenY = oldRect.y + p[1] / oldDensityY;
+        return [
+          (screenX - newRect.x) * newDensityX,
+          (screenY - newRect.y) * newDensityY,
+        ];
       };
 
       let trimmed = 0;
@@ -214,7 +251,7 @@ export function useEditController(): EditController {
         const next: Stroke[] = [];
         for (const s of prev) {
           const remapped = remapStroke(s, remapPt);
-          if (strokeIntersectsBounds(remapped, newDims.width, newDims.height)) {
+          if (strokeFullyInsideBounds(remapped, newDims.width, newDims.height)) {
             next.push(remapped);
           } else {
             trimmed += 1;
@@ -274,6 +311,7 @@ export function useEditController(): EditController {
     setShape,
     setText,
     addStroke,
+    updateStroke,
     removeStrokes,
     undo,
     clear,
@@ -311,29 +349,41 @@ function remapStroke(
   }
 }
 
-function strokeIntersectsBounds(s: Stroke, w: number, h: number): boolean {
-  // Bounding box test — keep stroke if any part lies inside [0,w] × [0,h].
+function strokeFullyInsideBounds(s: Stroke, w: number, h: number): boolean {
+  // Bounding box test — keep stroke only if its visible bounds sit inside
+  // [0,w] x [0,h]. That prevents clipped annotations from persisting as
+  // hidden state after the capture rect moves.
   let minX = Infinity,
     minY = Infinity,
     maxX = -Infinity,
     maxY = -Infinity;
-  const expand = (x: number, y: number) => {
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
+  const expand = (x: number, y: number, pad = 0) => {
+    if (x - pad < minX) minX = x - pad;
+    if (y - pad < minY) minY = y - pad;
+    if (x + pad > maxX) maxX = x + pad;
+    if (y + pad > maxY) maxY = y + pad;
   };
-  if (s.kind === "marker" || s.kind === "eraser") {
-    for (const [x, y] of s.pts) expand(x, y);
+  if (s.kind === "marker") {
+    const pad = Math.max(1, s.style.width / 2);
+    for (const [x, y] of s.pts) expand(x, y, pad);
+  } else if (s.kind === "eraser") {
+    const pad = Math.max(1, s.width / 2);
+    for (const [x, y] of s.pts) expand(x, y, pad);
   } else if (s.kind === "text") {
     expand(s.at[0], s.at[1]);
-    // Approximate text width by fontSize × 8 chars-worth — generous so we
-    // don't drop labels that are partially in-bounds.
-    expand(s.at[0] + s.style.fontSize * 8, s.at[1] + s.style.fontSize * 1.4);
+    // Canvas text metrics are unavailable here, so use a conservative
+    // sans-serif estimate based on the actual label length.
+    const width = s.style.fontSize * Math.max(s.text.length, 1) * 0.65;
+    expand(s.at[0] + width, s.at[1] + s.style.fontSize * 1.15);
   } else {
-    expand(s.a[0], s.a[1]);
-    expand(s.b[0], s.b[1]);
+    const pad = Math.max(1, s.style.width / 2);
+    const arrowPad =
+      s.kind === "arrow"
+        ? Math.min(Math.max(s.style.width * 3.5, 8), 28)
+        : 0;
+    expand(s.a[0], s.a[1], pad + arrowPad);
+    expand(s.b[0], s.b[1], pad + arrowPad);
   }
   if (!Number.isFinite(minX)) return false;
-  return !(maxX < 0 || minX > w || maxY < 0 || minY > h);
+  return minX >= 0 && minY >= 0 && maxX <= w && maxY <= h;
 }

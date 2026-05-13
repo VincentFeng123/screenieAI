@@ -1,13 +1,16 @@
 import {
+  type CSSProperties,
   useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
   useState,
 } from "react";
+import { Move, Trash2 } from "lucide-react";
 import {
   type EraserStroke,
   type MarkerStroke,
+  type Point2,
   type Shape,
   type ShapeStroke,
   type Stroke,
@@ -15,8 +18,13 @@ import {
   type TextStroke,
 } from "../lib/editTypes";
 import { nextStrokeId, type EditController } from "../lib/useEditController";
+import { BlurredBackdrop, TOOLBAR_FROST } from "./Frosted";
 
 type Rect = { x: number; y: number; w: number; h: number };
+const SELECTION_CONTROL_SIZE = 30;
+const SELECTION_CONTROL_GAP = 4;
+const SELECTION_CONTROLS_W =
+  SELECTION_CONTROL_SIZE * 2 + SELECTION_CONTROL_GAP;
 
 type LiveDraft =
   | { kind: "marker"; pts: Array<[number, number]>; style: StrokeStyle }
@@ -30,12 +38,35 @@ type LiveDraft =
     }
   | { kind: Shape; a: [number, number]; b: [number, number]; style: StrokeStyle };
 
+type EditableStroke = ShapeStroke | TextStroke;
+type SelectedObject = { id: string; kind: "shape" | "text" };
+type ObjectDrag = {
+  id: string;
+  start: EditableStroke;
+  current: EditableStroke;
+  pointerStart: [number, number];
+  dragging: boolean;
+};
+type TextDraft = {
+  id?: string;
+  existing?: boolean;
+  at: [number, number];
+  text: string;
+  style: StrokeStyle & { fontSize: number };
+};
+
 export type EditCanvasProps = {
   ctl: EditController;
   /// On-screen rect (overlay coords) where the canvas should render.
   rect: Rect;
   /// Cropped-image dimensions so we can convert between screen ↔ image space.
   cropped: { width: number; height: number };
+  /// Optional temporary geometry used while the capture rect is being resized.
+  /// The editing model still targets `rect`/`cropped`; this only controls where
+  /// already-committed annotations are painted so they can stay visually fixed
+  /// during a live resize.
+  renderRect?: Rect;
+  renderCropped?: { width: number; height: number };
   /// Tells the canvas whether it's allowed to consume pointer events.
   /// When false, all input falls through (e.g. when the rect itself is being
   /// resized and the editor is closed).
@@ -50,6 +81,11 @@ export type EditCanvasProps = {
     offsetX: number;
     offsetY: number;
   };
+  /// Full-screen capture used to render selected-object controls with the same
+  /// frosted treatment as the edit toolbar.
+  screenPngB64?: string;
+  screenW?: number;
+  screenH?: number;
 };
 
 /// Two-canvas drawing overlay aligned with the on-screen rect.
@@ -66,9 +102,16 @@ export default function EditCanvas({
   ctl,
   rect,
   cropped,
+  renderRect: renderRectProp,
+  renderCropped: renderCroppedProp,
   active,
   colorPickerSource,
+  screenPngB64,
+  screenW,
+  screenH,
 }: EditCanvasProps) {
+  const renderRect = renderRectProp ?? rect;
+  const renderCropped = renderCroppedProp ?? cropped;
   const committedRef = useRef<HTMLCanvasElement | null>(null);
   const liveRef = useRef<HTMLCanvasElement | null>(null);
   const draftRef = useRef<LiveDraft | null>(null);
@@ -81,12 +124,15 @@ export default function EditCanvas({
   // preview is the sole visible layer (otherwise the underlying committed
   // strokes would show through the destination-out cutouts on the live).
   const [eraserDragging, setEraserDragging] = useState(false);
-  type TextDraft = { at: [number, number]; text: string };
   const [textDraft, setTextDraftState] = useState<TextDraft | null>(null);
+  const [selectedObject, setSelectedObject] = useState<SelectedObject | null>(null);
+  const [dragPreviewStroke, setDragPreviewStroke] = useState<EditableStroke | null>(null);
   // Mirror of `textDraft` so synchronous handlers (pointerdown, blur) can
   // read the latest value without waiting for a React render. Updated by
   // every setTextDraft call below.
   const textDraftRef = useRef<TextDraft | null>(null);
+  const hiddenStrokeIdRef = useRef<string | null>(null);
+  const objectDragRef = useRef<ObjectDrag | null>(null);
   const setTextDraft = useCallback((next: TextDraft | null) => {
     textDraftRef.current = next;
     setTextDraftState(next);
@@ -99,6 +145,8 @@ export default function EditCanvas({
   strokesRef.current = ctl.strokes;
   const croppedRef = useRef(cropped);
   croppedRef.current = cropped;
+  const renderCroppedRef = useRef(renderCropped);
+  renderCroppedRef.current = renderCropped;
   const rectRef = useRef(rect);
   rectRef.current = rect;
   const ctlRef = useRef(ctl);
@@ -168,13 +216,14 @@ export default function EditCanvas({
   const redrawCommitted = useCallback((strokes: Stroke[]) => {
     const canvas = committedRef.current;
     if (!canvas) return;
-    const dims = croppedRef.current;
+    const dims = renderCroppedRef.current;
     canvas.width = dims.width;
     canvas.height = dims.height;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, dims.width, dims.height);
     for (const s of strokes) {
+      if (s.id === hiddenStrokeIdRef.current) continue;
       drawStrokeOnLayer(ctx, s, dims);
     }
   }, []);
@@ -183,33 +232,50 @@ export default function EditCanvas({
   useLayoutEffect(() => {
     redrawCommitted(ctl.strokes);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ctl.strokes, cropped.width, cropped.height]);
+  }, [ctl.strokes, renderCropped.width, renderCropped.height]);
 
   // Sync the live canvas size when the cropped dimensions change.
   useLayoutEffect(() => {
     const canvas = liveRef.current;
     if (!canvas) return;
-    canvas.width = cropped.width;
-    canvas.height = cropped.height;
-  }, [cropped.width, cropped.height]);
+    canvas.width = renderCropped.width;
+    canvas.height = renderCropped.height;
+  }, [renderCropped.width, renderCropped.height]);
 
   const tool = ctl.tool;
 
-  const screenToImage = useCallback(
-    (clientX: number, clientY: number): [number, number] => {
+  const screenToImageInfo = useCallback(
+    (clientX: number, clientY: number): { point: [number, number]; inside: boolean } => {
       const canvas = liveRef.current;
-      if (!canvas) return [0, 0];
+      if (!canvas) return { point: [0, 0], inside: false };
       const box = canvas.getBoundingClientRect();
-      const sx = cropped.width / box.width;
-      const sy = cropped.height / box.height;
+      if (box.width <= 0 || box.height <= 0) {
+        return { point: [0, 0], inside: false };
+      }
+      const sx = renderCropped.width / box.width;
+      const sy = renderCropped.height / box.height;
       const ix = (clientX - box.left) * sx;
       const iy = (clientY - box.top) * sy;
-      return [
-        clamp(ix, 0, cropped.width),
-        clamp(iy, 0, cropped.height),
-      ];
+      const inside =
+        ix >= 0 &&
+        ix <= renderCropped.width &&
+        iy >= 0 &&
+        iy <= renderCropped.height;
+      return {
+        point: [
+          clamp(ix, 0, renderCropped.width),
+          clamp(iy, 0, renderCropped.height),
+        ],
+        inside,
+      };
     },
-    [cropped.width, cropped.height],
+    [renderCropped.width, renderCropped.height],
+  );
+
+  const screenToImage = useCallback(
+    (clientX: number, clientY: number): [number, number] =>
+      screenToImageInfo(clientX, clientY).point,
+    [screenToImageInfo],
   );
 
   const drawLiveDraft = useCallback(() => {
@@ -217,7 +283,7 @@ export default function EditCanvas({
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const dims = croppedRef.current;
+    const dims = renderCroppedRef.current;
     ctx.clearRect(0, 0, dims.width, dims.height);
     const d = draftRef.current;
     if (!d) return;
@@ -308,21 +374,312 @@ export default function EditCanvas({
     if (!draft) return;
     textDraftRef.current = null;
     setTextDraftState(null);
+    hiddenStrokeIdRef.current = null;
     const trimmed = draft.text.trim();
-    if (!trimmed) return;
-    const r = rectRef.current;
-    const c = croppedRef.current;
-    const scale = r.w > 0 ? c.width / r.w : 1;
-    const userText = ctlRef.current.text;
+    if (!trimmed) {
+      if (draft.id && draft.existing) {
+        ctlRef.current.removeStrokes(new Set([draft.id]));
+      }
+      setSelectedObject(null);
+      redrawCommitted(strokesRef.current.filter((s) => s.id !== draft.id));
+      return;
+    }
     const stroke: TextStroke = {
-      id: nextStrokeId(),
+      id: draft.id ?? nextStrokeId(),
       kind: "text",
       at: draft.at,
       text: trimmed,
-      style: { ...userText, fontSize: userText.fontSize * scale },
+      style: draft.style,
     };
-    ctlRef.current.addStroke(stroke);
+    if (!strokeFullyWithinBounds(stroke, croppedRef.current)) {
+      if (draft.id && draft.existing) {
+        ctlRef.current.removeStrokes(new Set([draft.id]));
+      }
+      setSelectedObject(null);
+      redrawCommitted(strokesRef.current.filter((s) => s.id !== draft.id));
+      return;
+    }
+    if (draft.existing) {
+      ctlRef.current.updateStroke(stroke);
+    } else {
+      ctlRef.current.addStroke(stroke);
+    }
+    setSelectedObject(draft.existing ? { id: stroke.id, kind: "text" } : null);
+    redrawCommitted(
+      draft.existing
+        ? strokesRef.current.map((s) => (s.id === stroke.id ? stroke : s))
+        : [...strokesRef.current, stroke],
+    );
+  }, [redrawCommitted]);
+
+  const clearLiveLayer = useCallback(() => {
+    const canvas = liveRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const dims = renderCroppedRef.current;
+    ctx?.clearRect(0, 0, dims.width, dims.height);
   }, []);
+
+  const drawLiveStroke = useCallback((stroke: EditableStroke) => {
+    const canvas = liveRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const dims = renderCroppedRef.current;
+    ctx.clearRect(0, 0, dims.width, dims.height);
+    drawStrokeOnLayer(ctx, stroke, dims);
+  }, []);
+
+  const openTextDraftForStroke = useCallback(
+    (stroke: TextStroke) => {
+      const draft: TextDraft = {
+        id: stroke.id,
+        existing: true,
+        at: [...stroke.at] as [number, number],
+        text: stroke.text,
+        style: { ...stroke.style },
+      };
+      hiddenStrokeIdRef.current = stroke.id;
+      setSelectedObject({ id: stroke.id, kind: "text" });
+      setTextDraft(draft);
+      redrawCommitted(strokesRef.current);
+    },
+    [redrawCommitted, setTextDraft],
+  );
+
+  const finishObjectDrag = useCallback(() => {
+    const drag = objectDragRef.current;
+    if (!drag) return;
+    objectDragRef.current = null;
+    clearLiveLayer();
+    const moved = !sameEditableStroke(drag.start, drag.current);
+    if (drag.current.kind === "text") {
+      const current = drag.current as TextStroke;
+      if (textDraftRef.current?.id === drag.id) {
+        setTextDraft({
+          ...textDraftRef.current,
+          at: [...current.at] as [number, number],
+        });
+        // Keep the original stroke hidden while its input is open; commitDraft
+        // will replace it when editing finishes.
+        setDragPreviewStroke(null);
+        redrawCommitted(strokesRef.current);
+        return;
+      }
+      hiddenStrokeIdRef.current = null;
+      if (moved && strokeFullyWithinBounds(current, croppedRef.current)) {
+        setDragPreviewStroke(current);
+        ctlRef.current.updateStroke(current);
+        redrawCommitted(
+          strokesRef.current.map((s) =>
+            s.id === current.id ? current : s,
+          ),
+        );
+      } else {
+        redrawCommitted(strokesRef.current);
+        setDragPreviewStroke(null);
+      }
+      setSelectedObject({ id: drag.id, kind: "text" });
+      return;
+    }
+
+    hiddenStrokeIdRef.current = null;
+    if (moved && strokeFullyWithinBounds(drag.current, croppedRef.current)) {
+      setDragPreviewStroke(drag.current);
+      ctlRef.current.updateStroke(drag.current);
+      redrawCommitted(
+        strokesRef.current.map((s) =>
+          s.id === drag.current.id ? drag.current : s,
+        ),
+      );
+    } else {
+      redrawCommitted(strokesRef.current);
+      setDragPreviewStroke(null);
+    }
+    setSelectedObject({ id: drag.id, kind: "shape" });
+  }, [clearLiveLayer, redrawCommitted, setTextDraft]);
+
+  useEffect(() => {
+    if (!dragPreviewStroke || objectDragRef.current) return;
+    if (selectedObject?.id !== dragPreviewStroke.id) {
+      setDragPreviewStroke(null);
+      return;
+    }
+    const committed = selectedEditableStroke(
+      {
+        id: dragPreviewStroke.id,
+        kind: dragPreviewStroke.kind === "text" ? "text" : "shape",
+      },
+      null,
+      null,
+      ctl.strokes,
+    );
+    if (committed && sameEditableStroke(committed, dragPreviewStroke)) {
+      setDragPreviewStroke(null);
+    }
+  }, [ctl.strokes, dragPreviewStroke, selectedObject?.id]);
+
+  const beginSelectedObjectDrag = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) return;
+      const stroke = selectedEditableStroke(
+        selectedObject,
+        textDraftRef.current,
+        dragPreviewStroke,
+        strokesRef.current,
+      );
+      if (!stroke) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const at = screenToImage(event.clientX, event.clientY);
+      objectDragRef.current = {
+        id: stroke.id,
+        start: stroke,
+        current: stroke,
+        pointerStart: at,
+        dragging: false,
+      };
+      setDragPreviewStroke(stroke);
+      if (stroke.kind === "text" && textDraftRef.current?.id === stroke.id) {
+        clearLiveLayer();
+      } else {
+        hiddenStrokeIdRef.current = stroke.id;
+        redrawCommitted(strokesRef.current);
+        drawLiveStroke(stroke);
+      }
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+    },
+    [
+      clearLiveLayer,
+      drawLiveStroke,
+      redrawCommitted,
+      screenToImage,
+      dragPreviewStroke,
+      selectedObject,
+    ],
+  );
+
+  const moveSelectedObjectDrag = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      const drag = objectDragRef.current;
+      if (!drag) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const at = screenToImage(event.clientX, event.clientY);
+      const dx = at[0] - drag.pointerStart[0];
+      const dy = at[1] - drag.pointerStart[1];
+      if (!drag.dragging && Math.hypot(dx, dy) < 3) return;
+      drag.dragging = true;
+      drag.current = translateEditableStrokeWithinBounds(
+        drag.start,
+        dx,
+        dy,
+        croppedRef.current,
+      );
+      setDragPreviewStroke(drag.current);
+      if (drag.current.kind === "text" && textDraftRef.current?.id === drag.id) {
+        setTextDraft({
+          ...textDraftRef.current,
+          at: [...(drag.current as TextStroke).at] as [number, number],
+        });
+        clearLiveLayer();
+        return;
+      }
+      drawLiveStroke(drag.current);
+    },
+    [clearLiveLayer, drawLiveStroke, screenToImage, setTextDraft],
+  );
+
+  const endSelectedObjectDrag = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (!objectDragRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      finishObjectDrag();
+    },
+    [finishObjectDrag],
+  );
+
+  const dismissSelectedObject = useCallback(
+    (event?: React.PointerEvent<HTMLElement>) => {
+      event?.preventDefault();
+      event?.stopPropagation();
+      commitDraft();
+      objectDragRef.current = null;
+      hiddenStrokeIdRef.current = null;
+      setSelectedObject(null);
+      setDragPreviewStroke(null);
+      clearLiveLayer();
+      redrawCommitted(strokesRef.current);
+    },
+    [clearLiveLayer, commitDraft, redrawCommitted],
+  );
+
+  const selectExistingStroke = useCallback(
+    (strokeId: string, event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      const stroke = strokesRef.current.find((s): s is EditableStroke =>
+        isEditableStroke(s) && s.id === strokeId,
+      );
+      if (!stroke) return;
+      const atInfo = screenToImageInfo(event.clientX, event.clientY);
+      if (
+        !atInfo.inside ||
+        !pointHitsEditableStroke(stroke, atInfo.point, croppedRef.current)
+      ) {
+        dismissSelectedObject(event);
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      if (ctlRef.current.popoverOpen) ctlRef.current.setPopoverOpen(false);
+      commitDraft();
+      clearLiveLayer();
+      setDragPreviewStroke(null);
+      if (stroke.kind === "text" && ctlRef.current.tool === "text") {
+        openTextDraftForStroke(stroke);
+        return;
+      }
+      hiddenStrokeIdRef.current = null;
+      setSelectedObject({
+        id: stroke.id,
+        kind: stroke.kind === "text" ? "text" : "shape",
+      });
+      redrawCommitted(strokesRef.current);
+    },
+    [
+      clearLiveLayer,
+      commitDraft,
+      dismissSelectedObject,
+      openTextDraftForStroke,
+      redrawCommitted,
+      screenToImageInfo,
+    ],
+  );
+
+  const deleteSelectedObject = useCallback(() => {
+    const draft = textDraftRef.current;
+    if (draft) {
+      textDraftRef.current = null;
+      setTextDraftState(null);
+      hiddenStrokeIdRef.current = null;
+      if (draft.id && draft.existing) {
+        ctlRef.current.removeStrokes(new Set([draft.id]));
+        redrawCommitted(strokesRef.current.filter((s) => s.id !== draft.id));
+      } else {
+        redrawCommitted(strokesRef.current);
+      }
+      setDragPreviewStroke(null);
+      setSelectedObject(null);
+      return;
+    }
+    const selected = selectedObject;
+    if (!selected) return;
+    ctlRef.current.removeStrokes(new Set([selected.id]));
+    setSelectedObject(null);
+    setDragPreviewStroke(null);
+    redrawCommitted(strokesRef.current.filter((s) => s.id !== selected.id));
+  }, [redrawCommitted, selectedObject]);
 
   const onPointerDown = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
@@ -330,13 +687,33 @@ export default function EditCanvas({
       if (event.button !== 0) return;
       event.stopPropagation();
       event.preventDefault();
-      const at = screenToImage(event.clientX, event.clientY);
+      const atInfo = screenToImageInfo(event.clientX, event.clientY);
+      if (!atInfo.inside) return;
+      const at = atInfo.point;
       (event.target as Element).setPointerCapture?.(event.pointerId);
 
       // Any pointer-down inside the canvas means the user is acting on the
       // image (drawing, placing). Fade the per-tool settings panel out so
       // it doesn't cover the captured region while they work.
       if (ctl.popoverOpen) ctl.setPopoverOpen(false);
+
+      if (tool === "text") {
+        const hit = findTopmostTextAt(strokesRef.current, at, croppedRef.current);
+        if (hit) {
+          commitDraft();
+          openTextDraftForStroke(hit);
+          return;
+        }
+      } else if (tool === "shape") {
+        const hit = findTopmostShapeAt(strokesRef.current, at);
+        if (hit) {
+          commitDraft();
+          setSelectedObject({ id: hit.id, kind: "shape" });
+          return;
+        }
+      } else {
+        setSelectedObject(null);
+      }
 
       // Color picker is a one-shot sample on click; doesn't begin a drag.
       if (tool === "colorpicker") {
@@ -379,6 +756,7 @@ export default function EditCanvas({
           hitIdsRef.current = new Set();
         }
       } else if (tool === "shape") {
+        setSelectedObject(null);
         draftRef.current = {
           kind: ctl.shape.kind,
           a: at,
@@ -392,7 +770,20 @@ export default function EditCanvas({
         // commit is synchronous and idempotent — onBlur firing afterwards
         // is a no-op because commitDraft cleared the ref.
         commitDraft();
-        setTextDraft({ at, text: "" });
+        setSelectedObject(null);
+        setDragPreviewStroke(null);
+        const r = rectRef.current;
+        const c = croppedRef.current;
+        const scale = r.w > 0 ? c.width / r.w : 1;
+        const userText = ctlRef.current.text;
+        const draftId = nextStrokeId();
+        setTextDraft({
+          id: draftId,
+          existing: false,
+          at,
+          text: "",
+          style: { ...userText, fontSize: userText.fontSize * scale },
+        });
       }
       drawLiveDraft();
     },
@@ -404,16 +795,43 @@ export default function EditCanvas({
       ctl.eraserMode,
       ctl.shape,
       drawLiveDraft,
-      screenToImage,
+      screenToImageInfo,
       commitDraft,
+      openTextDraftForStroke,
       setTextDraft,
     ],
   );
 
   const onPointerMove = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
+      const drag = objectDragRef.current;
+      if (drag) {
+        const at = screenToImage(event.clientX, event.clientY);
+        const dx = at[0] - drag.pointerStart[0];
+        const dy = at[1] - drag.pointerStart[1];
+        if (!drag.dragging && Math.hypot(dx, dy) < 3) return;
+        drag.dragging = true;
+        drag.current = translateEditableStrokeWithinBounds(
+          drag.start,
+          dx,
+          dy,
+          croppedRef.current,
+        );
+        if (drag.current.kind === "text" && textDraftRef.current?.id === drag.id) {
+          setTextDraft({
+            ...textDraftRef.current,
+            at: [...(drag.current as TextStroke).at] as [number, number],
+          });
+          clearLiveLayer();
+          return;
+        }
+        drawLiveStroke(drag.current);
+        return;
+      }
       if (!draggingRef.current) return;
-      const at = screenToImage(event.clientX, event.clientY);
+      const atInfo = screenToImageInfo(event.clientX, event.clientY);
+      if (!atInfo.inside) return;
+      const at = atInfo.point;
       const d = draftRef.current;
       if (!d) return;
       if (d.kind === "marker" || d.kind === "eraser") {
@@ -434,11 +852,23 @@ export default function EditCanvas({
       }
       drawLiveDraft();
     },
-    [drawLiveDraft, screenToImage],
+    [
+      clearLiveLayer,
+      drawLiveDraft,
+      drawLiveStroke,
+      screenToImage,
+      screenToImageInfo,
+      setTextDraft,
+    ],
   );
 
   const onPointerUp = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
+      if (objectDragRef.current) {
+        finishObjectDrag();
+        void event;
+        return;
+      }
       if (!draggingRef.current) return;
       draggingRef.current = false;
       const d = draftRef.current;
@@ -497,34 +927,117 @@ export default function EditCanvas({
           hitIdsRef.current = new Set();
         }
       } else {
-        ctl.addStroke({
+        const shapeStroke = {
           id: nextStrokeId(),
           kind: d.kind,
           a: d.a,
           b: d.b,
           style: d.style,
-        } as ShapeStroke);
+        } as ShapeStroke;
+        if (!strokeFullyWithinBounds(shapeStroke, dims)) return;
+        ctl.addStroke(shapeStroke);
+        setSelectedObject(null);
       }
       void event;
     },
-    [ctl, eraserDragging, redrawCommitted],
+    [ctl, eraserDragging, finishObjectDrag, redrawCommitted],
   );
 
   // If the tool changes away from text while a draft is open, commit it.
   useEffect(() => {
     if (tool !== "text") commitDraft();
-  }, [tool, commitDraft]);
+    if (tool === "marker" || tool === "eraser" || tool === "colorpicker") {
+      objectDragRef.current = null;
+      hiddenStrokeIdRef.current = null;
+      setSelectedObject(null);
+      setDragPreviewStroke(null);
+      clearLiveLayer();
+      redrawCommitted(strokesRef.current);
+      return;
+    }
+    if (tool !== "shape" && hiddenStrokeIdRef.current && !textDraftRef.current) {
+      hiddenStrokeIdRef.current = null;
+      clearLiveLayer();
+      redrawCommitted(strokesRef.current);
+    }
+  }, [tool, commitDraft, clearLiveLayer, redrawCommitted]);
+
+  // Collapsing the edit toolbar should not leave an empty transient text
+  // object behind. Existing edited text is committed; brand-new empty drafts
+  // are simply discarded by commitDraft's trim check.
+  useEffect(() => {
+    if (ctl.open) return;
+    commitDraft();
+    setSelectedObject(null);
+    hiddenStrokeIdRef.current = null;
+    setDragPreviewStroke(null);
+    clearLiveLayer();
+    redrawCommitted(strokesRef.current);
+  }, [ctl.open, commitDraft, clearLiveLayer, redrawCommitted]);
+
+  useLayoutEffect(() => {
+    if (!textDraft) return;
+    textInputRef.current?.focus();
+    textInputRef.current?.select();
+  }, [textDraft?.id]);
 
   // Convert the text-draft image-space anchor into screen coords for the
   // floating <input>'s position.
-  const textDraftScreen: { left: number; top: number; fontSize: number } | null =
+  const imageToScreen = useCallback(
+    (p: Point2): [number, number] => [
+      renderRect.x + (p[0] / renderCropped.width) * renderRect.w,
+      renderRect.y + (p[1] / renderCropped.height) * renderRect.h,
+    ],
+    [
+      renderCropped.height,
+      renderCropped.width,
+      renderRect.h,
+      renderRect.w,
+      renderRect.x,
+      renderRect.y,
+    ],
+  );
+
+  const textDraftScreen: { left: number; top: number; fontSize: number; color: string } | null =
     textDraft
       ? {
-          left: rect.x + (textDraft.at[0] / cropped.width) * rect.w,
-          top: rect.y + (textDraft.at[1] / cropped.height) * rect.h,
-          fontSize: ctl.text.fontSize,
+          left: renderRect.x + (textDraft.at[0] / renderCropped.width) * renderRect.w,
+          top: renderRect.y + (textDraft.at[1] / renderCropped.height) * renderRect.h,
+          fontSize:
+            (textDraft.style.fontSize / Math.max(renderCropped.width, 1)) *
+            renderRect.w,
+          color: textDraft.style.color,
         }
       : null;
+
+  const rawSelectedControlsPlacement = selectedObject
+    ? controlsPlacementForSelection(
+        selectedObject,
+        textDraft,
+        dragPreviewStroke,
+        strokesRef.current,
+        imageToScreen,
+        renderCropped,
+      )
+    : null;
+  const selectedControlsPlacement = rawSelectedControlsPlacement
+    ? clampControlsPlacement(rawSelectedControlsPlacement, renderRect)
+    : null;
+  const objectSelectionEnabled =
+    tool !== "marker" && tool !== "eraser" && tool !== "colorpicker";
+  const annotationHitTargets = objectSelectionEnabled
+    ? ctl.strokes
+        .filter((s): s is EditableStroke => isEditableStroke(s))
+        .filter((s) => s.id !== hiddenStrokeIdRef.current)
+        .map((s) => ({
+          stroke: s,
+          style: hitTargetStyleForStroke(s, imageToScreen, renderCropped, renderRect),
+        }))
+        .filter(
+          (item): item is { stroke: EditableStroke; style: CSSProperties } =>
+            item.style !== null,
+        )
+    : [];
 
   return (
     <>
@@ -541,10 +1054,10 @@ export default function EditCanvas({
         }}
         style={{
           position: "absolute",
-          left: rect.x,
-          top: rect.y,
-          width: rect.w,
-          height: rect.h,
+          left: renderRect.x,
+          top: renderRect.y,
+          width: renderRect.w,
+          height: renderRect.h,
           pointerEvents: active && tool ? "auto" : "none",
           cursor: cursorForTool(tool, active),
           zIndex: 6,
@@ -576,6 +1089,27 @@ export default function EditCanvas({
           }}
         />
       </div>
+      {selectedObject && (
+        <div
+          aria-hidden
+          onPointerDown={dismissSelectedObject}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "transparent",
+            zIndex: 11,
+            pointerEvents: "auto",
+          }}
+        />
+      )}
+      {annotationHitTargets.map(({ stroke, style }) => (
+        <div
+          key={`annotation-hit-${stroke.id}`}
+          aria-hidden
+          onPointerDown={(e) => selectExistingStroke(stroke.id, e)}
+          style={style}
+        />
+      ))}
       {textDraftScreen && (
         <input
           ref={textInputRef}
@@ -587,7 +1121,16 @@ export default function EditCanvas({
             setTextDraft(
               textDraftRef.current
                 ? { ...textDraftRef.current, text: v }
-                : { at: [0, 0], text: v },
+                : {
+                    at: [0, 0],
+                    text: v,
+                    style: {
+                      ...ctl.text,
+                      fontSize:
+                        ctl.text.fontSize *
+                        (cropped.width / Math.max(rect.w, 1)),
+                    },
+                  },
             );
           }}
           onKeyDown={(e) => {
@@ -598,6 +1141,11 @@ export default function EditCanvas({
             } else if (e.key === "Escape") {
               e.preventDefault();
               setTextDraft(null);
+              hiddenStrokeIdRef.current = null;
+              setSelectedObject(null);
+              setDragPreviewStroke(null);
+              clearLiveLayer();
+              redrawCommitted(strokesRef.current);
             }
           }}
           onBlur={commitDraft}
@@ -614,7 +1162,7 @@ export default function EditCanvas({
             fontSize: textDraftScreen.fontSize,
             lineHeight: 1,
             fontWeight: 600,
-            color: ctl.text.color,
+            color: textDraftScreen.color,
             background: "transparent",
             border: "none",
             padding: 0,
@@ -623,6 +1171,84 @@ export default function EditCanvas({
             zIndex: 14,
           }}
         />
+      )}
+      {selectedControlsPlacement && (
+        <div
+          style={{
+            position: "absolute",
+            left: selectedControlsPlacement.left,
+            top: selectedControlsPlacement.top,
+            width: SELECTION_CONTROLS_W,
+            height: SELECTION_CONTROL_SIZE,
+            display: "flex",
+            gap: SELECTION_CONTROL_GAP,
+            zIndex: 15,
+            pointerEvents: "auto",
+          }}
+        >
+          <button
+            type="button"
+            className="screenie-edit-pill screenie-action-btn"
+            aria-label="Move selected annotation"
+            title="Move"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onPointerDown={beginSelectedObjectDrag}
+            onPointerMove={moveSelectedObjectDrag}
+            onPointerUp={endSelectedObjectDrag}
+            onPointerCancel={endSelectedObjectDrag}
+            style={selectionControlButtonStyle("grab")}
+          >
+            {screenPngB64 && screenW && screenH && (
+              <BlurredBackdrop
+                src={screenPngB64}
+                screenW={screenW}
+                screenH={screenH}
+                blurRadius={TOOLBAR_FROST.blurRadius}
+                imageBrightness={TOOLBAR_FROST.imageBrightness}
+                tint={TOOLBAR_FROST.tint}
+                fill={TOOLBAR_FROST.fill}
+                persistImage
+              />
+            )}
+            <span style={{ position: "relative", zIndex: 1, display: "flex" }}>
+              <Move size={14} strokeWidth={2} aria-hidden />
+            </span>
+          </button>
+          <button
+            type="button"
+            className="screenie-edit-pill screenie-action-btn"
+            aria-label="Delete selected annotation"
+            title="Delete"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onClick={(e) => {
+              e.stopPropagation();
+              deleteSelectedObject();
+            }}
+            style={selectionControlButtonStyle("pointer")}
+          >
+            {screenPngB64 && screenW && screenH && (
+              <BlurredBackdrop
+                src={screenPngB64}
+                screenW={screenW}
+                screenH={screenH}
+                blurRadius={TOOLBAR_FROST.blurRadius}
+                imageBrightness={TOOLBAR_FROST.imageBrightness}
+                tint={TOOLBAR_FROST.tint}
+                fill={TOOLBAR_FROST.fill}
+                persistImage
+              />
+            )}
+            <span style={{ position: "relative", zIndex: 1, display: "flex" }}>
+              <Trash2 size={14} strokeWidth={2} aria-hidden />
+            </span>
+          </button>
+        </div>
       )}
     </>
   );
@@ -635,6 +1261,316 @@ function cursorForTool(tool: EditController["tool"], active: boolean): string {
   if (tool === "text") return "text";
   if (tool === "colorpicker") return "crosshair";
   return "crosshair";
+}
+
+function isShapeStroke(stroke: Stroke): stroke is ShapeStroke {
+  return (
+    stroke.kind === "rect" ||
+    stroke.kind === "ellipse" ||
+    stroke.kind === "line" ||
+    stroke.kind === "arrow"
+  );
+}
+
+function isEditableStroke(stroke: Stroke): stroke is EditableStroke {
+  return stroke.kind === "text" || isShapeStroke(stroke);
+}
+
+function findTopmostTextAt(
+  strokes: Stroke[],
+  point: Point2,
+  dims: { width: number; height: number },
+): TextStroke | null {
+  for (let i = strokes.length - 1; i >= 0; i--) {
+    const s = strokes[i];
+    if (s.kind !== "text") continue;
+    const b = strokeBounds(s, dims);
+    if (
+      point[0] >= b.x0 &&
+      point[0] <= b.x1 &&
+      point[1] >= b.y0 &&
+      point[1] <= b.y1
+    ) {
+      return s;
+    }
+  }
+  return null;
+}
+
+function findTopmostShapeAt(strokes: Stroke[], point: Point2): ShapeStroke | null {
+  for (let i = strokes.length - 1; i >= 0; i--) {
+    const s = strokes[i];
+    if (!isShapeStroke(s)) continue;
+    if (shapeHitTest(s, point[0], point[1])) return s;
+  }
+  return null;
+}
+
+function pointHitsEditableStroke(
+  stroke: EditableStroke,
+  point: Point2,
+  dims: { width: number; height: number },
+): boolean {
+  if (stroke.kind === "text") {
+    const b = strokeBounds(stroke, dims);
+    return (
+      point[0] >= b.x0 &&
+      point[0] <= b.x1 &&
+      point[1] >= b.y0 &&
+      point[1] <= b.y1
+    );
+  }
+  return shapeHitTest(stroke, point[0], point[1]);
+}
+
+function textDraftToStroke(draft: TextDraft): TextStroke {
+  return {
+    id: draft.id ?? "draft",
+    kind: "text",
+    at: draft.at,
+    text: draft.text,
+    style: draft.style,
+  };
+}
+
+function selectedEditableStroke(
+  selected: SelectedObject | null,
+  draft: TextDraft | null,
+  preview: EditableStroke | null,
+  strokes: Stroke[],
+): EditableStroke | null {
+  if (!selected) return null;
+  if (draft?.id === selected.id) return textDraftToStroke(draft);
+  if (preview?.id === selected.id) return preview;
+  return (
+    strokes.find((s): s is EditableStroke =>
+      selected.kind === "text"
+        ? s.kind === "text" && s.id === selected.id
+        : isShapeStroke(s) && s.id === selected.id,
+    ) ?? null
+  );
+}
+
+function sameEditableStroke(a: EditableStroke, b: EditableStroke): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function translateEditableStrokeWithinBounds(
+  stroke: EditableStroke,
+  dx: number,
+  dy: number,
+  dims: { width: number; height: number },
+): EditableStroke {
+  const b = strokeBounds(stroke, dims);
+  const minDx = -b.x0;
+  const maxDx = dims.width - b.x1;
+  const minDy = -b.y0;
+  const maxDy = dims.height - b.y1;
+  const tx = clamp(dx, minDx, maxDx);
+  const ty = clamp(dy, minDy, maxDy);
+  if (stroke.kind === "text") {
+    return {
+      ...stroke,
+      at: [stroke.at[0] + tx, stroke.at[1] + ty],
+    };
+  }
+  return {
+    ...stroke,
+    a: [stroke.a[0] + tx, stroke.a[1] + ty],
+    b: [stroke.b[0] + tx, stroke.b[1] + ty],
+  };
+}
+
+function strokeFullyWithinBounds(
+  stroke: EditableStroke,
+  dims: { width: number; height: number },
+): boolean {
+  const b = strokeBounds(stroke, dims);
+  return b.x0 >= 0 && b.y0 >= 0 && b.x1 <= dims.width && b.y1 <= dims.height;
+}
+
+function strokeBounds(
+  stroke: EditableStroke,
+  _dims: { width: number; height: number },
+): { x0: number; y0: number; x1: number; y1: number } {
+  if (stroke.kind === "text") {
+    const metrics = measureTextStroke(stroke);
+    return {
+      x0: stroke.at[0],
+      y0: stroke.at[1],
+      x1: stroke.at[0] + metrics.width,
+      y1: stroke.at[1] + metrics.height,
+    };
+  }
+  const pad = Math.max(1, stroke.style.width / 2);
+  if (stroke.kind === "ellipse" || stroke.kind === "rect") {
+    return {
+      x0: Math.min(stroke.a[0], stroke.b[0]) - pad,
+      y0: Math.min(stroke.a[1], stroke.b[1]) - pad,
+      x1: Math.max(stroke.a[0], stroke.b[0]) + pad,
+      y1: Math.max(stroke.a[1], stroke.b[1]) + pad,
+    };
+  }
+  const head =
+    stroke.kind === "arrow"
+      ? Math.min(Math.max(stroke.style.width * 3.5, 8), 28)
+      : 0;
+  const extra = pad + head;
+  return {
+    x0: Math.min(stroke.a[0], stroke.b[0]) - extra,
+    y0: Math.min(stroke.a[1], stroke.b[1]) - extra,
+    x1: Math.max(stroke.a[0], stroke.b[0]) + extra,
+    y1: Math.max(stroke.a[1], stroke.b[1]) + extra,
+  };
+}
+
+function shapeHitTest(stroke: ShapeStroke, x: number, y: number): boolean {
+  const radius = Math.max(8, stroke.style.width + 5);
+  if (stroke.kind === "rect") {
+    const x0 = Math.min(stroke.a[0], stroke.b[0]);
+    const y0 = Math.min(stroke.a[1], stroke.b[1]);
+    const x1 = Math.max(stroke.a[0], stroke.b[0]);
+    const y1 = Math.max(stroke.a[1], stroke.b[1]);
+    if (
+      stroke.style.fill &&
+      x >= x0 &&
+      x <= x1 &&
+      y >= y0 &&
+      y <= y1
+    ) {
+      return true;
+    }
+    return (
+      pointSegDistSq(x, y, x0, y0, x1, y0) <= radius * radius ||
+      pointSegDistSq(x, y, x1, y0, x1, y1) <= radius * radius ||
+      pointSegDistSq(x, y, x1, y1, x0, y1) <= radius * radius ||
+      pointSegDistSq(x, y, x0, y1, x0, y0) <= radius * radius
+    );
+  }
+  if (stroke.kind === "line" || stroke.kind === "arrow") {
+    return (
+      pointSegDistSq(x, y, stroke.a[0], stroke.a[1], stroke.b[0], stroke.b[1]) <=
+      radius * radius
+    );
+  }
+  const cx = (stroke.a[0] + stroke.b[0]) / 2;
+  const cy = (stroke.a[1] + stroke.b[1]) / 2;
+  const rx = Math.abs(stroke.b[0] - stroke.a[0]) / 2;
+  const ry = Math.abs(stroke.b[1] - stroke.a[1]) / 2;
+  if (rx <= 0 || ry <= 0) return false;
+  const nx = (x - cx) / rx;
+  const ny = (y - cy) / ry;
+  const d = Math.hypot(nx, ny);
+  if (stroke.style.fill && d <= 1) return true;
+  const avgR = (rx + ry) / 2;
+  return Math.abs(d - 1) <= radius / Math.max(avgR, 1);
+}
+
+let textMeasureCanvas: HTMLCanvasElement | null = null;
+function measureTextStroke(stroke: TextStroke): { width: number; height: number } {
+  if (textMeasureCanvas === null) {
+    textMeasureCanvas = document.createElement("canvas");
+  }
+  const ctx = textMeasureCanvas.getContext("2d");
+  const fontSize = stroke.style.fontSize;
+  if (!ctx) {
+    return {
+      width: fontSize * Math.max(stroke.text.length, 1) * 0.6,
+      height: fontSize * 1.15,
+    };
+  }
+  ctx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+  return {
+    width: Math.max(1, ctx.measureText(stroke.text || " ").width),
+    height: fontSize * 1.15,
+  };
+}
+
+function controlsPlacementForSelection(
+  selected: SelectedObject,
+  draft: TextDraft | null,
+  preview: EditableStroke | null,
+  strokes: Stroke[],
+  imageToScreen: (p: Point2) => [number, number],
+  dims: { width: number; height: number },
+): { left: number; top: number } | null {
+  const stroke = selectedEditableStroke(selected, draft, preview, strokes);
+  if (!stroke) return null;
+  const b = strokeBounds(stroke, dims);
+  const [sx0] = imageToScreen([b.x0, b.y1]);
+  const [sx1, sy1] = imageToScreen([b.x1, b.y1]);
+  return { left: (sx0 + sx1 - SELECTION_CONTROLS_W) / 2, top: sy1 + 8 };
+}
+
+function clampControlsPlacement(
+  placement: { left: number; top: number },
+  rect: Rect,
+): { left: number; top: number } {
+  const height = SELECTION_CONTROL_SIZE;
+  const maxLeft = Math.max(rect.x, rect.x + rect.w - SELECTION_CONTROLS_W);
+  const maxTop = Math.max(rect.y, rect.y + rect.h - height);
+  return {
+    left: clamp(placement.left, rect.x, maxLeft),
+    top: clamp(placement.top, rect.y, maxTop),
+  };
+}
+
+function hitTargetStyleForStroke(
+  stroke: EditableStroke,
+  imageToScreen: (p: Point2) => [number, number],
+  dims: { width: number; height: number },
+  rect: Rect,
+): CSSProperties | null {
+  const b = strokeBounds(stroke, dims);
+  if (![b.x0, b.y0, b.x1, b.y1].every(Number.isFinite)) return null;
+  const [sx0, sy0] = imageToScreen([b.x0, b.y0]);
+  const [sx1, sy1] = imageToScreen([b.x1, b.y1]);
+  const pad = stroke.kind === "text" ? 4 : 6;
+  const minSize = stroke.kind === "text" ? 10 : 14;
+  const cx = (sx0 + sx1) / 2;
+  const cy = (sy0 + sy1) / 2;
+  const width = Math.max(Math.abs(sx1 - sx0) + pad * 2, minSize);
+  const height = Math.max(Math.abs(sy1 - sy0) + pad * 2, minSize);
+  const left = clamp(cx - width / 2, rect.x, rect.x + rect.w);
+  const top = clamp(cy - height / 2, rect.y, rect.y + rect.h);
+  const right = clamp(cx + width / 2, rect.x, rect.x + rect.w);
+  const bottom = clamp(cy + height / 2, rect.y, rect.y + rect.h);
+  if (right <= left || bottom <= top) return null;
+  return {
+    position: "absolute",
+    left,
+    top,
+    width: right - left,
+    height: bottom - top,
+    background: "transparent",
+    cursor: "pointer",
+    zIndex: 13,
+    pointerEvents: "auto",
+  };
+}
+
+function selectionControlButtonStyle(
+  cursor: CSSProperties["cursor"],
+): CSSProperties {
+  return {
+    position: "relative",
+    width: SELECTION_CONTROL_SIZE,
+    height: SELECTION_CONTROL_SIZE,
+    minWidth: SELECTION_CONTROL_SIZE,
+    minHeight: SELECTION_CONTROL_SIZE,
+    padding: 0,
+    border: "none",
+    borderRadius: 9999,
+    color: "rgba(255, 255, 255, 0.95)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden",
+    pointerEvents: "auto",
+    cursor,
+    transition: "none",
+    transform: "none",
+  };
 }
 
 function drawStrokeOnLayer(
@@ -736,6 +1672,7 @@ function drawShape(ctx: CanvasRenderingContext2D, stroke: ShapeStroke): void {
     const y = Math.min(ay, by);
     const w = Math.abs(bx - ax);
     const h = Math.abs(by - ay);
+    if (stroke.style.fill) ctx.fillRect(x, y, w, h);
     ctx.strokeRect(x, y, w, h);
   } else if (stroke.kind === "ellipse") {
     const cx = (ax + bx) / 2;
@@ -744,6 +1681,7 @@ function drawShape(ctx: CanvasRenderingContext2D, stroke: ShapeStroke): void {
     const ry = Math.abs(by - ay) / 2;
     ctx.beginPath();
     ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+    if (stroke.style.fill) ctx.fill();
     ctx.stroke();
   } else if (stroke.kind === "line") {
     ctx.beginPath();
@@ -830,6 +1768,15 @@ function strokeHitByEraserPoint(
     const y0 = Math.min(stroke.a[1], stroke.b[1]);
     const x1 = Math.max(stroke.a[0], stroke.b[0]);
     const y1 = Math.max(stroke.a[1], stroke.b[1]);
+    if (
+      stroke.style.fill &&
+      x >= x0 - radius &&
+      x <= x1 + radius &&
+      y >= y0 - radius &&
+      y <= y1 + radius
+    ) {
+      return true;
+    }
     return (
       pointSegDistSq(x, y, x0, y0, x1, y0) <= r2 ||
       pointSegDistSq(x, y, x1, y0, x1, y1) <= r2 ||
@@ -853,6 +1800,9 @@ function strokeHitByEraserPoint(
     const nx = (x - cx) / rx;
     const ny = (y - cy) / ry;
     const d = Math.hypot(nx, ny);
+    if (stroke.style.fill && d <= 1 + radius / Math.max((rx + ry) / 2, 1)) {
+      return true;
+    }
     const avgR = (rx + ry) / 2;
     const tol = (radius + stroke.style.width / 2) / Math.max(avgR, 1);
     return Math.abs(d - 1) <= tol;
