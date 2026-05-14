@@ -1717,12 +1717,13 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
 fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     // Mirror of the macOS `show_overlay_window` setup: configure the window
     // styles + exclude-self capture flag, show it without activating, push it
-    // to topmost, and install the low-level keyboard + mouse hooks (Esc
-    // consumption and per-region click-through). Also start the background-
-    // change observer — the Windows analogue of macOS's
-    // `screenie_install_overlay_deactivate_hider` + space/window-list poll —
-    // which emits `overlay-background-changed` to React whenever the visible
-    // top-level window list changes, so the frosted backdrop stays fresh.
+    // to topmost, start the continuous backdrop stream, and install the
+    // low-level keyboard + mouse hooks (Esc consumption and per-region
+    // click-through). The old window-list background observer is deliberately
+    // not started on Windows: when no-hide capture fails it pushes the
+    // frontend into the legacy hide-and-recapture fallback, which reads as
+    // repeated overlay flashing. The continuous stream keeps the frosted
+    // panels fresh without hiding the window.
     //
     // CRITICAL: low-level hooks (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) only fire
     // on a thread with a Win32 message loop — Microsoft's docs say the OS
@@ -1745,10 +1746,6 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     windows_window::start_overlay_continuous_capture(app);
     if let Err(e) = app.run_on_main_thread(|| {
         let _ = windows_window::install_overlay_escape_monitor();
-        // Background observer doesn't share the hook's message-loop
-        // requirement (it's a tokio interval task), but moving it inside
-        // this dispatch keeps the show-overlay sequencing clean.
-        windows_window::start_overlay_background_observer();
     }) {
         eprintln!(
             "[screenie] show_overlay_window: main-thread dispatch failed: {e}"
@@ -1756,7 +1753,6 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
         // Fall back to in-place install — hooks won't fire, but the
         // overlay at least appears so the user can dismiss it.
         let _ = windows_window::install_overlay_escape_monitor();
-        windows_window::start_overlay_background_observer();
     }
 }
 

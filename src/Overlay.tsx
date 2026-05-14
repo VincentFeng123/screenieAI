@@ -207,6 +207,20 @@ const OVERLAY_INTERACTION_REGION_SELECTOR = [
 const IS_WINDOWS_PLATFORM =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
+const TOOLBAR_PANEL_FROST = {
+  blurRadius: 26,
+  imageBrightness: 0.64,
+  tint: "rgba(34, 36, 35, 0.43)",
+  fill: "rgba(18, 19, 18, 0.17)",
+} as const;
+
+// Windows renders overlay frost from screenshot-backed bitmap layers. Use the
+// chat panel recipe for the outer prompt container so the full textfield
+// region reads as the same material. The textarea itself stays transparent.
+const PROMPT_TOOLBAR_FROST = IS_WINDOWS_PLATFORM
+  ? CHAT_PANEL_FROST
+  : TOOLBAR_PANEL_FROST;
+
 function collectOverlayInteractionRegions(): OverlayInteractionRegion[] {
   const regions: OverlayInteractionRegion[] = [];
   const viewportW = window.innerWidth;
@@ -788,6 +802,13 @@ export default function Overlay() {
         try {
           next = await invoke<ScreenCapture>("refresh_overlay_backdrop_capture");
         } catch (sckError) {
+          if (IS_WINDOWS_PLATFORM) {
+            console.warn(
+              "refresh_overlay_backdrop_capture failed; skipping Windows hide/re-show fallback:",
+              sckError,
+            );
+            throw sckError;
+          }
           console.warn("refresh_overlay_backdrop_capture failed, falling back:", sckError);
           usedLegacyRefresh = true;
           hideForRefresh();
@@ -2341,10 +2362,10 @@ function Toolbar({
         src={screen.png_base64}
         screenW={screen.width / dpr}
         screenH={screen.height / dpr}
-        blurRadius={26}
-        imageBrightness={0.64}
-        tint="rgba(34, 36, 35, 0.43)"
-        fill="rgba(18, 19, 18, 0.17)"
+        blurRadius={PROMPT_TOOLBAR_FROST.blurRadius}
+        imageBrightness={PROMPT_TOOLBAR_FROST.imageBrightness}
+        tint={PROMPT_TOOLBAR_FROST.tint}
+        fill={PROMPT_TOOLBAR_FROST.fill}
         persistImage
       />
       {showPresets && <PresetChipRow disabled={disabled} onPick={(t) => {
@@ -2352,9 +2373,7 @@ function Toolbar({
         else submit(t.prompt);
       }} />}
       <div
-        className={`screenie-input-shell${
-          IS_WINDOWS_PLATFORM ? " screenie-input-shell-win-frost" : ""
-        }`}
+        className="screenie-input-shell"
         style={{
           display: "flex",
           alignItems: "flex-end",
@@ -2367,18 +2386,6 @@ function Toolbar({
           minHeight: 32,
         }}
       >
-        {IS_WINDOWS_PLATFORM && (
-          <BlurredBackdrop
-            src={screen.png_base64}
-            screenW={screen.width / dpr}
-            screenH={screen.height / dpr}
-            blurRadius={CHAT_PANEL_FROST.blurRadius}
-            imageBrightness={CHAT_PANEL_FROST.imageBrightness}
-            tint={CHAT_PANEL_FROST.tint}
-            fill={CHAT_PANEL_FROST.fill}
-            persistImage
-          />
-        )}
         <textarea
           ref={taRef}
           rows={1}
