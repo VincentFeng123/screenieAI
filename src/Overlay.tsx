@@ -229,6 +229,18 @@ function collectOverlayInteractionRegions(): OverlayInteractionRegion[] {
   document
     .querySelectorAll<HTMLElement>(OVERLAY_INTERACTION_REGION_SELECTOR)
     .forEach((el) => {
+      // Windows/WebView2 click-through is implemented by toggling
+      // WS_EX_TRANSPARENT on the host HWNDs. Treating the full capture rect as
+      // interactive makes every hover across the selected pixels flip that
+      // style and can visibly drop/repaint the overlay. Keep the rect as a
+      // visual/pass-through surface on Windows; the toolbar, chat, handles,
+      // and narrow move strips remain native hit regions.
+      // The rect still renders normally; this only keeps it out of the
+      // native mouse-active list.
+      if (IS_WINDOWS_PLATFORM && el.classList.contains("screenie-capture-region")) {
+        return;
+      }
+
       const style = window.getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") return;
       if (style.pointerEvents === "none") return;
