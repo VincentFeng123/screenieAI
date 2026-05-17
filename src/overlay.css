@@ -12,6 +12,16 @@
 html {
   -webkit-user-select: none;
   user-select: none;
+  --screenie-acrylic-surface:
+    linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.22) 0%,
+      rgba(255, 255, 255, 0.08) 34%,
+      rgba(7, 9, 9, 0.22) 100%
+    ),
+    rgba(24, 27, 26, 0.58);
+  --screenie-acrylic-border: rgba(255, 255, 255, 0.16);
+  --screenie-acrylic-highlight: rgba(255, 255, 255, 0.20);
 }
 input,
 textarea,
@@ -35,21 +45,23 @@ textarea,
    These rules assume the host element is NOT transformed — the chat panel
    and toolbar wrap their frosted surface in an outer animation/positioning
    layer so backdrop-filter never lives on a transformed node. */
-/* Overlay surfaces. The frost itself is now drawn by a native
-   NSVisualEffectView mounted behind the WebView at this panel's viewport
-   rect (see macos_window.m + useOverlayFrostRegions in Overlay.tsx). The
-   panel's own CSS background is a faint dark wash that tints the live
-   vibrancy without hiding it. CSS `backdrop-filter` is intentionally NOT
-   used here — it doesn't actually compute against the desktop on a
-   transparent overlay window. */
+/* Overlay surfaces. The live frost itself is native vibrancy on macOS and a
+   screenshot-backed BlurredBackdrop on Windows. This CSS layer is still
+   load-bearing: it gives every non-transparent container a visible acrylic
+   body when native/WebView blur is delayed or unavailable. */
 .screenie-chat-panel,
 .screenie-toolbar,
 .screenie-hint {
   position: relative;
-  background: rgba(220, 222, 220, 0.04);
+  background: var(--screenie-acrylic-surface);
+  -webkit-backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
+  backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
   border: none;
   outline: none;
-  box-shadow: none;
+  box-shadow:
+    inset 0 0 0 1px var(--screenie-acrylic-border),
+    inset 0 1px 0 var(--screenie-acrylic-highlight),
+    inset 0 -28px 72px rgba(0, 0, 0, 0.18);
   box-sizing: border-box;
   color: rgba(255, 255, 255, 0.95);
   isolation: isolate;
@@ -226,11 +238,8 @@ textarea,
   white-space: nowrap;
 }
 
-/* Mirrors the chat panel / toolbar recipe: translucent dark base + bitmap
-   blur via a child <BlurredBackdrop> (the JSX passes `persistImage` so the
-   bitmap never fades — keeps the pill from going transparent on a WebKit
-   backdrop-filter glitch). The CSS backdrop-filter is kept too, but the
-   bitmap is the load-bearing layer here. */
+/* Mirrors the chat panel / toolbar recipe: visible acrylic base + bitmap
+   blur via a child <BlurredBackdrop> when one is mounted. */
 .screenie-action {
   position: relative;
   display: inline-flex;
@@ -241,10 +250,13 @@ textarea,
   font-weight: 500;
   font-family: inherit;
   color: rgba(255, 255, 255, 0.95);
-  /* Native NSVisualEffectView is mounted behind this pill; the bg here
-     is just a tint over the live vibrancy. */
-  background: rgba(220, 222, 220, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: var(--screenie-acrylic-surface);
+  -webkit-backdrop-filter: blur(26px) saturate(145%) brightness(0.88);
+  backdrop-filter: blur(26px) saturate(145%) brightness(0.88);
+  border: 1px solid var(--screenie-acrylic-border);
+  box-shadow:
+    inset 0 1px 0 var(--screenie-acrylic-highlight),
+    inset 0 -18px 46px rgba(0, 0, 0, 0.16);
   cursor: pointer;
   isolation: isolate;
   overflow: hidden;
@@ -392,7 +404,9 @@ textarea,
   .screenie-edit-pill,
   .screenie-edit-popover,
   .screenie-hint {
-    background: rgba(54, 56, 54, 0.94);
+    background:
+      linear-gradient(145deg, rgba(70, 74, 72, 0.86), rgba(28, 30, 30, 0.92)),
+      rgba(38, 40, 39, 0.94);
   }
 }
 
@@ -409,13 +423,15 @@ textarea,
 .screenie-edit-pill,
 .screenie-edit-popover {
   position: relative;
-  /* Frost comes from the per-panel NSVisualEffectView (see
-     macos_window.m). Keep this background as a faint tint so the
-     vibrancy matches the toolbar/textfield surface exactly. */
-  background: rgba(220, 222, 220, 0.04);
+  background: var(--screenie-acrylic-surface);
+  -webkit-backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
+  backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
   border: none;
   outline: none;
-  box-shadow: none;
+  box-shadow:
+    inset 0 0 0 1px var(--screenie-acrylic-border),
+    inset 0 1px 0 var(--screenie-acrylic-highlight),
+    inset 0 -22px 58px rgba(0, 0, 0, 0.17);
   box-sizing: border-box;
   color: rgba(255, 255, 255, 0.95);
   isolation: isolate;

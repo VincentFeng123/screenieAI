@@ -208,10 +208,10 @@ const IS_WINDOWS_PLATFORM =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
 const TOOLBAR_PANEL_FROST = {
-  blurRadius: 26,
-  imageBrightness: 0.64,
-  tint: "rgba(34, 36, 35, 0.43)",
-  fill: "rgba(18, 19, 18, 0.17)",
+  blurRadius: 30,
+  imageBrightness: 0.58,
+  tint: "rgba(42, 45, 44, 0.58)",
+  fill: "rgba(10, 12, 12, 0.26)",
 } as const;
 
 // Windows renders overlay frost from screenshot-backed bitmap layers. Use the
@@ -1471,10 +1471,10 @@ function ActionsBar({
               src={screenPngB64}
               screenW={screenCssW}
               screenH={screenCssH}
-              blurRadius={26}
-              imageBrightness={0.64}
-              tint="rgba(34, 36, 35, 0.43)"
-              fill="rgba(18, 19, 18, 0.17)"
+              blurRadius={PROMPT_TOOLBAR_FROST.blurRadius}
+              imageBrightness={PROMPT_TOOLBAR_FROST.imageBrightness}
+              tint={PROMPT_TOOLBAR_FROST.tint}
+              fill={PROMPT_TOOLBAR_FROST.fill}
               persistImage
             />
             <span style={{ position: "relative", zIndex: 1, display: "flex" }}>
@@ -1742,10 +1742,10 @@ function CursorCallout({
           src={screen.png_base64}
           screenW={screen.width / dpr}
           screenH={screen.height / dpr}
-          blurRadius={26}
-          imageBrightness={0.64}
-          tint="rgba(34, 36, 35, 0.43)"
-          fill="rgba(18, 19, 18, 0.17)"
+          blurRadius={PROMPT_TOOLBAR_FROST.blurRadius}
+          imageBrightness={PROMPT_TOOLBAR_FROST.imageBrightness}
+          tint={PROMPT_TOOLBAR_FROST.tint}
+          fill={PROMPT_TOOLBAR_FROST.fill}
           persistImage
         />
         <span style={{ position: "relative", zIndex: 1 }}>{text}</span>
@@ -3312,10 +3312,10 @@ function ToastPill({
           src={screen.png_base64}
           screenW={screen.width / dpr}
           screenH={screen.height / dpr}
-          blurRadius={26}
-          imageBrightness={0.64}
-          tint="rgba(34, 36, 35, 0.43)"
-          fill="rgba(18, 19, 18, 0.17)"
+          blurRadius={PROMPT_TOOLBAR_FROST.blurRadius}
+          imageBrightness={PROMPT_TOOLBAR_FROST.imageBrightness}
+          tint={PROMPT_TOOLBAR_FROST.tint}
+          fill={PROMPT_TOOLBAR_FROST.fill}
           persistImage
         />
         <span style={{ position: "relative", zIndex: 1 }}>{children}</span>
@@ -4474,10 +4474,10 @@ function ResultLayer({
               src={screen.png_base64}
               screenW={screen.width / dpr}
               screenH={screen.height / dpr}
-              blurRadius={26}
-              imageBrightness={0.64}
-              tint="rgba(34, 36, 35, 0.43)"
-              fill="rgba(18, 19, 18, 0.17)"
+              blurRadius={PROMPT_TOOLBAR_FROST.blurRadius}
+              imageBrightness={PROMPT_TOOLBAR_FROST.imageBrightness}
+              tint={PROMPT_TOOLBAR_FROST.tint}
+              fill={PROMPT_TOOLBAR_FROST.fill}
               persistImage
             />
             <span style={{ position: "relative", zIndex: 1, display: "flex" }}>
@@ -5414,10 +5414,10 @@ function Hint({
           src={screen.png_base64}
           screenW={screen.width / dpr}
           screenH={screen.height / dpr}
-          blurRadius={26}
-          imageBrightness={0.64}
-          tint="rgba(34, 36, 35, 0.43)"
-          fill="rgba(18, 19, 18, 0.17)"
+          blurRadius={PROMPT_TOOLBAR_FROST.blurRadius}
+          imageBrightness={PROMPT_TOOLBAR_FROST.imageBrightness}
+          tint={PROMPT_TOOLBAR_FROST.tint}
+          fill={PROMPT_TOOLBAR_FROST.fill}
           persistImage
         />
         <span style={{ position: "relative", zIndex: 1 }}>{text}</span>

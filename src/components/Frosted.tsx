@@ -63,16 +63,16 @@ const WIN_BLUR_MAX = 32;
 // Saturation boost mirrors the slight saturation lift NSVisualEffectMaterial.sidebar
 // applies — without it the static-bitmap blur reads as a gray mush instead of
 // faintly tinted glass.
-const WIN_SATURATION = 1.4;
+const WIN_SATURATION = 1.55;
 
 function WindowsBlurredBackdrop({
   src,
   screenW,
   screenH,
   blurRadius = 24,
-  imageBrightness = 0.7,
-  tint = "rgba(34, 36, 35, 0.43)",
-  fill = "rgba(18, 19, 18, 0.17)",
+  imageBrightness = 0.58,
+  tint = "rgba(42, 45, 44, 0.58)",
+  fill = "rgba(10, 12, 12, 0.26)",
 }: {
   src: string;
   screenW: number;
@@ -343,16 +343,16 @@ export function SvgInsetBorder({
 /// CSS recipe (background + backdrop-filter) and the inner BlurredBackdrop tuning
 /// the toolbar uses. Reused by the edit pill so its background is identical.
 export const TOOLBAR_FROST = {
-  blurRadius: 26,
-  imageBrightness: 0.64,
-  tint: "rgba(34, 36, 35, 0.43)",
-  fill: "rgba(18, 19, 18, 0.17)",
+  blurRadius: 30,
+  imageBrightness: 0.58,
+  tint: "rgba(42, 45, 44, 0.58)",
+  fill: "rgba(10, 12, 12, 0.26)",
 } as const;
 
 /// Frost recipe matching `.screenie-chat-panel` — slightly cooler/darker.
 export const CHAT_PANEL_FROST = {
   blurRadius: 32,
-  imageBrightness: 0.64,
-  tint: "rgba(34, 36, 35, 0.50)",
-  fill: "rgba(18, 19, 18, 0.20)",
+  imageBrightness: 0.55,
+  tint: "rgba(34, 37, 37, 0.64)",
+  fill: "rgba(8, 10, 10, 0.30)",
 } as const;
