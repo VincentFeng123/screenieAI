@@ -130,8 +130,8 @@ function relayOverlayPointerClick(button: number) {
 }
 
 // Track scroll-gesture phase for the first tick that JS relays. Native then
-// keeps the overlay mouse-transparent for the rest of the scroll burst, so
-// follow-up trackpad/mouse-wheel events reach the app underneath directly.
+// forces hit tests through for the rest of the scroll burst, so follow-up
+// trackpad/mouse-wheel events reach the app underneath directly.
 // Phase values match kCGScrollPhase: 1=Began, 2=Changed. Windows ignores the
 // phase value because Win32 SendInput has no gesture-phase concept.
 const WHEEL_PHASE_BEGAN = 1;
@@ -229,14 +229,10 @@ function collectOverlayInteractionRegions(): OverlayInteractionRegion[] {
   document
     .querySelectorAll<HTMLElement>(OVERLAY_INTERACTION_REGION_SELECTOR)
     .forEach((el) => {
-      // Windows/WebView2 click-through is implemented by toggling
-      // WS_EX_TRANSPARENT on the host HWNDs. Treating the full capture rect as
-      // interactive makes every hover across the selected pixels flip that
-      // style and can visibly drop/repaint the overlay. Keep the rect as a
-      // visual/pass-through surface on Windows; the toolbar, chat, handles,
+      // Windows/WebView2 click-through is implemented with native hit-test
+      // passthrough. Keep the full capture rect out of the interactive list
+      // so it remains a visual/pass-through surface; toolbar, chat, handles,
       // and narrow move strips remain native hit regions.
-      // The rect still renders normally; this only keeps it out of the
-      // native mouse-active list.
       if (IS_WINDOWS_PLATFORM && el.classList.contains("screenie-capture-region")) {
         return;
       }
@@ -924,7 +920,7 @@ export default function Overlay() {
 
   // Hidden Tauri webviews can occasionally miss a custom event while being
   // re-shown. Opportunistically check for a pending capture so the window
-  // cannot remain transparent.
+  // cannot remain visually empty.
   useEffect(() => {
     const hydrate = () => {
       if (document.visibilityState === "hidden") return;
@@ -1933,7 +1929,7 @@ function AdjustingLayer({
           ...selectionRectStyle(rect),
           boxShadow: `0 0 0 9999px rgba(0,0,0,0.58)`,
           cursor: "default",
-          pointerEvents: editCtl.tool ? "none" : "auto",
+          pointerEvents: IS_WINDOWS_PLATFORM || editCtl.tool ? "none" : "auto",
         }}
         onMouseDown={beginDrag("move", { relayClickThrough: true })}
         onWheel={(e) => {
@@ -4098,7 +4094,7 @@ function ResultLayer({
           boxSizing: "border-box",
           borderRadius: 2,
           cursor: "default",
-          pointerEvents: editCtl.tool ? "none" : "auto",
+          pointerEvents: IS_WINDOWS_PLATFORM || editCtl.tool ? "none" : "auto",
         }}
       />
       {moveHitAreas(rect).map((style, i) => (

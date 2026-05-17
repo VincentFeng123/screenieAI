@@ -1060,10 +1060,9 @@ fn set_overlay_interaction_regions(
     #[cfg(target_os = "windows")]
     {
         // React drives this from a useLayoutEffect on every render; the
-        // Windows side stores the rects and a low-level mouse hook
-        // toggles WS_EX_TRANSPARENT on the overlay HWND based on whether
-        // the cursor is inside one of them — same UX as the macOS
-        // `ignoresMouseEvents` toggle.
+        // Windows side stores the rects and answers WM_NCHITTEST with
+        // HTTRANSPARENT outside them — same UX as the macOS
+        // `ignoresMouseEvents` toggle, without hover-time style flips.
         let _ = &window;
         let tuples = regions.into_iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
         windows_window::set_overlay_interaction_regions(tuples, passthrough_enabled);
@@ -1129,8 +1128,8 @@ fn set_overlay_mouse_capture(window: WebviewWindow, active: bool) -> Result<(), 
     #[cfg(target_os = "windows")]
     {
         // Match the macOS path: forward the JS-driven drag state to the
-        // native side so the WH_MOUSE_LL hook stops re-evaluating
-        // `WS_EX_TRANSPARENT` from the cursor position until the drag ends.
+        // native side so WM_NCHITTEST keeps the overlay mouse-active until
+        // the drag ends.
         let _ = &window;
         windows_window::set_overlay_mouse_capture(active);
     }
@@ -1150,10 +1149,10 @@ fn relay_overlay_pointer_click(window: WebviewWindow, button: i32) -> Result<(),
     }
     #[cfg(target_os = "windows")]
     {
-        // Mirror of the macOS click-relay: temporarily set
-        // `WS_EX_TRANSPARENT` on the overlay and SendInput a synthetic
-        // click at the cursor so the app underneath receives it (and
-        // activates normally via WM_MOUSEACTIVATE).
+        // Mirror of the macOS click-relay: temporarily force hit tests to
+        // HTTRANSPARENT and SendInput a synthetic click at the cursor so the
+        // app underneath receives it (and activates normally via
+        // WM_MOUSEACTIVATE).
         let _ = &window;
         windows_window::relay_overlay_pointer_click(button);
     }
@@ -1718,8 +1717,9 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     // Mirror of the macOS `show_overlay_window` setup: configure the window
     // styles + exclude-self capture flag, show it without activating, push it
     // to topmost, start the continuous backdrop stream, and install the
-    // low-level keyboard + mouse hooks (Esc consumption and per-region
-    // click-through). The old window-list background observer is deliberately
+    // low-level keyboard/mouse hooks (Esc consumption + stuck-drag cleanup).
+    // Per-region click-through is handled by WM_NCHITTEST subclasses. The
+    // old window-list background observer is deliberately
     // not started on Windows: when no-hide capture fails it pushes the
     // frontend into the legacy hide-and-recapture fallback, which reads as
     // repeated overlay flashing. The continuous stream keeps the frosted
@@ -1731,9 +1731,8 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     // dispatches them via its message pump. Tokio worker threads have no
     // message loop, so installing the hooks here directly (this function
     // is called from `tauri::async_runtime::spawn`'d tasks) leaves both
-    // hooks dormant: Esc never gets consumed and `WS_EX_TRANSPARENT` is
-    // never toggled — making the overlay swallow every click instead of
-    // letting it fall through to the app underneath. Dispatching to the
+    // hooks dormant: Esc never gets consumed and stuck drags never clear.
+    // Dispatching to the
     // main UI thread (which Tauri runs the wry/winit message pump on)
     // puts the hooks on a thread that actually pumps. The macOS bridge
     // already follows this same pattern via `app.run_on_main_thread`.
