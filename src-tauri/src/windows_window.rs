@@ -13,9 +13,10 @@
 //!   macOS's `NSStatusWindowLevel`.
 //!
 //! - Partial click-through: a JS-supplied list of interactive rects, enforced
-//!   by `WM_NCHITTEST` subclasses on the overlay and WebView2 child HWNDs.
-//!   Empty overlay regions pass clicks through to apps underneath while the
-//!   overlay remains visually present; interactive panels receive input.
+//!   by `WM_NCHITTEST` subclasses on the overlay and direct WebView2 host
+//!   child HWNDs. Empty overlay regions pass clicks through to apps underneath
+//!   while the overlay remains visually present; interactive panels receive
+//!   input.
 //!
 //! - Esc consumption: a low-level keyboard hook (`WH_KEYBOARD_LL`) returns
 //!   `LRESULT(1)` for Esc while the overlay is visible, so fullscreen
@@ -45,7 +46,7 @@ use core::ffi::c_void;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
+    BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
@@ -69,14 +70,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CallNextHookEx, EnumChildWindows, EnumWindows, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
-    SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GWL_EXSTYLE, HHOOK, HTTRANSPARENT,
-    HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LWA_ALPHA, MA_NOACTIVATE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONUP,
-    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, SetLayeredWindowAttributes,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
+    IsWindowVisible, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GW_CHILD, GW_HWNDNEXT,
+    GWL_EXSTYLE, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 // `windows-rs 0.58` represents every HANDLE-style type as
@@ -309,6 +310,31 @@ pub fn set_overlay_interaction_regions(
 
 pub fn clear_overlay_interaction_regions() {
     set_overlay_interaction_regions(Vec::new(), false);
+}
+
+/// Reset native hit testing for a freshly-triggered capture. The React side
+/// will enter selecting mode, which must receive mouse input across the whole
+/// overlay so the user can drag out the first rect. This also clears any stale
+/// relay/capture flags left from a previous hidden overlay session.
+pub fn prepare_overlay_for_new_capture() {
+    CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+    CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
+    MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+
+    let hwnd_to_clear = if let Ok(mut g) = overlay_state().lock() {
+        if let Some(s) = g.as_mut() {
+            s.regions.clear();
+            s.passthrough_enabled = false;
+            Some(s.hwnd_raw)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(hwnd_raw) = hwnd_to_clear {
+        clear_transparent_styles_on_main(hwnd_raw);
+    }
 }
 
 pub fn set_overlay_text_input_focused(focused: bool) {
@@ -661,13 +687,13 @@ fn get_hwnd(window: &WebviewWindow) -> Option<HWND> {
 // and scroll fall through to the app underneath while the overlay keeps
 // rendering normally.
 //
-// The subclass is installed on both the top-level overlay HWND and WebView2's
-// child HWNDs. That avoids the old approach of toggling `WS_EX_TRANSPARENT`
-// across the child tree on hover, which caused WebView2 to repaint visibly and
-// still left some child-window hit tests eating clicks.
+// Install on the top-level overlay HWND and direct WebView2 host children
+// only. Recursively subclassing WebView2's internal HWND tree is fragile:
+// those private windows are owned by the WebView runtime and can repaint as a
+// fully transparent host if their subclass chain is disturbed.
 // ---------------------------------------------------------------------------
 
-/// Common-controls subclass proc for the overlay HWND and WebView2 child
+/// Common-controls subclass proc for the overlay HWND and direct WebView2 host
 /// HWNDs. Forwards everything except passthrough hit tests to DefSubclassProc.
 unsafe extern "system" fn overlay_hit_test_subclass_proc(
     hwnd: HWND,
@@ -748,45 +774,38 @@ fn overlay_hit_test(lparam: LPARAM) -> Option<LRESULT> {
     if !in_region {
         // `HTTRANSPARENT` is the standard Win32 sentinel meaning "this
         // window is not at the hit-test point; pass to the next window in
-        // z-order." Since every WebView2 child HWND has this subclass too,
-        // the child host cannot eat the first click before the top-level
-        // overlay has a chance to pass it through.
+        // z-order." The direct WebView2 host child is subclassed too, so it
+        // cannot eat the first click before the top-level overlay has a
+        // chance to pass it through.
         Some(LRESULT(HTTRANSPARENT as isize))
     } else {
         None
     }
 }
 
-/// Install hit-test subclasses on the overlay and every current child HWND.
+/// Install hit-test subclasses on the overlay and direct current child HWNDs.
 /// Idempotent: calling SetWindowSubclass again with the same proc/id updates
 /// ref data instead of stacking duplicate handlers.
 fn install_overlay_hit_test_subclasses(hwnd: HWND) -> bool {
-    unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let ok = &mut *(lparam.0 as *mut bool);
-        if !SetWindowSubclass(
-            hwnd,
-            Some(overlay_hit_test_subclass_proc),
-            OVERLAY_HIT_TEST_SUBCLASS_ID,
-            0,
-        )
-        .as_bool()
-        {
-            *ok = false;
+    fn subclass_one(hwnd: HWND) -> bool {
+        unsafe {
+            SetWindowSubclass(
+                hwnd,
+                Some(overlay_hit_test_subclass_proc),
+                OVERLAY_HIT_TEST_SUBCLASS_ID,
+                0,
+            )
+            .as_bool()
         }
-        TRUE
     }
 
-    let mut ok = unsafe {
-        SetWindowSubclass(
-            hwnd,
-            Some(overlay_hit_test_subclass_proc),
-            OVERLAY_HIT_TEST_SUBCLASS_ID,
-            0,
-        )
-        .as_bool()
-    };
-    unsafe {
-        let _ = EnumChildWindows(hwnd, Some(enum_child), LPARAM(&mut ok as *mut _ as isize));
+    let mut ok = subclass_one(hwnd);
+    let mut child = unsafe { GetWindow(hwnd, GW_CHILD).ok() };
+    while let Some(child_hwnd) = child {
+        if !subclass_one(child_hwnd) {
+            ok = false;
+        }
+        child = unsafe { GetWindow(child_hwnd, GW_HWNDNEXT).ok() };
     }
     if !ok {
         eprintln!("[screenie] subclass install: one or more hit-test subclasses failed");
@@ -796,7 +815,6 @@ fn install_overlay_hit_test_subclasses(hwnd: HWND) -> bool {
 
 fn refresh_overlay_hit_test_subclasses(hwnd: HWND) {
     apply_overlay_base_styles(hwnd);
-    clear_transparent_styles(hwnd);
     install_overlay_hit_test_subclasses(hwnd);
 }
 
@@ -836,11 +854,21 @@ fn apply_overlay_base_styles(hwnd: HWND) {
             (ex | WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) & !WS_EX_TRANSPARENT.0;
         if new_ex != ex {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
+            // Extended-style changes via SetWindowLongPtrW don't take effect
+            // for hit testing until USER re-evaluates the frame. Do this only
+            // when the style actually changed; forcing FRAMECHANGED on every
+            // React region sync can make transparent WebView2 windows repaint
+            // as an empty surface.
+            let _ = SetWindowPos(
+                hwnd,
+                HWND(core::ptr::null_mut()),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
-        // Belt-and-suspenders for layered transparent WebView2 windows: keep
-        // a fully opaque global alpha while preserving the WebView's own
-        // transparent background pixels.
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
         let _ = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -848,7 +876,7 @@ fn apply_overlay_base_styles(hwnd: HWND) {
             0,
             0,
             0,
-            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
 }

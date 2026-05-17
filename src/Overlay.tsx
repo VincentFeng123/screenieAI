@@ -710,6 +710,14 @@ export default function Overlay() {
       const cap = await invoke<ScreenCapture | null>("take_pending_capture");
       if (cap) {
         setRefreshHidden(false);
+        if (IS_WINDOWS_PLATFORM) {
+          await invoke("set_overlay_interaction_regions", {
+            regions: [],
+            passthroughEnabled: false,
+          }).catch((e) => {
+            console.error("reset overlay interaction regions failed:", e);
+          });
+        }
         setScreen(cap);
         // If this capture was triggered by the "repeat last" hotkey, the
         // Rust side has set repeat_pending; consume the flag and pull the

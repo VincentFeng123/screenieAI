@@ -1997,6 +1997,16 @@ async fn capture_and_show_overlay(app: AppHandle) {
         state.overlay_alive.store(true, Ordering::Relaxed);
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // A new capture always begins in selecting mode. If the persistent
+        // overlay HWND was previously hidden while result/adjust controls had
+        // passthrough regions installed, clear that native state before the
+        // window is re-shown so Ctrl+Shift+A cannot open into an input-
+        // transparent empty surface.
+        windows_window::prepare_overlay_for_new_capture();
+    }
+
     // 4. Open (or re-show) the overlay on that monitor.
     //
     // Lifecycle: the overlay is built ONCE on first capture. Subsequent
