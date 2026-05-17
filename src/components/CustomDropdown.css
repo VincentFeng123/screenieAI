@@ -13,9 +13,7 @@
      stays readable. ~78% opacity in light mode, ~80% in dark — both kept
      close to the chat panel's frosted aesthetic. The dropdown's own light
      baseline value here drives the panel variant; ghost overrides below. */
-  --select-menu-bg:
-    linear-gradient(145deg, rgba(255, 255, 255, 0.90), rgba(255, 255, 255, 0.68)),
-    rgba(255, 255, 255, 0.78);
+  --select-menu-bg: rgba(255, 255, 255, 0.78);
   /* Hover row for the panel variant (Settings). 10% black is clearly
      visible against the light Settings surface; in dark mode we flip to
      10% white below. The ghost variant overrides this entirely with an
@@ -29,18 +27,14 @@
 /* Dark-mode variants of the panel hover + menu surface. */
 :root[data-theme="dark"] .screenie-select,
 :root[data-theme="dark"] .screenie-select-menu-portal {
-  --select-menu-bg:
-    linear-gradient(145deg, rgba(64, 68, 68, 0.62), rgba(14, 16, 16, 0.82)),
-    rgba(20, 22, 24, 0.82);
+  --select-menu-bg: rgba(20, 22, 24, 0.80);
   --select-hover: rgba(255, 255, 255, 0.10);
   --select-active: rgba(255, 255, 255, 0.16);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .screenie-select,
   :root:not([data-theme="light"]) .screenie-select-menu-portal {
-    --select-menu-bg:
-      linear-gradient(145deg, rgba(64, 68, 68, 0.62), rgba(14, 16, 16, 0.82)),
-      rgba(20, 22, 24, 0.82);
+    --select-menu-bg: rgba(20, 22, 24, 0.80);
     --select-hover: rgba(255, 255, 255, 0.10);
     --select-active: rgba(255, 255, 255, 0.16);
   }
@@ -67,14 +61,7 @@
   /* Translucent dark surface — lighter than the chat panel beneath so the
      menu reads as a distinct floating layer rather than blending in. The
      backdrop-filter further down does the actual frosting work. */
-  --select-menu-bg:
-    linear-gradient(
-      145deg,
-      rgba(255, 255, 255, 0.20),
-      rgba(255, 255, 255, 0.07) 36%,
-      rgba(6, 8, 8, 0.24)
-    ),
-    rgba(22, 24, 23, 0.68);
+  --select-menu-bg: rgba(22, 24, 23, 0.58);
   /* Hover row: an opaque gray, not a translucent white wash. Translucent
      whites disappeared into the dark menu surface; this opaque gray reads
      as a clearly-distinct row on every background the menu floats over. */
@@ -208,13 +195,13 @@
   flex-direction: column;
   padding: 6px;
   border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  border: none;
   background: var(--select-menu-bg);
   color: var(--select-ink);
-  /* Fine acrylic edge only. The inset highlight keeps the menu readable over
-     busy captures without turning it into a boxed dialog. */
+  /* No outer hairline — the drop shadow alone separates the menu from the
+     surface below. A black ring read as a "boxed" element that didn't fit
+     the borderless visual language elsewhere in the app. */
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.18),
     0 24px 56px rgba(0, 0, 0, 0.42),
     0 2px 8px rgba(0, 0, 0, 0.28);
   /* Mirrors the chat panel's frosted-glass recipe (overlay.css :23-34) so
@@ -223,6 +210,33 @@
      from washing over into pure white in light mode. */
   -webkit-backdrop-filter: blur(32px) saturate(150%) brightness(1.05);
   backdrop-filter: blur(32px) saturate(150%) brightness(1.05);
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-select,
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-select-menu-portal {
+  --select-menu-bg:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.90), rgba(255, 255, 255, 0.68)),
+    rgba(255, 255, 255, 0.78);
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-select[data-variant="ghost"],
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-select-menu-portal[data-variant="ghost"] {
+  --select-menu-bg:
+    linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.20),
+      rgba(255, 255, 255, 0.07) 36%,
+      rgba(6, 8, 8, 0.24)
+    ),
+    rgba(22, 24, 23, 0.68);
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-select-menu {
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 24px 56px rgba(0, 0, 0, 0.42),
+    0 2px 8px rgba(0, 0, 0, 0.28);
 }
 
 /* Dark-mode tone-down: bring brightness below 1 so a light-blue desktop

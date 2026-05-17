@@ -7,6 +7,16 @@ import Overlay from "./Overlay";
 const params = new URLSearchParams(window.location.search);
 const hashMode = window.location.hash.replace(/^#/, "");
 const mode = params.get("mode") || hashMode;
+const platform = navigator.userAgent.includes("Windows")
+  ? "windows"
+  : navigator.userAgent.includes("Mac")
+    ? "macos"
+    : "other";
+
+document.documentElement.dataset.screeniePlatform = platform;
+if (mode) {
+  document.documentElement.dataset.screenieMode = mode;
+}
 
 if (mode === "overlay") {
   document.documentElement.style.background = "transparent";

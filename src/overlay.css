@@ -12,6 +12,9 @@
 html {
   -webkit-user-select: none;
   user-select: none;
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] {
   --screenie-acrylic-surface:
     linear-gradient(
       145deg,
@@ -47,25 +50,32 @@ textarea,
    layer so backdrop-filter never lives on a transformed node. */
 /* Overlay surfaces. The live frost itself is native vibrancy on macOS and a
    screenshot-backed BlurredBackdrop on Windows. This CSS layer is still
-   load-bearing: it gives every non-transparent container a visible acrylic
-   body when native/WebView blur is delayed or unavailable. */
+   load-bearing only on Windows, where WebView2 can otherwise render these
+   surfaces too close to transparent. */
 .screenie-chat-panel,
 .screenie-toolbar,
 .screenie-hint {
   position: relative;
-  background: var(--screenie-acrylic-surface);
-  -webkit-backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
-  backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
+  background: rgba(220, 222, 220, 0.04);
   border: none;
   outline: none;
-  box-shadow:
-    inset 0 0 0 1px var(--screenie-acrylic-border),
-    inset 0 1px 0 var(--screenie-acrylic-highlight),
-    inset 0 -28px 72px rgba(0, 0, 0, 0.18);
+  box-shadow: none;
   box-sizing: border-box;
   color: rgba(255, 255, 255, 0.95);
   isolation: isolate;
   contain: layout style;
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-chat-panel,
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-toolbar,
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-hint {
+  background: var(--screenie-acrylic-surface);
+  -webkit-backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
+  backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
+  box-shadow:
+    inset 0 0 0 1px var(--screenie-acrylic-border),
+    inset 0 1px 0 var(--screenie-acrylic-highlight),
+    inset 0 -28px 72px rgba(0, 0, 0, 0.18);
 }
 
 .screenie-chat-panel > :not(.screenie-blurred-backdrop),
@@ -238,8 +248,8 @@ textarea,
   white-space: nowrap;
 }
 
-/* Mirrors the chat panel / toolbar recipe: visible acrylic base + bitmap
-   blur via a child <BlurredBackdrop> when one is mounted. */
+/* Mirrors the chat panel / toolbar recipe. On Windows an additional scoped
+   acrylic layer below makes the background visibly frosted. */
 .screenie-action {
   position: relative;
   display: inline-flex;
@@ -250,6 +260,15 @@ textarea,
   font-weight: 500;
   font-family: inherit;
   color: rgba(255, 255, 255, 0.95);
+  background: rgba(220, 222, 220, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  cursor: pointer;
+  isolation: isolate;
+  overflow: hidden;
+  contain: layout style;
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-action {
   background: var(--screenie-acrylic-surface);
   -webkit-backdrop-filter: blur(26px) saturate(145%) brightness(0.88);
   backdrop-filter: blur(26px) saturate(145%) brightness(0.88);
@@ -257,10 +276,6 @@ textarea,
   box-shadow:
     inset 0 1px 0 var(--screenie-acrylic-highlight),
     inset 0 -18px 46px rgba(0, 0, 0, 0.16);
-  cursor: pointer;
-  isolation: isolate;
-  overflow: hidden;
-  contain: layout style;
 }
 
 /* Lift the icon + text above the absolutely-positioned BlurredBackdrop
@@ -404,9 +419,7 @@ textarea,
   .screenie-edit-pill,
   .screenie-edit-popover,
   .screenie-hint {
-    background:
-      linear-gradient(145deg, rgba(70, 74, 72, 0.86), rgba(28, 30, 30, 0.92)),
-      rgba(38, 40, 39, 0.94);
+    background: rgba(54, 56, 54, 0.94);
   }
 }
 
@@ -423,19 +436,25 @@ textarea,
 .screenie-edit-pill,
 .screenie-edit-popover {
   position: relative;
-  background: var(--screenie-acrylic-surface);
-  -webkit-backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
-  backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
+  background: rgba(220, 222, 220, 0.04);
   border: none;
   outline: none;
-  box-shadow:
-    inset 0 0 0 1px var(--screenie-acrylic-border),
-    inset 0 1px 0 var(--screenie-acrylic-highlight),
-    inset 0 -22px 58px rgba(0, 0, 0, 0.17);
+  box-shadow: none;
   box-sizing: border-box;
   color: rgba(255, 255, 255, 0.95);
   isolation: isolate;
   contain: layout style;
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-edit-pill,
+:root[data-screenie-platform="windows"][data-screenie-mode="overlay"] .screenie-edit-popover {
+  background: var(--screenie-acrylic-surface);
+  -webkit-backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
+  backdrop-filter: blur(28px) saturate(145%) brightness(0.88);
+  box-shadow:
+    inset 0 0 0 1px var(--screenie-acrylic-border),
+    inset 0 1px 0 var(--screenie-acrylic-highlight),
+    inset 0 -22px 58px rgba(0, 0, 0, 0.17);
 }
 
 
