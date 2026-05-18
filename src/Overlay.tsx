@@ -229,14 +229,9 @@ function collectOverlayInteractionRegions(): OverlayInteractionRegion[] {
   document
     .querySelectorAll<HTMLElement>(OVERLAY_INTERACTION_REGION_SELECTOR)
     .forEach((el) => {
-      // Windows/WebView2 click-through is implemented with native hit-test
-      // passthrough. Keep the full capture rect out of the interactive list
-      // so it remains a visual/pass-through surface; toolbar, chat, handles,
-      // and narrow move strips remain native hit regions.
-      if (IS_WINDOWS_PLATFORM && el.classList.contains("screenie-capture-region")) {
-        return;
-      }
-
+      // Windows/WebView2 click-through is implemented with native
+      // passthrough. Keep the full capture rect in the interactive list so a
+      // drag moves the region; no-move clicks are relayed to the app below.
       const style = window.getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") return;
       if (style.pointerEvents === "none") return;
@@ -1937,7 +1932,7 @@ function AdjustingLayer({
           ...selectionRectStyle(rect),
           boxShadow: `0 0 0 9999px rgba(0,0,0,0.58)`,
           cursor: "default",
-          pointerEvents: IS_WINDOWS_PLATFORM || editCtl.tool ? "none" : "auto",
+          pointerEvents: editCtl.tool ? "none" : "auto",
         }}
         onMouseDown={beginDrag("move", { relayClickThrough: true })}
         onWheel={(e) => {
@@ -4102,7 +4097,7 @@ function ResultLayer({
           boxSizing: "border-box",
           borderRadius: 2,
           cursor: "default",
-          pointerEvents: IS_WINDOWS_PLATFORM || editCtl.tool ? "none" : "auto",
+          pointerEvents: editCtl.tool ? "none" : "auto",
         }}
       />
       {moveHitAreas(rect).map((style, i) => (

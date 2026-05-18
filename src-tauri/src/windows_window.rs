@@ -12,11 +12,11 @@
 //! - Topmost ordering via `SetWindowPos(HWND_TOPMOST, …)` — equivalent of
 //!   macOS's `NSStatusWindowLevel`.
 //!
-//! - Partial click-through: a JS-supplied list of interactive rects, enforced
-//!   by `WM_NCHITTEST` subclasses on the overlay and direct WebView2 host
-//!   child HWNDs. Empty overlay regions pass clicks through to apps underneath
-//!   while the overlay remains visually present; interactive panels receive
-//!   input.
+//! - Partial click-through: a JS-supplied list of interactive rects drives
+//!   cursor-tracked `WS_EX_TRANSPARENT` on the layered overlay. Empty overlay
+//!   regions pass clicks through to apps underneath while the overlay remains
+//!   visually present; interactive panels receive input. `WM_NCHITTEST`
+//!   subclasses remain as a same-thread/backstop path for WebView2 children.
 //!
 //! - Esc consumption: a low-level keyboard hook (`WH_KEYBOARD_LL`) returns
 //!   `LRESULT(1)` for Esc while the overlay is visible, so fullscreen
@@ -70,14 +70,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CallNextHookEx, EnumChildWindows, EnumWindows, GetForegroundWindow,
-    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
+    GetCursorPos, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
     IsWindowVisible, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
     SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GW_CHILD, GW_HWNDNEXT,
     GWL_EXSTYLE, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    MA_NOACTIVATE, MSLLHOOKSTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 // `windows-rs 0.58` represents every HANDLE-style type as
@@ -135,9 +137,17 @@ static PREVIOUS_FOREGROUND_HWND: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set true while a synthetic click/scroll is being relayed to the
 /// underlying app. Mirrors macOS's `screenieOverlayClickRelayActive`.
-/// While set, the hit-test subclass returns HTTRANSPARENT even over overlay
+/// While set, native hit testing forces pass-through even over overlay
 /// controls so the SendInput-posted event doesn't race back into the overlay.
 static CLICK_RELAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whether WS_EX_TRANSPARENT is currently applied to the layered overlay.
+/// WM_NCHITTEST/HTTRANSPARENT is not enough for cross-process click-through:
+/// Microsoft documents that result as continuing hit testing only through
+/// underlying windows in the same thread. A layered top-level window with
+/// WS_EX_TRANSPARENT is the documented way to pass mouse events to windows
+/// underneath it, so we toggle this style as the cursor crosses React's
+/// interactive regions.
+static MOUSE_PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Generation counter so a stale relay's late-cleanup task can't reset
 /// state that a newer relay just installed.
 static CLICK_RELAY_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -229,6 +239,7 @@ pub fn configure_overlay_window(window: &WebviewWindow, app: &AppHandle) {
     // may create child HWNDs after first show, so this is called again from
     // `order_overlay_window` and region updates.
     refresh_overlay_hit_test_subclasses_on_main(hwnd_to_raw(hwnd));
+    sync_overlay_mouse_passthrough_on_main(hwnd_to_raw(hwnd));
 }
 
 /// Bring the overlay to the topmost level without activating it. Counterpart
@@ -252,6 +263,7 @@ pub fn order_overlay_window(window: &WebviewWindow) {
     }
     refresh_overlay_hit_test_subclasses_on_main(hwnd_to_raw(hwnd));
     OVERLAY_VISIBLE.store(true, Ordering::Release);
+    sync_overlay_mouse_passthrough_on_main(hwnd_to_raw(hwnd));
 }
 
 /// Install the low-level keyboard + mouse hooks. Idempotent. Returns true
@@ -270,6 +282,7 @@ pub fn uninstall_overlay_escape_monitor() {
     OVERLAY_VISIBLE.store(false, Ordering::Release);
     MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
     CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+    MOUSE_PASSTHROUGH_ACTIVE.store(false, Ordering::Release);
     uninstall_keyboard_hook();
     uninstall_mouse_hook();
     // Clear any leftover WS_EX_TRANSPARENT from older runtime paths so the
@@ -305,6 +318,7 @@ pub fn set_overlay_interaction_regions(
     };
     if let Some(hwnd_raw) = hwnd_to_refresh {
         refresh_overlay_hit_test_subclasses_on_main(hwnd_raw);
+        sync_overlay_mouse_passthrough_on_main(hwnd_raw);
     }
 }
 
@@ -334,6 +348,7 @@ pub fn prepare_overlay_for_new_capture() {
     };
     if let Some(hwnd_raw) = hwnd_to_clear {
         clear_transparent_styles_on_main(hwnd_raw);
+        sync_overlay_mouse_passthrough_on_main(hwnd_raw);
     }
 }
 
@@ -384,6 +399,13 @@ pub fn set_overlay_mouse_capture(active: bool) {
         CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
     MOUSE_CAPTURE_ACTIVE.store(active, Ordering::Release);
+    let hwnd_raw = overlay_state()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.hwnd_raw));
+    if let Some(hwnd_raw) = hwnd_raw {
+        sync_overlay_mouse_passthrough_on_main(hwnd_raw);
+    }
 }
 
 /// Synthesize a click at the current cursor position so the underlying app
@@ -398,25 +420,24 @@ pub fn set_overlay_mouse_capture(active: bool) {
 /// quirk: 1 = right), 2 = right. The mac side maps 1 → right; we keep that
 /// quirk for parity with the JS callers.
 pub fn relay_overlay_pointer_click(button_number: i32) -> bool {
-    if overlay_state()
+    let Some(hwnd_raw) = overlay_state()
         .lock()
         .ok()
         .and_then(|g| g.as_ref().map(|s| s.hwnd_raw))
-        .is_none()
-    {
+    else {
         return false;
-    }
+    };
 
     let generation = CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     CLICK_RELAY_ACTIVE.store(true, Ordering::Release);
     MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    force_overlay_mouse_passthrough_on_main(hwnd_raw, true);
 
     tauri::async_runtime::spawn(async move {
         // Give the WebView a beat to unwind the JS mouseup before the
-        // synthetic click is hit-tested. CLICK_RELAY_ACTIVE makes our
-        // hit-test subclasses return HTTRANSPARENT even over interaction
-        // regions, so the click lands on the underlying app without any
-        // compositor-affecting style flip.
+        // synthetic click is hit-tested. CLICK_RELAY_ACTIVE forces
+        // WS_EX_TRANSPARENT for the short relay window, so the click lands
+        // on the underlying app instead of racing back into WebView2.
         tokio::time::sleep(std::time::Duration::from_millis(8)).await;
         unsafe {
             post_synthetic_click(button_number);
@@ -427,6 +448,7 @@ pub fn relay_overlay_pointer_click(button_number: i32) -> bool {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         if CLICK_RELAY_GENERATION.load(Ordering::Acquire) == generation {
             CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+            sync_overlay_mouse_passthrough_on_main(hwnd_raw);
         }
     });
     true
@@ -437,18 +459,18 @@ pub fn relay_overlay_pointer_click(button_number: i32) -> bool {
 /// handler so scrolling inside the captured region scrolls the underlying
 /// app instead of being eaten by our WebView.
 pub fn relay_overlay_wheel(delta_x: f64, delta_y: f64) -> bool {
-    if overlay_state()
+    let Some(hwnd_raw) = overlay_state()
         .lock()
         .ok()
         .and_then(|g| g.as_ref().map(|s| s.hwnd_raw))
-        .is_none()
-    {
+    else {
         return false;
-    }
+    };
 
     let generation = CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     CLICK_RELAY_ACTIVE.store(true, Ordering::Release);
     MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    force_overlay_mouse_passthrough_on_main(hwnd_raw, true);
 
     tauri::async_runtime::spawn(async move {
         // Wheel events are less time-sensitive than clicks; a 1ms beat is
@@ -463,6 +485,7 @@ pub fn relay_overlay_wheel(delta_x: f64, delta_y: f64) -> bool {
         tokio::time::sleep(std::time::Duration::from_millis(140)).await;
         if CLICK_RELAY_GENERATION.load(Ordering::Acquire) == generation {
             CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+            sync_overlay_mouse_passthrough_on_main(hwnd_raw);
         }
     });
     true
@@ -681,11 +704,12 @@ fn get_hwnd(window: &WebviewWindow) -> Option<HWND> {
 }
 
 // ---------------------------------------------------------------------------
-// Hit-test subclasses — primary click-through mechanism. Windows asks the
-// subclass on every `WM_NCHITTEST` whether a point belongs to us. We return
-// `HTTRANSPARENT` outside React-pushed interaction regions, so clicks, hover,
-// and scroll fall through to the app underneath while the overlay keeps
-// rendering normally.
+// Hit-test subclasses + cursor-tracked pass-through. Windows asks the
+// subclass on every `WM_NCHITTEST` whether a point belongs to us. We also
+// toggle top-level WS_EX_TRANSPARENT from the low-level mouse hook because
+// HTTRANSPARENT only continues hit testing through windows in the same
+// thread; WS_EX_TRANSPARENT on the layered overlay is what lets other apps
+// underneath receive real mouse input.
 //
 // Install on the top-level overlay HWND and direct WebView2 host children
 // only. Recursively subclassing WebView2's internal HWND tree is fragile:
@@ -715,10 +739,11 @@ unsafe extern "system" fn overlay_hit_test_subclass_proc(
 }
 
 /// Decide whether `WM_NCHITTEST` for the given lparam point should pass
-/// through to the app underneath. Returns `Some(HTTRANSPARENT)` to declare
-/// the overlay non-interactive at that point, `None` to let the original
-/// WndProc make the call (which yields `HTCLIENT` for the WebView2 child
-/// when the point is over a button / textarea / handle).
+/// through to same-thread child/sibling windows. Returns
+/// `Some(HTTRANSPARENT)` to declare the overlay non-interactive at that
+/// point, `None` to let the original WndProc make the call (which yields
+/// `HTCLIENT` for the WebView2 child when the point is over a button /
+/// textarea / handle).
 ///
 /// Three short-circuits return `None`:
 /// - Overlay hidden (hooks still installed but no real overlay to interact with).
@@ -772,14 +797,114 @@ fn overlay_hit_test(lparam: LPARAM) -> Option<LRESULT> {
         .iter()
         .any(|r| cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h);
     if !in_region {
-        // `HTTRANSPARENT` is the standard Win32 sentinel meaning "this
-        // window is not at the hit-test point; pass to the next window in
-        // z-order." The direct WebView2 host child is subclassed too, so it
-        // cannot eat the first click before the top-level overlay has a
-        // chance to pass it through.
+        // `HTTRANSPARENT` is only documented to continue hit testing
+        // through windows in this thread. Cross-app click-through is handled
+        // by the cursor-tracked WS_EX_TRANSPARENT style above; this return is
+        // still useful for WebView2 child HWNDs inside our own window tree.
         Some(LRESULT(HTTRANSPARENT as isize))
     } else {
         None
+    }
+}
+
+fn screen_point_is_inside_regions(
+    overlay_hwnd: HWND,
+    screen_point: POINT,
+    regions: &[InteractionRegion],
+) -> bool {
+    let mut pt = screen_point;
+    unsafe {
+        let _ = ScreenToClient(overlay_hwnd, &mut pt);
+    }
+    let cx = pt.x as f64;
+    let cy = pt.y as f64;
+    regions
+        .iter()
+        .any(|r| cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h)
+}
+
+fn overlay_should_passthrough_at_screen_point(
+    overlay_hwnd: HWND,
+    screen_point: POINT,
+) -> bool {
+    if !OVERLAY_VISIBLE.load(Ordering::Relaxed) {
+        return false;
+    }
+    if CLICK_RELAY_ACTIVE.load(Ordering::Relaxed) {
+        return true;
+    }
+    if MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let (passthrough_enabled, regions) = match overlay_state().lock() {
+        Ok(g) => match g.as_ref() {
+            Some(s) => {
+                // The caller may hold an old HWND after a WebView rebuild.
+                if s.hwnd_raw != hwnd_to_raw(overlay_hwnd) {
+                    return false;
+                }
+                (s.passthrough_enabled, s.regions.clone())
+            }
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+
+    if !passthrough_enabled {
+        return false;
+    }
+    if regions.is_empty() {
+        return true;
+    }
+    !screen_point_is_inside_regions(overlay_hwnd, screen_point, &regions)
+}
+
+fn update_overlay_mouse_passthrough_for_point(overlay_hwnd: HWND, screen_point: POINT) {
+    let active = overlay_should_passthrough_at_screen_point(overlay_hwnd, screen_point);
+    set_overlay_mouse_passthrough(overlay_hwnd, active);
+}
+
+fn update_overlay_mouse_passthrough_for_current_cursor(overlay_hwnd: HWND) {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe {
+        if GetCursorPos(&mut pt).is_ok() {
+            update_overlay_mouse_passthrough_for_point(overlay_hwnd, pt);
+        }
+    }
+}
+
+fn sync_overlay_mouse_passthrough_on_main(hwnd_raw: isize) {
+    run_overlay_hwnd_update_on_main(
+        hwnd_raw,
+        update_overlay_mouse_passthrough_for_current_cursor,
+    );
+}
+
+fn force_overlay_mouse_passthrough_on_main(hwnd_raw: isize, active: bool) {
+    let app = overlay_app()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().cloned());
+    if let Some(app) = app {
+        if app
+            .run_on_main_thread(move || {
+                set_overlay_mouse_passthrough(hwnd_from_raw(hwnd_raw), active);
+            })
+            .is_ok()
+        {
+            return;
+        }
+    }
+    set_overlay_mouse_passthrough(hwnd_from_raw(hwnd_raw), active);
+}
+
+fn set_overlay_mouse_passthrough(overlay_hwnd: HWND, active: bool) {
+    if MOUSE_PASSTHROUGH_ACTIVE.swap(active, Ordering::AcqRel) == active {
+        return;
+    }
+    unsafe {
+        set_hwnd_transparent_style(overlay_hwnd, active);
     }
 }
 
@@ -850,8 +975,12 @@ fn apply_overlay_base_styles(hwnd: HWND) {
             return;
         }
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        let new_ex =
-            (ex | WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) & !WS_EX_TRANSPARENT.0;
+        let mut new_ex = ex | WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
+        if MOUSE_PASSTHROUGH_ACTIVE.load(Ordering::Acquire) {
+            new_ex |= WS_EX_TRANSPARENT.0;
+        } else {
+            new_ex &= !WS_EX_TRANSPARENT.0;
+        }
         if new_ex != ex {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
             // Extended-style changes via SetWindowLongPtrW don't take effect
@@ -1110,21 +1239,43 @@ unsafe fn inject_ctrl_digit(digit_vk: u16) {
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && OVERLAY_VISIBLE.load(Ordering::Relaxed) {
         let msg = wparam.0 as u32;
-        if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP {
+        let is_mouse_event = matches!(
+            msg,
+            WM_MOUSEMOVE
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
+                | WM_MOUSEWHEEL
+                | WM_MOUSEHWHEEL
+        );
+        if is_mouse_event {
+            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
             // Safety net for stuck drags. If a JS-driven drag was started
             // (set_overlay_mouse_capture(true)) but the JS mouseup
             // never fired — e.g., the overlay lost focus mid-drag, or
             // the WebView was re-mounted — the MOUSE_CAPTURE_ACTIVE flag
             // would otherwise be stuck true, making the hit-test subclass
-            // keep the overlay mouse-active everywhere. Cheap: one atomic
-            // swap, no lock acquisition inside the hot path.
-            MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+            // keep the overlay mouse-active everywhere.
+            if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP {
+                MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+            }
+            let hwnd_raw = overlay_state()
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|s| s.hwnd_raw));
+            if let Some(hwnd_raw) = hwnd_raw {
+                update_overlay_mouse_passthrough_for_point(hwnd_from_raw(hwnd_raw), info.pt);
+            }
         }
     }
     CallNextHookEx(HHOOK(core::ptr::null_mut()), code, wparam, lparam)
 }
 
 fn clear_transparent_styles(hwnd: HWND) {
+    MOUSE_PASSTHROUGH_ACTIVE.store(false, Ordering::Release);
     unsafe {
         set_hwnd_transparent_style(hwnd, false);
         set_child_windows_transparent_style(hwnd, false);

@@ -76,12 +76,12 @@ Finder, or whichever app is underneath.
 
 ## Windows Fallback
 
-Windows can approximate this architecture with a layered transparent topmost
-window, `WM_NCHITTEST` returning `HTTRANSPARENT` outside UI regions, and a
-low-level keyboard hook for Esc. That is a separate native implementation.
-Current ScreenieAI behavior should remain macOS-first; non-macOS should fall
-back to normal Tauri focus plus whole-window behavior until a dedicated Windows
-bridge exists.
+Windows uses a layered transparent topmost window with `WS_EX_NOACTIVATE`,
+cursor-tracked `WS_EX_TRANSPARENT` outside UI regions, `WM_MOUSEACTIVATE`
+returning `MA_NOACTIVATE`, and a low-level keyboard hook for Esc.
+`WM_NCHITTEST`/`HTTRANSPARENT` is still useful inside the WebView2 window tree,
+but Microsoft documents `HTTRANSPARENT` as same-thread hit-test rerouting, so
+cross-app click-through relies on the layered-window `WS_EX_TRANSPARENT` path.
 
 ## Sources
 
@@ -103,5 +103,14 @@ bridge exists.
   https://developer.apple.com/documentation/coregraphics/cgevent/tapcreate%28tap%3Aplace%3Aoptions%3Aeventsofinterest%3Acallback%3Auserinfo%3A%29
 - Apple `CGEventTapCallBack`:
   https://developer.apple.com/documentation/coregraphics/cgeventtapcallback
+- Microsoft `WM_NCHITTEST` / `HTTRANSPARENT`:
+  https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nchittest
+- Microsoft extended window styles (`WS_EX_LAYERED`, `WS_EX_NOACTIVATE`,
+  `WS_EX_TRANSPARENT`, `WS_EX_TOOLWINDOW`):
+  https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles
+- Microsoft layered-window hit testing:
+  https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features
+- Microsoft `WM_MOUSEACTIVATE` / `MA_NOACTIVATE`:
+  https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-mouseactivate
 - Tauri `WebviewWindow`:
   https://docs.rs/tauri/latest/tauri/webview/struct.WebviewWindow.html
