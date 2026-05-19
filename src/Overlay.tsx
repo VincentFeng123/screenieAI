@@ -277,6 +277,7 @@ function regionsSignature(
 function useOverlayInteractionRegions(enabled: boolean) {
   const lastSignatureRef = useRef("");
   const enabledRef = useRef(enabled);
+  const lastSyncedEnabledRef = useRef(enabled);
   const rafRef = useRef<number | null>(null);
   // Per-frame guard: useLayoutEffect runs after every commit (no deps), but
   // during AI streaming we re-render per token. Walking the DOM + stringifying
@@ -322,8 +323,11 @@ function useOverlayInteractionRegions(enabled: boolean) {
   // layout, the MutationObserver / ResizeObserver below schedules a follow-up
   // rAF sync.
   useLayoutEffect(() => {
-    if (frameSyncedRef.current) return;
+    const enabledChanged =
+      IS_WINDOWS_PLATFORM && lastSyncedEnabledRef.current !== enabledRef.current;
+    if (frameSyncedRef.current && !enabledChanged) return;
     frameSyncedRef.current = true;
+    lastSyncedEnabledRef.current = enabledRef.current;
     syncNow();
     window.requestAnimationFrame(() => {
       frameSyncedRef.current = false;
