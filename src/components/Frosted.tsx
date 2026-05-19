@@ -323,13 +323,22 @@ export function SvgInsetBorder({
   strokeWidth?: number;
   strokeAlpha?: number;
 }) {
+  const insetStyle = isWindowsPlatform
+    ? {
+        left: `${Math.max(0, inset - 0.5)}px`,
+        top: `${Math.max(0, inset - 0.5)}px`,
+        right: `${inset + 0.5}px`,
+        bottom: `${inset + 0.5}px`,
+      }
+    : { inset: `${inset}px` };
+
   return (
     <div
       className="screenie-inset-border"
       aria-hidden
       style={{
         position: "absolute",
-        inset: `${inset}px`,
+        ...insetStyle,
         borderRadius: `${Math.max(0, radius - inset)}px`,
         border: `${strokeWidth}px solid rgba(255, 255, 255, ${strokeAlpha})`,
         boxSizing: "border-box",

@@ -1146,6 +1146,12 @@ type DragSession = {
   dragging: boolean;
 };
 
+type NativeCaptureRegionDragPayload = {
+  phase?: "start" | "move" | "end";
+  dx?: number;
+  dy?: number;
+};
+
 type RectDragOptions = {
   relayClickThrough?: boolean;
 };
@@ -1173,6 +1179,7 @@ function useRectDrag(
   callbacksRef.current = callbacks;
 
   const dragRef = useRef<DragSession | null>(null);
+  const nativeDragRef = useRef<{ start: Rect } | null>(null);
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
@@ -1225,6 +1232,50 @@ function useRectDrag(
         dragRef.current = null;
         setOverlayMouseCapture(false);
         callbacksRef.current?.onCancel?.(d.kind, d.start, rectRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!IS_WINDOWS_PLATFORM) return;
+    let cancelled = false;
+    const unlistenPromise = listen<NativeCaptureRegionDragPayload>(
+      "overlay-capture-region-drag",
+      (event) => {
+        if (cancelled) return;
+        const phase = event.payload?.phase;
+        const dx = typeof event.payload?.dx === "number" ? event.payload.dx : 0;
+        const dy = typeof event.payload?.dy === "number" ? event.payload.dy : 0;
+        const bounds = { W: window.innerWidth, H: window.innerHeight };
+
+        if (phase === "start") {
+          const start = rectRef.current;
+          nativeDragRef.current = { start };
+          callbacksRef.current?.onStart?.("move", start);
+          return;
+        }
+        if (phase !== "move" && phase !== "end") return;
+
+        const session =
+          nativeDragRef.current ??
+          (nativeDragRef.current = { start: rectRef.current });
+        const next = applyDrag(session.start, "move", dx, dy, bounds);
+        setRectRef.current(next);
+
+        if (phase === "end") {
+          nativeDragRef.current = null;
+          onEndRef.current?.(next, session.start);
+        }
+      },
+    );
+
+    return () => {
+      cancelled = true;
+      unlistenPromise.then((fn) => fn()).catch(() => {});
+      if (nativeDragRef.current) {
+        const d = nativeDragRef.current;
+        nativeDragRef.current = null;
+        callbacksRef.current?.onCancel?.("move", d.start, rectRef.current);
       }
     };
   }, []);

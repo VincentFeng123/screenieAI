@@ -123,11 +123,27 @@ struct OverlayState {
     passthrough_enabled: bool,
 }
 
+struct CaptureRegionDragState {
+    hwnd_raw: isize,
+    start: POINT,
+    button_number: i32,
+    active: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct CaptureRegionDragEvent {
+    phase: &'static str,
+    dx: f64,
+    dy: f64,
+}
+
 static OVERLAY: OnceLock<Mutex<Option<OverlayState>>> = OnceLock::new();
 static OVERLAY_APP: OnceLock<Mutex<Option<AppHandle>>> = OnceLock::new();
+static CAPTURE_REGION_DRAG: OnceLock<Mutex<Option<CaptureRegionDragState>>> = OnceLock::new();
 static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 const OVERLAY_HIT_TEST_SUBCLASS_ID: usize = 0x5343_4f48; // "SCOH"
+const CAPTURE_REGION_DRAG_THRESHOLD: f64 = 5.0;
 static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TEXT_INPUT_FOCUSED: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_FOREGROUND_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -173,6 +189,10 @@ fn overlay_state() -> &'static Mutex<Option<OverlayState>> {
 
 fn overlay_app() -> &'static Mutex<Option<AppHandle>> {
     OVERLAY_APP.get_or_init(|| Mutex::new(None))
+}
+
+fn capture_region_drag_state() -> &'static Mutex<Option<CaptureRegionDragState>> {
+    CAPTURE_REGION_DRAG.get_or_init(|| Mutex::new(None))
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +304,9 @@ pub fn uninstall_overlay_escape_monitor() {
     MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
     CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
     MOUSE_PASSTHROUGH_ACTIVE.store(false, Ordering::Release);
+    if let Ok(mut g) = capture_region_drag_state().lock() {
+        *g = None;
+    }
     uninstall_keyboard_hook();
     uninstall_mouse_hook();
     // Clear any leftover WS_EX_TRANSPARENT from older runtime paths so the
@@ -343,6 +366,9 @@ pub fn prepare_overlay_for_new_capture() {
     CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
     CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
     MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    if let Ok(mut g) = capture_region_drag_state().lock() {
+        *g = None;
+    }
 
     let hwnd_to_clear = if let Ok(mut g) = overlay_state().lock() {
         if let Some(s) = g.as_mut() {
@@ -860,11 +886,130 @@ fn screen_point_is_inside_drag_region(overlay_hwnd: HWND, screen_point: POINT) -
     }
     let cx = pt.x as f64;
     let cy = pt.y as f64;
-    regions
-        .iter()
-        .any(|r| {
-            r.drag && cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h
-        })
+    let mut inside_drag_region = false;
+    for r in &regions {
+        let inside = cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h;
+        if !inside {
+            continue;
+        }
+        if r.drag {
+            inside_drag_region = true;
+        } else {
+            return false;
+        }
+    }
+    inside_drag_region
+}
+
+fn emit_capture_region_drag_event(phase: &'static str, dx: f64, dy: f64) {
+    let app = overlay_app()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().cloned());
+    if let Some(app) = app {
+        let _ = app.emit_to(
+            "overlay",
+            "overlay-capture-region-drag",
+            CaptureRegionDragEvent { phase, dx, dy },
+        );
+    }
+}
+
+fn mouse_button_number_for_down(msg: u32) -> Option<i32> {
+    match msg {
+        WM_LBUTTONDOWN => Some(0),
+        WM_RBUTTONDOWN => Some(1),
+        WM_MBUTTONDOWN => Some(2),
+        _ => None,
+    }
+}
+
+fn mouse_button_number_for_up(msg: u32) -> Option<i32> {
+    match msg {
+        WM_LBUTTONUP => Some(0),
+        WM_RBUTTONUP => Some(1),
+        WM_MBUTTONUP => Some(2),
+        _ => None,
+    }
+}
+
+fn begin_capture_region_drag(hwnd_raw: isize, start: POINT, button_number: i32) {
+    CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+    CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
+    MOUSE_CAPTURE_ACTIVE.store(true, Ordering::Release);
+    set_overlay_mouse_passthrough(hwnd_from_raw(hwnd_raw), false);
+    if let Ok(mut g) = capture_region_drag_state().lock() {
+        *g = Some(CaptureRegionDragState {
+            hwnd_raw,
+            start,
+            button_number,
+            active: false,
+        });
+    }
+    emit_capture_region_drag_event("start", 0.0, 0.0);
+}
+
+fn handle_capture_region_drag_event(overlay_hwnd: HWND, msg: u32, point: POINT) -> Option<LRESULT> {
+    let up_button = mouse_button_number_for_up(msg);
+    let mut relay_click_button: Option<i32> = None;
+    let mut should_update_passthrough = false;
+    let mut emit: Option<(&'static str, f64, f64)> = None;
+    let mut handled = false;
+
+    if let Ok(mut g) = capture_region_drag_state().lock() {
+        let Some(state) = g.as_mut() else {
+            return None;
+        };
+        if state.hwnd_raw != hwnd_to_raw(overlay_hwnd) {
+            *g = None;
+            MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+            return None;
+        }
+
+        let dx = (point.x - state.start.x) as f64;
+        let dy = (point.y - state.start.y) as f64;
+        let is_matching_up = up_button == Some(state.button_number);
+
+        if msg == WM_MOUSEMOVE {
+            if !state.active && dx.hypot(dy) >= CAPTURE_REGION_DRAG_THRESHOLD {
+                state.active = true;
+            }
+            if state.active {
+                emit = Some(("move", dx, dy));
+            }
+            handled = true;
+        } else if is_matching_up {
+            let was_active = state.active;
+            let button_number = state.button_number;
+            *g = None;
+            MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+            should_update_passthrough = true;
+            if was_active {
+                emit = Some(("end", dx, dy));
+            } else {
+                emit = Some(("end", 0.0, 0.0));
+                relay_click_button = Some(button_number);
+            }
+            handled = true;
+        } else if up_button.is_some() {
+            handled = true;
+        }
+    }
+
+    if let Some((phase, dx, dy)) = emit {
+        emit_capture_region_drag_event(phase, dx, dy);
+    }
+    if should_update_passthrough {
+        update_overlay_mouse_passthrough_for_point(overlay_hwnd, point);
+    }
+    if let Some(button_number) = relay_click_button {
+        let _ = relay_overlay_pointer_click(button_number);
+    }
+    if handled {
+        Some(LRESULT(1))
+    } else {
+        None
+    }
 }
 
 fn overlay_should_passthrough_at_screen_point(
@@ -1303,11 +1448,13 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 .and_then(|g| g.as_ref().map(|s| s.hwnd_raw));
             if let Some(hwnd_raw) = hwnd_raw {
                 let overlay_hwnd = hwnd_from_raw(hwnd_raw);
-                if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
+                if let Some(result) = handle_capture_region_drag_event(overlay_hwnd, msg, info.pt) {
+                    return result;
+                }
+                if let Some(button_number) = mouse_button_number_for_down(msg) {
                     if screen_point_is_inside_drag_region(overlay_hwnd, info.pt) {
-                        CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
-                        CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
-                        MOUSE_CAPTURE_ACTIVE.store(true, Ordering::Release);
+                        begin_capture_region_drag(hwnd_raw, info.pt, button_number);
+                        return LRESULT(1);
                     }
                 }
                 // Safety net for stuck drags. If a JS-driven drag was started
