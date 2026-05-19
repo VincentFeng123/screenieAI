@@ -110,6 +110,7 @@ struct InteractionRegion {
     y: f64,
     w: f64,
     h: f64,
+    drag: bool,
 }
 
 struct OverlayState {
@@ -298,15 +299,23 @@ pub fn uninstall_overlay_escape_monitor() {
 }
 
 pub fn set_overlay_interaction_regions(
-    regions: Vec<(f64, f64, f64, f64)>,
+    regions: Vec<(f64, f64, f64, f64, bool)>,
     passthrough_enabled: bool,
 ) {
     let hwnd_to_refresh = if let Ok(mut g) = overlay_state().lock() {
         if let Some(s) = g.as_mut() {
             s.regions = regions
                 .into_iter()
-                .filter(|(_, _, w, h)| w.is_finite() && h.is_finite() && *w > 0.5 && *h > 0.5)
-                .map(|(x, y, w, h)| InteractionRegion { x, y, w, h })
+                .filter(|(_, _, w, h, _)| {
+                    w.is_finite() && h.is_finite() && *w > 0.5 && *h > 0.5
+                })
+                .map(|(x, y, w, h, drag)| InteractionRegion {
+                    x,
+                    y,
+                    w,
+                    h,
+                    drag,
+                })
                 .collect();
             s.passthrough_enabled = passthrough_enabled;
             Some(s.hwnd_raw)
@@ -823,6 +832,41 @@ fn screen_point_is_inside_regions(
         .any(|r| cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h)
 }
 
+fn screen_point_is_inside_drag_region(overlay_hwnd: HWND, screen_point: POINT) -> bool {
+    if !OVERLAY_VISIBLE.load(Ordering::Relaxed) || CLICK_RELAY_ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let (passthrough_enabled, regions) = match overlay_state().lock() {
+        Ok(g) => match g.as_ref() {
+            Some(s) => {
+                if s.hwnd_raw != hwnd_to_raw(overlay_hwnd) {
+                    return false;
+                }
+                (s.passthrough_enabled, s.regions.clone())
+            }
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+
+    if !passthrough_enabled {
+        return false;
+    }
+
+    let mut pt = screen_point;
+    unsafe {
+        let _ = ScreenToClient(overlay_hwnd, &mut pt);
+    }
+    let cx = pt.x as f64;
+    let cy = pt.y as f64;
+    regions
+        .iter()
+        .any(|r| {
+            r.drag && cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h
+        })
+}
+
 fn overlay_should_passthrough_at_screen_point(
     overlay_hwnd: HWND,
     screen_point: POINT,
@@ -1253,21 +1297,29 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         );
         if is_mouse_event {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            // Safety net for stuck drags. If a JS-driven drag was started
-            // (set_overlay_mouse_capture(true)) but the JS mouseup
-            // never fired — e.g., the overlay lost focus mid-drag, or
-            // the WebView was re-mounted — the MOUSE_CAPTURE_ACTIVE flag
-            // would otherwise be stuck true, making the hit-test subclass
-            // keep the overlay mouse-active everywhere.
-            if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP {
-                MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
-            }
             let hwnd_raw = overlay_state()
                 .lock()
                 .ok()
                 .and_then(|g| g.as_ref().map(|s| s.hwnd_raw));
             if let Some(hwnd_raw) = hwnd_raw {
-                update_overlay_mouse_passthrough_for_point(hwnd_from_raw(hwnd_raw), info.pt);
+                let overlay_hwnd = hwnd_from_raw(hwnd_raw);
+                if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
+                    if screen_point_is_inside_drag_region(overlay_hwnd, info.pt) {
+                        CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
+                        CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
+                        MOUSE_CAPTURE_ACTIVE.store(true, Ordering::Release);
+                    }
+                }
+                // Safety net for stuck drags. If a JS-driven drag was started
+                // (set_overlay_mouse_capture(true)) but the JS mouseup
+                // never fired — e.g., the overlay lost focus mid-drag, or
+                // the WebView was re-mounted — the MOUSE_CAPTURE_ACTIVE flag
+                // would otherwise be stuck true, making the hit-test subclass
+                // keep the overlay mouse-active everywhere.
+                if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP {
+                    MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+                }
+                update_overlay_mouse_passthrough_for_point(overlay_hwnd, info.pt);
             }
         }
     }

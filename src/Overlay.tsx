@@ -115,7 +115,13 @@ async function preloadScreenCapture(capture: ScreenCapture): Promise<void> {
 
 type Rect = { x: number; y: number; w: number; h: number };
 type Point = { x: number; y: number };
-type OverlayInteractionRegion = { x: number; y: number; w: number; h: number };
+type OverlayInteractionRegion = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  drag?: boolean;
+};
 
 function setOverlayMouseCapture(active: boolean) {
   invoke("set_overlay_mouse_capture", { active }).catch((e) => {
@@ -236,6 +242,7 @@ function collectOverlayInteractionRegions(): OverlayInteractionRegion[] {
       if (style.display === "none" || style.visibility === "hidden") return;
       if (style.pointerEvents === "none") return;
 
+      const drag = el.classList.contains("screenie-capture-region");
       for (const clientRect of Array.from(el.getClientRects())) {
         const x1 = clamp(clientRect.left, 0, viewportW);
         const y1 = clamp(clientRect.top, 0, viewportH);
@@ -244,7 +251,7 @@ function collectOverlayInteractionRegions(): OverlayInteractionRegion[] {
         const w = x2 - x1;
         const h = y2 - y1;
         if (w < 1 || h < 1) continue;
-        regions.push({ x: x1, y: y1, w, h });
+        regions.push({ x: x1, y: y1, w, h, drag });
       }
     });
 
@@ -262,6 +269,7 @@ function regionsSignature(
       y: Math.round(r.y),
       w: Math.round(r.w),
       h: Math.round(r.h),
+      drag: !!r.drag,
     })),
   });
 }

@@ -414,6 +414,8 @@ struct OverlayInteractionRegion {
     y: f64,
     w: f64,
     h: f64,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    drag: Option<bool>,
 }
 
 #[repr(C)]
@@ -1064,7 +1066,10 @@ fn set_overlay_interaction_regions(
         // HTTRANSPARENT outside them — same UX as the macOS
         // `ignoresMouseEvents` toggle, without hover-time style flips.
         let _ = &window;
-        let tuples = regions.into_iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
+        let tuples = regions
+            .into_iter()
+            .map(|r| (r.x, r.y, r.w, r.h, r.drag.unwrap_or(false)))
+            .collect();
         windows_window::set_overlay_interaction_regions(tuples, passthrough_enabled);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
