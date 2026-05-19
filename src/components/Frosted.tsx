@@ -325,10 +325,10 @@ export function SvgInsetBorder({
 }) {
   const insetStyle = isWindowsPlatform
     ? {
-        left: `${Math.max(0, inset - 0.5)}px`,
-        top: `${Math.max(0, inset - 0.5)}px`,
-        right: `${inset + 0.5}px`,
-        bottom: `${inset + 0.5}px`,
+        left: `${Math.max(0, inset - 0.25)}px`,
+        top: `${Math.max(0, inset - 0.25)}px`,
+        right: `${inset + 0.25}px`,
+        bottom: `${inset + 0.25}px`,
       }
     : { inset: `${inset}px` };
 
