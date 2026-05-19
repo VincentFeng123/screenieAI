@@ -34,6 +34,13 @@ textarea,
   user-select: text;
 }
 
+.screenie-capture-region,
+.screenie-move-hit,
+.screenie-handle-hit {
+  touch-action: none;
+  -webkit-user-drag: none;
+}
+
 /* Translucent frosted surface. Heavy blur does the readability work; the
    tinted base (alpha ~0.55) is a uniform gray wash so text contrast stays
    acceptable when the underlying capture is bright or busy. The inset gray

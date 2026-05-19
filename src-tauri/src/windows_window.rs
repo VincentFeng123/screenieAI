@@ -71,15 +71,15 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecute
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CallNextHookEx, EnumChildWindows, EnumWindows, GetForegroundWindow,
     GetCursorPos, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
-    IsWindowVisible, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GW_CHILD, GW_HWNDNEXT,
-    GWL_EXSTYLE, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    IsWindowVisible, ReleaseCapture, SetCapture, SetForegroundWindow, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GW_CHILD,
+    GW_HWNDNEXT, GWL_EXSTYLE, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
     MA_NOACTIVATE, MSLLHOOKSTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT,
 };
 
 // `windows-rs 0.58` represents every HANDLE-style type as
@@ -182,6 +182,12 @@ static BG_LAST_SIGNAL_MS: AtomicU64 = AtomicU64::new(0);
 /// when windows move. The loop tick is cheap (~1ms BitBlt + hash); the
 /// expensive PNG encode + IPC emit runs only on hash change.
 static CONTINUOUS_CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Backstop for cursor-tracked pass-through. The low-level mouse hook updates
+/// this on native events, but a fast press can arrive while WS_EX_TRANSPARENT
+/// still reflects the previous cursor location. Polling while the overlay is
+/// visible keeps the native hit-test state warm even when WebView2/Windows
+/// coalesces or reroutes the last move event.
+static MOUSE_PASSTHROUGH_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn overlay_state() -> &'static Mutex<Option<OverlayState>> {
     OVERLAY.get_or_init(|| Mutex::new(None))
@@ -291,6 +297,7 @@ pub fn order_overlay_window(window: &WebviewWindow) {
 /// when at least one hook is active.
 pub fn install_overlay_escape_monitor() -> bool {
     OVERLAY_VISIBLE.store(true, Ordering::Release);
+    start_overlay_mouse_passthrough_sync();
     let kb = install_keyboard_hook();
     let m = install_mouse_hook();
     kb || m
@@ -301,6 +308,8 @@ pub fn install_overlay_escape_monitor() -> bool {
 /// it without re-pushing regions from React.
 pub fn uninstall_overlay_escape_monitor() {
     OVERLAY_VISIBLE.store(false, Ordering::Release);
+    stop_overlay_mouse_passthrough_sync();
+    release_native_mouse_capture_on_main();
     MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
     CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
     MOUSE_PASSTHROUGH_ACTIVE.store(false, Ordering::Release);
@@ -366,6 +375,7 @@ pub fn prepare_overlay_for_new_capture() {
     CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
     CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
     MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    release_native_mouse_capture_on_main();
     if let Ok(mut g) = capture_region_drag_state().lock() {
         *g = None;
     }
@@ -439,7 +449,14 @@ pub fn set_overlay_mouse_capture(active: bool) {
         .ok()
         .and_then(|g| g.as_ref().map(|s| s.hwnd_raw));
     if let Some(hwnd_raw) = hwnd_raw {
+        if active {
+            run_overlay_hwnd_update_on_main(hwnd_raw, set_native_mouse_capture);
+        } else {
+            run_overlay_hwnd_update_on_main(hwnd_raw, release_native_mouse_capture_for_hwnd);
+        }
         sync_overlay_mouse_passthrough_on_main(hwnd_raw);
+    } else if !active {
+        release_native_mouse_capture();
     }
 }
 
@@ -724,6 +741,33 @@ pub fn stop_overlay_continuous_capture() {
 // Internals
 // ---------------------------------------------------------------------------
 
+fn start_overlay_mouse_passthrough_sync() {
+    if MOUSE_PASSTHROUGH_SYNC_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(16));
+        interval.tick().await;
+        while MOUSE_PASSTHROUGH_SYNC_RUNNING.load(Ordering::Acquire) {
+            interval.tick().await;
+            if !OVERLAY_VISIBLE.load(Ordering::Relaxed) {
+                continue;
+            }
+            let hwnd_raw = overlay_state()
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|s| s.hwnd_raw));
+            if let Some(hwnd_raw) = hwnd_raw {
+                sync_overlay_mouse_passthrough_for_current_cursor_if_needed(hwnd_raw);
+            }
+        }
+    });
+}
+
+fn stop_overlay_mouse_passthrough_sync() {
+    MOUSE_PASSTHROUGH_SYNC_RUNNING.store(false, Ordering::Release);
+}
+
 fn get_hwnd(window: &WebviewWindow) -> Option<HWND> {
     match window.hwnd() {
         // Reconstruct via the inner raw pointer. Tauri uses a different
@@ -937,7 +981,9 @@ fn begin_capture_region_drag(hwnd_raw: isize, start: POINT, button_number: i32) 
     CLICK_RELAY_ACTIVE.store(false, Ordering::Release);
     CLICK_RELAY_GENERATION.fetch_add(1, Ordering::AcqRel);
     MOUSE_CAPTURE_ACTIVE.store(true, Ordering::Release);
-    set_overlay_mouse_passthrough(hwnd_from_raw(hwnd_raw), false);
+    let hwnd = hwnd_from_raw(hwnd_raw);
+    set_native_mouse_capture(hwnd);
+    set_overlay_mouse_passthrough(hwnd, false);
     if let Ok(mut g) = capture_region_drag_state().lock() {
         *g = Some(CaptureRegionDragState {
             hwnd_raw,
@@ -963,6 +1009,7 @@ fn handle_capture_region_drag_event(overlay_hwnd: HWND, msg: u32, point: POINT) 
         if state.hwnd_raw != hwnd_to_raw(overlay_hwnd) {
             *g = None;
             MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+            release_native_mouse_capture();
             return None;
         }
 
@@ -983,6 +1030,7 @@ fn handle_capture_region_drag_event(overlay_hwnd: HWND, msg: u32, point: POINT) 
             let button_number = state.button_number;
             *g = None;
             MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+            release_native_mouse_capture();
             should_update_passthrough = true;
             if was_active {
                 emit = Some(("end", dx, dy));
@@ -1063,6 +1111,22 @@ fn update_overlay_mouse_passthrough_for_current_cursor(overlay_hwnd: HWND) {
     }
 }
 
+fn sync_overlay_mouse_passthrough_for_current_cursor_if_needed(hwnd_raw: isize) {
+    let overlay_hwnd = hwnd_from_raw(hwnd_raw);
+    let mut pt = POINT { x: 0, y: 0 };
+    let desired = unsafe {
+        if GetCursorPos(&mut pt).is_ok() {
+            overlay_should_passthrough_at_screen_point(overlay_hwnd, pt)
+        } else {
+            return;
+        }
+    };
+    if MOUSE_PASSTHROUGH_ACTIVE.load(Ordering::Acquire) == desired {
+        return;
+    }
+    force_overlay_mouse_passthrough_on_main(hwnd_raw, desired);
+}
+
 fn sync_overlay_mouse_passthrough_on_main(hwnd_raw: isize) {
     run_overlay_hwnd_update_on_main(
         hwnd_raw,
@@ -1094,6 +1158,36 @@ fn set_overlay_mouse_passthrough(overlay_hwnd: HWND, active: bool) {
     }
     unsafe {
         set_hwnd_transparent_style(overlay_hwnd, active);
+    }
+}
+
+fn set_native_mouse_capture(hwnd: HWND) {
+    unsafe {
+        if IsWindow(hwnd).as_bool() {
+            let _ = SetCapture(hwnd);
+        }
+    }
+}
+
+fn release_native_mouse_capture_for_hwnd(_hwnd: HWND) {
+    release_native_mouse_capture();
+}
+
+fn release_native_mouse_capture_on_main() {
+    let hwnd_raw = overlay_state()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.hwnd_raw));
+    if let Some(hwnd_raw) = hwnd_raw {
+        run_overlay_hwnd_update_on_main(hwnd_raw, release_native_mouse_capture_for_hwnd);
+    } else {
+        release_native_mouse_capture();
+    }
+}
+
+fn release_native_mouse_capture() {
+    unsafe {
+        let _ = ReleaseCapture();
     }
 }
 
@@ -1465,6 +1559,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 // keep the overlay mouse-active everywhere.
                 if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP {
                     MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+                    release_native_mouse_capture();
                 }
                 update_overlay_mouse_passthrough_for_point(overlay_hwnd, info.pt);
             }

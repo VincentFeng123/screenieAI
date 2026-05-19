@@ -1142,6 +1142,8 @@ type DragSession = {
   mouseX: number;
   mouseY: number;
   button: number;
+  pointerId: number | null;
+  captureTarget: HTMLElement | null;
   relayClickThrough: boolean;
   dragging: boolean;
 };
@@ -1182,7 +1184,17 @@ function useRectDrag(
   const nativeDragRef = useRef<{ start: Rect } | null>(null);
 
   useEffect(() => {
-    const onMove = (e: MouseEvent) => {
+    const releasePointerCapture = (d: DragSession) => {
+      if (d.pointerId === null || !d.captureTarget) return;
+      try {
+        if (d.captureTarget.hasPointerCapture(d.pointerId)) {
+          d.captureTarget.releasePointerCapture(d.pointerId);
+        }
+      } catch {
+        /* Pointer capture can already be gone after pointercancel/lostcapture. */
+      }
+    };
+    const onMove = (e: PointerEvent) => {
       const d = dragRef.current;
       if (!d) return;
       const dx = e.clientX - d.mouseX;
@@ -1201,7 +1213,7 @@ function useRectDrag(
       const next = applyDrag(d.start, d.kind, dx, dy, bounds);
       setRectRef.current(next);
     };
-    const onUp = (e: MouseEvent) => {
+    const finishDrag = (e: PointerEvent, cancelled = false) => {
       const d = dragRef.current;
       if (!d) return;
       const dx = e.clientX - d.mouseX;
@@ -1211,8 +1223,9 @@ function useRectDrag(
         Math.abs(dx) < CLICK_THRESHOLD &&
         Math.abs(dy) < CLICK_THRESHOLD;
       dragRef.current = null;
+      releasePointerCapture(d);
       setOverlayMouseCapture(false);
-      if (d.relayClickThrough && wasClick) {
+      if (!cancelled && d.relayClickThrough && wasClick) {
         relayOverlayPointerClick(d.button);
       }
       // Pass the rect at drag-start alongside the final rect so callers can
@@ -1220,16 +1233,27 @@ function useRectDrag(
       // captured by the consumer's closure doesn't work — by the time onUp
       // fires the closure has already re-rendered with the latest rect, so
       // the two would always match.
-      onEndRef.current?.(rectRef.current, d.start);
+      if (!cancelled) {
+        onEndRef.current?.(rectRef.current, d.start);
+      }
     };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    const onUp = (e: PointerEvent) => finishDrag(e);
+    const onCancel = (e: PointerEvent) => {
+      const d = dragRef.current;
+      finishDrag(e, true);
+      if (d) callbacksRef.current?.onCancel?.(d.kind, d.start, rectRef.current);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
     return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
       if (dragRef.current) {
         const d = dragRef.current;
         dragRef.current = null;
+        releasePointerCapture(d);
         setOverlayMouseCapture(false);
         callbacksRef.current?.onCancel?.(d.kind, d.start, rectRef.current);
       }
@@ -1281,15 +1305,23 @@ function useRectDrag(
   }, []);
 
   return useCallback(
-    (kind: "move" | Handle, options?: RectDragOptions) => (e: React.MouseEvent) => {
+    (kind: "move" | Handle, options?: RectDragOptions) => (e: React.PointerEvent<HTMLElement>) => {
       e.stopPropagation();
       e.preventDefault();
+      let captureTarget: HTMLElement | null = e.currentTarget;
+      try {
+        captureTarget.setPointerCapture(e.pointerId);
+      } catch {
+        captureTarget = null;
+      }
       dragRef.current = {
         kind,
         start: rectRef.current,
         mouseX: e.clientX,
         mouseY: e.clientY,
         button: e.button,
+        pointerId: e.pointerId,
+        captureTarget,
         relayClickThrough: kind === "move" && !!options?.relayClickThrough,
         dragging: false,
       };
@@ -1993,7 +2025,7 @@ function AdjustingLayer({
           cursor: "default",
           pointerEvents: editCtl.tool ? "none" : "auto",
         }}
-        onMouseDown={beginDrag("move", { relayClickThrough: true })}
+        onPointerDown={beginDrag("move", { relayClickThrough: true })}
         onWheel={(e) => {
           if (editCtl.tool) return;
           e.preventDefault();
@@ -2005,7 +2037,7 @@ function AdjustingLayer({
         <div
           key={`move-${i}`}
           className="screenie-move-hit"
-          onMouseDown={beginDrag("move")}
+          onPointerDown={beginDrag("move")}
           style={{ ...style, pointerEvents: editCtl.tool ? "none" : "auto" }}
         />
       ))}
@@ -2016,7 +2048,7 @@ function AdjustingLayer({
         <div
           key={`hit-${h}`}
           className="screenie-handle-hit"
-          onMouseDown={beginDrag(h)}
+          onPointerDown={beginDrag(h)}
           style={{
             ...handleHitArea(rect, h),
             pointerEvents: editCtl.tool ? "none" : "auto",
@@ -4138,7 +4170,7 @@ function ResultLayer({
       )}
       <div
         className="screenie-capture-region"
-        onMouseDown={beginRectDrag("move", { relayClickThrough: true })}
+        onPointerDown={beginRectDrag("move", { relayClickThrough: true })}
         onWheel={(e) => {
           if (editCtl.tool) return;
           e.preventDefault();
@@ -4163,7 +4195,7 @@ function ResultLayer({
         <div
           key={`move-${i}`}
           className="screenie-move-hit"
-          onMouseDown={beginRectDrag("move")}
+          onPointerDown={beginRectDrag("move")}
           style={{ ...style, pointerEvents: editCtl.tool ? "none" : "auto" }}
         />
       ))}
@@ -4174,7 +4206,7 @@ function ResultLayer({
         <div
           key={`hit-${h}`}
           className="screenie-handle-hit"
-          onMouseDown={beginRectDrag(h)}
+          onPointerDown={beginRectDrag(h)}
           style={{
             ...handleHitArea(rect, h),
             pointerEvents: editCtl.tool ? "none" : "auto",
