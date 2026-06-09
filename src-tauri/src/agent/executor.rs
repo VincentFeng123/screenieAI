@@ -6,8 +6,8 @@ use super::grounding::{
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
 use super::types::{
-    is_secure_text_role, normalize_signature_name, Action, CoordinateSpace, Element,
-    ElementSource, FocusedApp, FocusedAppProvider, MenuPressOutcome, ObservationError, Planner,
+    is_secure_text_role, normalize_signature_name, Action, CoordinateSpace, Element, ElementSource,
+    FocusedApp, FocusedAppProvider, MenuPressOutcome, ObservationError, Planner,
     PlannerHistoryEntry, Rect, ScreenObserver,
 };
 use super::vision::{
@@ -427,6 +427,8 @@ pub struct AgentStepReport {
     pub execution_policy: ExecutionPolicy,
     pub executed: bool,
     pub mechanism: Option<ActionMechanism>,
+    /// Wall-clock time the whole step took (planning through verification).
+    pub duration_ms: Option<u64>,
     pub safety_gate: Option<SafetyGateReport>,
     pub confirmation: Option<ConfirmationOutcome>,
     pub verification: VerificationReport,
@@ -564,6 +566,10 @@ pub trait ConfirmationRequester {
     /// a step's action has been planned and is about to run. Default is a
     /// no-op so test requesters need no changes.
     fn notify_step(&self, _step: &AgentStepReport) {}
+
+    /// Fired once a step has settled (verified, skipped, or failed) with the
+    /// final report including mechanism and duration. Default is a no-op.
+    fn notify_step_result(&self, _step: &AgentStepReport) {}
 
     /// Blocking free-text question to the user (the `ask` action and the
     /// stuck-recovery prompt). Default is unavailable so headless and test
@@ -1610,6 +1616,10 @@ where
     // class (fast UI tweaks vs. app/page navigation).
     let mut carried_observation: Option<(StableObservation, Instant)> = None;
     let mut pre_step_settle = stable_timeout;
+    // Batched follow-up actions from the last decision: pre-resolved against
+    // the planning observation, executed without another model call.
+    let mut queued: VecDeque<(PreparedAction, Action, String)> = VecDeque::new();
+    let mut last_step_clean = true;
 
     'steps: while step_index < step_budget {
         if run_started.elapsed() >= wall_clock_budget {
@@ -1668,12 +1678,20 @@ where
 
         step_index = step_index.saturating_add(1);
         let step_number = step_index;
+        let step_started = Instant::now();
         if abort.is_aborted() {
             executor.release_held_inputs();
             terminal_status = Some(AgentRunStatus::Aborted);
             failure_reason = Some("agent aborted".into());
             break;
         }
+
+        // A batch only survives cleanly verified steps; any rejection,
+        // no-op, refresh failure, or recovery invalidates what's left of it.
+        if !last_step_clean {
+            queued.clear();
+        }
+        last_step_clean = false;
 
         let focused_before_observation = match observer.focused_app() {
             Ok(app) => app,
@@ -1768,6 +1786,9 @@ where
         } else {
             GroundingMode::OnePass
         };
+        let from_queue = queued.pop_front();
+        let planned_fresh = from_queue.is_none();
+        let mut decision_followups: Vec<Action> = Vec::new();
         let (
             action,
             planner_reason,
@@ -1776,53 +1797,112 @@ where
             grounding_report,
             decision_expect,
             secure_typing,
-        ) = loop {
-            let decision = planner
-                .next_action(&planner_goal, &before, &planning_history)
-                .await;
-            if let Some(note) = decision.note.as_deref() {
-                push_agent_note(&mut notes, note);
-            }
-            if decision.milestone_done
-                && !milestone_advanced_this_step
-                && current_milestone < milestones.len()
-            {
-                milestone_advanced_this_step = true;
-                current_milestone += 1;
-                eprintln!(
-                    "[screenie] agent step {} milestone {}/{} complete",
-                    step_number,
-                    current_milestone,
-                    milestones.len()
-                );
-            }
-            let decision_expect = decision.expect.clone();
-            let mut action = decision.action.clone();
-            let planner_reason = decision.reason.clone();
-            let mut preparation_observation = before.clone();
-            let grounding_plan = GroundedActionPlan::from_action(&action);
-            let mut grounding_report = None;
-            if let Some(plan) = grounding_plan.as_ref() {
-                match resolve_grounded_action(
-                    observer,
-                    grounder,
-                    &options,
-                    &before,
-                    plan,
-                    initial_grounding_mode,
-                )
-                .await
+        ) = if let Some((queued_prepared, queued_action, queued_reason)) = from_queue {
+            // Batched follow-up: no model call. The stored target gets
+            // re-validated by refresh_prepared_target before execution, and
+            // the safety gate still runs.
+            (
+                queued_action,
+                queued_reason,
+                queued_prepared,
+                None,
+                None,
+                None,
+                false,
+            )
+        } else {
+            loop {
+                let decision = planner
+                    .next_action(&planner_goal, &before, &planning_history)
+                    .await;
+                decision_followups = decision.followups.clone();
+                if let Some(note) = decision.note.as_deref() {
+                    push_agent_note(&mut notes, note);
+                }
+                if decision.milestone_done
+                    && !milestone_advanced_this_step
+                    && current_milestone < milestones.len()
                 {
-                    Ok((resolved_action, synthetic, report)) => {
-                        action = resolved_action;
-                        grounding_report = Some(report);
-                        preparation_observation.push(synthetic);
+                    milestone_advanced_this_step = true;
+                    current_milestone += 1;
+                    eprintln!(
+                        "[screenie] agent step {} milestone {}/{} complete",
+                        step_number,
+                        current_milestone,
+                        milestones.len()
+                    );
+                }
+                let decision_expect = decision.expect.clone();
+                let mut action = decision.action.clone();
+                let planner_reason = decision.reason.clone();
+                let mut preparation_observation = before.clone();
+                let grounding_plan = GroundedActionPlan::from_action(&action);
+                let mut grounding_report = None;
+                if let Some(plan) = grounding_plan.as_ref() {
+                    match resolve_grounded_action(
+                        observer,
+                        grounder,
+                        &options,
+                        &before,
+                        plan,
+                        initial_grounding_mode,
+                    )
+                    .await
+                    {
+                        Ok((resolved_action, synthetic, report)) => {
+                            action = resolved_action;
+                            grounding_report = Some(report);
+                            preparation_observation.push(synthetic);
+                        }
+                        Err(report) => {
+                            let reason = report
+                                .failure_reason
+                                .clone()
+                                .unwrap_or_else(|| "grounding failed".into());
+                            let step = AgentStepReport {
+                                step: step_number,
+                                action,
+                                planner_reason: Some(planner_reason),
+                                target: None,
+                                click_point: None,
+                                click_preflight: None,
+                                execution_policy: options.execution_policy,
+                                executed: false,
+                                mechanism: None,
+                                duration_ms: None,
+                                safety_gate: None,
+                                confirmation: None,
+                                verification: VerificationReport::skipped_no_change_expected(),
+                                settle_status,
+                                calibration: None,
+                                observation_source: observation_metadata.source,
+                                vision_candidate_count: observation_metadata.candidate_count,
+                                vision_trigger_reason: observation_metadata.trigger_reason.clone(),
+                                vision_capture_size: observation_metadata.capture_size,
+                                vision_detector_kind: observation_metadata.detector_kind.clone(),
+                                grounding: Some(report),
+                                failure_reason: Some(reason.clone()),
+                            };
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            terminal_status = Some(AgentRunStatus::Failed);
+                            failure_reason = Some(reason);
+                            break 'steps;
+                        }
                     }
-                    Err(report) => {
-                        let reason = report
-                            .failure_reason
-                            .clone()
-                            .unwrap_or_else(|| "grounding failed".into());
+                } else {
+                    for synthetic in observer.synthetic_elements_for_action(&action) {
+                        if !preparation_observation
+                            .iter()
+                            .any(|element| element.id == synthetic.id)
+                        {
+                            preparation_observation.push(synthetic);
+                        }
+                    }
+                }
+                let prepared = match prepare_action(&action, &preparation_observation) {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        let reason = err.to_string();
                         let step = AgentStepReport {
                             step: step_number,
                             action,
@@ -1833,6 +1913,7 @@ where
                             execution_policy: options.execution_policy,
                             executed: false,
                             mechanism: None,
+                            duration_ms: None,
                             safety_gate: None,
                             confirmation: None,
                             verification: VerificationReport::skipped_no_change_expected(),
@@ -1843,167 +1924,151 @@ where
                             vision_trigger_reason: observation_metadata.trigger_reason.clone(),
                             vision_capture_size: observation_metadata.capture_size,
                             vision_detector_kind: observation_metadata.detector_kind.clone(),
-                            grounding: Some(report),
+                            grounding: grounding_report,
                             failure_reason: Some(reason.clone()),
                         };
-                        log_agent_step(&step);
-                        steps.push(step);
+                        commit_step(confirmations, &mut steps, step, step_started);
                         terminal_status = Some(AgentRunStatus::Failed);
                         failure_reason = Some(reason);
                         break 'steps;
                     }
-                }
-            } else {
-                for synthetic in observer.synthetic_elements_for_action(&action) {
-                    if !preparation_observation
-                        .iter()
-                        .any(|element| element.id == synthetic.id)
-                    {
-                        preparation_observation.push(synthetic);
-                    }
-                }
-            }
-            let prepared = match prepare_action(&action, &preparation_observation) {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    let reason = err.to_string();
-                    let step = AgentStepReport {
-                        step: step_number,
-                        action,
-                        planner_reason: Some(planner_reason),
-                        target: None,
-                        click_point: None,
-                        click_preflight: None,
-                        execution_policy: options.execution_policy,
-                        executed: false,
-                        mechanism: None,
-                        safety_gate: None,
-                        confirmation: None,
-                        verification: VerificationReport::skipped_no_change_expected(),
-                        settle_status,
-                        calibration: None,
-                        observation_source: observation_metadata.source,
-                        vision_candidate_count: observation_metadata.candidate_count,
-                        vision_trigger_reason: observation_metadata.trigger_reason.clone(),
-                        vision_capture_size: observation_metadata.capture_size,
-                        vision_detector_kind: observation_metadata.detector_kind.clone(),
-                        grounding: grounding_report,
-                        failure_reason: Some(reason.clone()),
-                    };
-                    log_agent_step(&step);
-                    steps.push(step);
-                    terminal_status = Some(AgentRunStatus::Failed);
-                    failure_reason = Some(reason);
-                    break 'steps;
-                }
-            };
+                };
 
-            // Typing into a secure (password) field: the literal text never
-            // leaves this loop except inside `prepared` for execution — every
-            // report, history entry, prompt, and confirmation sees `•••`.
-            let secure_typing = secure_typing_target(&action, &prepared, &before);
-            let display_action = if secure_typing {
-                redact_action_for_trace(&action)
-            } else {
-                action.clone()
-            };
+                // Typing into a secure (password) field: the literal text never
+                // leaves this loop except inside `prepared` for execution — every
+                // report, history entry, prompt, and confirmation sees `•••`.
+                let secure_typing = secure_typing_target(&action, &prepared, &before);
+                let display_action = if secure_typing {
+                    redact_action_for_trace(&action)
+                } else {
+                    action.clone()
+                };
 
-            if let Some(reason) = stuck_recovery
-                .rejection_for(&normalized_progress_action(&display_action, &prepared))
-                .or_else(|| {
-                    planner_action_rejection_reason(
-                        &action,
-                        &prepared,
-                        &before,
-                        &steps,
-                        &options.goal,
-                    )
-                })
-                .or_else(|| {
-                    duplicate_successful_action_reason(&action, &prepared, &steps, &options.goal)
-                })
-            {
-                if duplicate_rejections >= MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP {
-                    let normalized = normalized_progress_action(&display_action, &prepared);
-                    let stage = stuck_recovery.escalate_rejection(&normalized, &reason);
-                    let exhausted = stage == StuckRecoveryStage::Exhausted;
-                    if stage == StuckRecoveryStage::VisionReplan {
-                        force_visual_replan_next = Some("after-rejection-cap".into());
-                    }
-                    if exhausted {
-                        eprintln!(
+                if let Some(reason) = stuck_recovery
+                    .rejection_for(&normalized_progress_action(&display_action, &prepared))
+                    .or_else(|| {
+                        planner_action_rejection_reason(
+                            &action,
+                            &prepared,
+                            &before,
+                            &steps,
+                            &options.goal,
+                        )
+                    })
+                    .or_else(|| {
+                        duplicate_successful_action_reason(
+                            &action,
+                            &prepared,
+                            &steps,
+                            &options.goal,
+                        )
+                    })
+                {
+                    if duplicate_rejections >= MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP {
+                        let normalized = normalized_progress_action(&display_action, &prepared);
+                        let stage = stuck_recovery.escalate_rejection(&normalized, &reason);
+                        let exhausted = stage == StuckRecoveryStage::Exhausted;
+                        if stage == StuckRecoveryStage::VisionReplan {
+                            force_visual_replan_next = Some("after-rejection-cap".into());
+                        }
+                        if exhausted {
+                            eprintln!(
                             "[screenie] agent step {} rejection cap exhausted recovery ladder; failing",
                             step_number
                         );
-                    } else {
-                        eprintln!(
+                        } else {
+                            eprintln!(
                             "[screenie] agent step {} rejection cap hit; banning '{normalized}' and escalating recovery stage={stage:?}",
                             step_number
                         );
+                        }
+                        history.push(PlannerHistoryEntry::new(
+                            display_action.clone(),
+                            planner_reason.clone(),
+                            format!("rejected without execution: {reason}"),
+                        ));
+                        let step = AgentStepReport {
+                            step: step_number,
+                            action: display_action,
+                            planner_reason: Some(planner_reason),
+                            target: prepared.target.clone(),
+                            click_point: prepared.click_point,
+                            click_preflight: None,
+                            execution_policy: options.execution_policy,
+                            executed: false,
+                            mechanism: None,
+                            duration_ms: None,
+                            safety_gate: None,
+                            confirmation: None,
+                            verification: VerificationReport::skipped_no_change_expected(),
+                            settle_status,
+                            calibration: None,
+                            observation_source: observation_metadata.source,
+                            vision_candidate_count: observation_metadata.candidate_count,
+                            vision_trigger_reason: observation_metadata.trigger_reason.clone(),
+                            vision_capture_size: observation_metadata.capture_size,
+                            vision_detector_kind: observation_metadata.detector_kind.clone(),
+                            grounding: grounding_report.clone(),
+                            failure_reason: exhausted.then(|| reason.clone()),
+                        };
+                        commit_step(confirmations, &mut steps, step, step_started);
+                        if exhausted {
+                            terminal_status = Some(AgentRunStatus::Failed);
+                            failure_reason = Some(reason);
+                            break 'steps;
+                        }
+                        continue 'steps;
                     }
-                    history.push(PlannerHistoryEntry::new(
-                        display_action.clone(),
-                        planner_reason.clone(),
-                        format!("rejected without execution: {reason}"),
-                    ));
-                    let step = AgentStepReport {
-                        step: step_number,
-                        action: display_action,
-                        planner_reason: Some(planner_reason),
-                        target: prepared.target.clone(),
-                        click_point: prepared.click_point,
-                        click_preflight: None,
-                        execution_policy: options.execution_policy,
-                        executed: false,
-                        mechanism: None,
-                        safety_gate: None,
-                        confirmation: None,
-                        verification: VerificationReport::skipped_no_change_expected(),
-                        settle_status,
-                        calibration: None,
-                        observation_source: observation_metadata.source,
-                        vision_candidate_count: observation_metadata.candidate_count,
-                        vision_trigger_reason: observation_metadata.trigger_reason.clone(),
-                        vision_capture_size: observation_metadata.capture_size,
-                        vision_detector_kind: observation_metadata.detector_kind.clone(),
-                        grounding: grounding_report.clone(),
-                        failure_reason: exhausted.then(|| reason.clone()),
-                    };
-                    log_agent_step(&step);
-                    steps.push(step);
-                    if exhausted {
-                        terminal_status = Some(AgentRunStatus::Failed);
-                        failure_reason = Some(reason);
-                        break 'steps;
-                    }
-                    continue 'steps;
-                }
 
-                eprintln!(
-                    "[screenie] agent step {} rejected planner action: {}",
-                    step_number, reason
-                );
-                planning_history.push(PlannerHistoryEntry::new(
+                    eprintln!(
+                        "[screenie] agent step {} rejected planner action: {}",
+                        step_number, reason
+                    );
+                    planning_history.push(PlannerHistoryEntry::new(
                     display_action,
                     planner_reason,
                     format!(
                         "rejected without execution: {reason}. Do not repeat this action; choose a different action for the next unfinished step."
                     ),
                 ));
-                duplicate_rejections = duplicate_rejections.saturating_add(1);
-                continue;
-            }
+                    duplicate_rejections = duplicate_rejections.saturating_add(1);
+                    continue;
+                }
 
-            break (
-                display_action,
-                planner_reason,
-                prepared,
-                grounding_plan,
-                grounding_report,
-                decision_expect,
-                secure_typing,
-            );
+                break (
+                    display_action,
+                    planner_reason,
+                    prepared,
+                    grounding_plan,
+                    grounding_report,
+                    decision_expect,
+                    secure_typing,
+                );
+            }
         };
+
+        // Queue this decision's follow-up batch, pre-resolved against the
+        // planning observation (ids are re-assigned every observe). Anything
+        // secure, destructive, or unresolvable truncates the batch; the
+        // execution-time gate still re-checks whatever gets through.
+        if planned_fresh {
+            for follow in std::mem::take(&mut decision_followups) {
+                let Ok(prepared_follow) = prepare_action(&follow, &before) else {
+                    break;
+                };
+                if secure_typing_target(&follow, &prepared_follow, &before)
+                    || destructive_action_reason(&follow, prepared_follow.target.as_ref(), &options)
+                        .is_some()
+                {
+                    break;
+                }
+                queued.push_back((
+                    prepared_follow,
+                    follow,
+                    format!("batched: {planner_reason}"),
+                ));
+            }
+        }
 
         let mut step = AgentStepReport {
             step: step_number,
@@ -2015,6 +2080,7 @@ where
             execution_policy: options.execution_policy,
             executed: false,
             mechanism: None,
+            duration_ms: None,
             safety_gate: None,
             confirmation: None,
             verification: VerificationReport::skipped_no_change_expected(),
@@ -2033,16 +2099,14 @@ where
         match &prepared.kind {
             PreparedKind::Done => {
                 terminal_status = Some(AgentRunStatus::Done);
-                log_agent_step(&step);
-                steps.push(step);
+                commit_step(confirmations, &mut steps, step, step_started);
                 break;
             }
             PreparedKind::Fail { reason } => {
                 step.failure_reason = Some(reason.clone());
                 terminal_status = Some(AgentRunStatus::Failed);
                 failure_reason = Some(reason.clone());
-                log_agent_step(&step);
-                steps.push(step);
+                commit_step(confirmations, &mut steps, step, step_started);
                 break;
             }
             PreparedKind::ReadPage => {
@@ -2068,11 +2132,13 @@ where
                     planner_reason.clone(),
                     result_text,
                 ));
-                log_agent_step(&step);
-                steps.push(step);
+                commit_step(confirmations, &mut steps, step, step_started);
                 continue 'steps;
             }
-            PreparedKind::Ask { question, options: choices } => {
+            PreparedKind::Ask {
+                question,
+                options: choices,
+            } => {
                 // Read-only like readPage: no input events, no safety gate.
                 let result_text = if options.execution_policy.is_dry_run() {
                     "dry-run: ask skipped".to_string()
@@ -2098,8 +2164,7 @@ where
                             step.failure_reason = Some("agent aborted".into());
                             terminal_status = Some(AgentRunStatus::Aborted);
                             failure_reason = Some("agent aborted".into());
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             break;
                         }
                         UserAnswerStatus::TimedOut | UserAnswerStatus::Unavailable => {
@@ -2113,8 +2178,7 @@ where
                     planner_reason.clone(),
                     result_text,
                 ));
-                log_agent_step(&step);
-                steps.push(step);
+                commit_step(confirmations, &mut steps, step, step_started);
                 continue 'steps;
             }
             _ => {}
@@ -2144,8 +2208,7 @@ where
                 step.failure_reason = Some("agent aborted".into());
                 terminal_status = Some(AgentRunStatus::Aborted);
                 failure_reason = Some("agent aborted".into());
-                log_agent_step(&step);
-                steps.push(step);
+                commit_step(confirmations, &mut steps, step, step_started);
                 break 'steps;
             }
 
@@ -2181,8 +2244,7 @@ where
                             step.failure_reason = Some(reason.clone());
                             terminal_status = Some(AgentRunStatus::Failed);
                             failure_reason = Some(reason);
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             break 'steps;
                         }
                         NoProgressOutcome::Recovering(stage) => {
@@ -2190,13 +2252,11 @@ where
                                 "[screenie] agent step {} stuck-recovery stage={:?}",
                                 step_number, stage
                             );
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             continue 'steps;
                         }
                         NoProgressOutcome::Recorded => {
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             continue 'steps;
                         }
                     }
@@ -2214,8 +2274,7 @@ where
                     step.failure_reason = Some(reason.clone());
                     terminal_status = Some(AgentRunStatus::Failed);
                     failure_reason = Some(reason);
-                    log_agent_step(&step);
-                    steps.push(step);
+                    commit_step(confirmations, &mut steps, step, step_started);
                     break 'steps;
                 }
             };
@@ -2231,8 +2290,7 @@ where
                 step.failure_reason = Some(reason.clone());
                 terminal_status = Some(AgentRunStatus::Failed);
                 failure_reason = Some(reason);
-                log_agent_step(&step);
-                steps.push(step);
+                commit_step(confirmations, &mut steps, step, step_started);
                 break 'steps;
             }
 
@@ -2303,8 +2361,7 @@ where
                     step.failure_reason = Some(gate.reason.clone());
                     terminal_status = Some(AgentRunStatus::Failed);
                     failure_reason = Some(gate.reason);
-                    log_agent_step(&step);
-                    steps.push(step);
+                    commit_step(confirmations, &mut steps, step, step_started);
                     break 'steps;
                 }
                 SafetyDecision::RequireConfirm => {
@@ -2333,16 +2390,14 @@ where
                             step.failure_reason = Some("agent aborted".into());
                             terminal_status = Some(AgentRunStatus::Aborted);
                             failure_reason = Some("agent aborted".into());
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             break 'steps;
                         }
                         ConfirmationStatus::Denied => {
                             step.failure_reason = Some("confirmation denied".into());
                             terminal_status = Some(AgentRunStatus::Failed);
                             failure_reason = Some("confirmation denied".into());
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             break 'steps;
                         }
                         ConfirmationStatus::TimedOut => {
@@ -2353,16 +2408,14 @@ where
                             step.failure_reason = Some(reason.clone());
                             terminal_status = Some(AgentRunStatus::Failed);
                             failure_reason = Some(reason);
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             break 'steps;
                         }
                         ConfirmationStatus::Unavailable => {
                             step.failure_reason = Some("confirmation unavailable".into());
                             terminal_status = Some(AgentRunStatus::Failed);
                             failure_reason = Some("confirmation unavailable".into());
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             break 'steps;
                         }
                     }
@@ -2420,8 +2473,7 @@ where
                             step.failure_reason = Some(reason.clone());
                             terminal_status = Some(AgentRunStatus::Failed);
                             failure_reason = Some(reason);
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             break 'steps;
                         }
                         NoProgressOutcome::Recovering(stage) => {
@@ -2429,13 +2481,11 @@ where
                                 "[screenie] agent step {} stuck-recovery stage={:?}",
                                 step_number, stage
                             );
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             continue 'steps;
                         }
                         NoProgressOutcome::Recorded => {
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             continue 'steps;
                         }
                     }
@@ -2469,8 +2519,7 @@ where
                         terminal_status = Some(AgentRunStatus::Failed);
                         failure_reason = Some(reason);
                         executor.release_held_inputs();
-                        log_agent_step(&step);
-                        steps.push(step);
+                        commit_step(confirmations, &mut steps, step, step_started);
                         break 'steps;
                     }
                     step.calibration = Some(calibration);
@@ -2593,8 +2642,7 @@ where
                                 step.failure_reason = Some(reason.clone());
                                 terminal_status = Some(AgentRunStatus::Failed);
                                 failure_reason = Some(reason);
-                                log_agent_step(&step);
-                                steps.push(step);
+                                commit_step(confirmations, &mut steps, step, step_started);
                                 break 'steps;
                             }
                             NoProgressOutcome::Recovering(stage) => {
@@ -2602,13 +2650,11 @@ where
                                     "[screenie] agent step {} stuck-recovery stage={:?}",
                                     step_number, stage
                                 );
-                                log_agent_step(&step);
-                                steps.push(step);
+                                commit_step(confirmations, &mut steps, step, step_started);
                                 continue 'steps;
                             }
                             NoProgressOutcome::Recorded => {
-                                log_agent_step(&step);
-                                steps.push(step);
+                                commit_step(confirmations, &mut steps, step, step_started);
                                 continue 'steps;
                             }
                         }
@@ -2658,8 +2704,8 @@ where
                 Ok(executed) => {
                     step.executed = step.executed || executed;
                     if executed {
-                        step.mechanism = ax_semantic_mechanism
-                            .or_else(|| synthetic_mechanism(&prepared.kind));
+                        step.mechanism =
+                            ax_semantic_mechanism.or_else(|| synthetic_mechanism(&prepared.kind));
                     }
                     log_agent_phase(step_number, "execute-ok", &action, prepared.target.as_ref());
                 }
@@ -2669,8 +2715,7 @@ where
                     terminal_status = Some(AgentRunStatus::Failed);
                     failure_reason = Some(reason);
                     executor.release_held_inputs();
-                    log_agent_step(&step);
-                    steps.push(step);
+                    commit_step(confirmations, &mut steps, step, step_started);
                     break 'steps;
                 }
             }
@@ -2702,8 +2747,7 @@ where
                         step.failure_reason = Some(reason.clone());
                         terminal_status = Some(AgentRunStatus::Failed);
                         failure_reason = Some(reason);
-                        log_agent_step(&step);
-                        steps.push(step);
+                        commit_step(confirmations, &mut steps, step, step_started);
                         break 'steps;
                     }
                     NoProgressOutcome::Recovering(stage) => {
@@ -2711,13 +2755,11 @@ where
                             "[screenie] agent step {} stuck-recovery stage={:?}",
                             step_number, stage
                         );
-                        log_agent_step(&step);
-                        steps.push(step);
+                        commit_step(confirmations, &mut steps, step, step_started);
                         continue 'steps;
                     }
                     NoProgressOutcome::Recorded => {
-                        log_agent_step(&step);
-                        steps.push(step);
+                        commit_step(confirmations, &mut steps, step, step_started);
                         continue 'steps;
                     }
                 }
@@ -2734,12 +2776,8 @@ where
                 VerificationReport::skipped_dry_run()
                     .with_attempts(attempt.min(u8::MAX as u32) as u8)
             } else if prepared.expects_observation_change() {
-                let (mut report, post) = verify_expected_effect(
-                    observer,
-                    &pre_state_hash,
-                    pre_step_settle,
-                    stable_poll,
-                );
+                let (mut report, post) =
+                    verify_expected_effect(observer, &pre_state_hash, pre_step_settle, stable_poll);
                 if let Some(post) = post {
                     let mut detail = summarize_observation_diff(&pre_elements, &post.elements);
                     if let Some(expect) = decision_expect.as_deref() {
@@ -2763,14 +2801,14 @@ where
                 VerificationStatus::Progressed => {
                     recent_no_progress.clear();
                     stuck_recovery.on_progress();
+                    last_step_clean = true;
                     let history_result = step_history_result(&step);
-                    log_agent_step(&step);
                     history.push(PlannerHistoryEntry::new(
                         action,
                         planner_reason,
                         history_result,
                     ));
-                    steps.push(step);
+                    commit_step(confirmations, &mut steps, step, step_started);
                     extend_adaptive_step_budget(
                         adaptive_step_budget,
                         &mut step_budget,
@@ -2781,14 +2819,14 @@ where
                 }
                 VerificationStatus::SkippedDryRun
                 | VerificationStatus::SkippedNoUiChangeExpected => {
+                    last_step_clean = true;
                     let history_result = step_history_result(&step);
-                    log_agent_step(&step);
                     history.push(PlannerHistoryEntry::new(
                         action,
                         planner_reason,
                         history_result,
                     ));
-                    steps.push(step);
+                    commit_step(confirmations, &mut steps, step, step_started);
                     continue 'steps;
                 }
                 VerificationStatus::ObservationFailed => {
@@ -2801,8 +2839,7 @@ where
                     terminal_status = Some(AgentRunStatus::Failed);
                     failure_reason = Some(reason);
                     executor.release_held_inputs();
-                    log_agent_step(&step);
-                    steps.push(step);
+                    commit_step(confirmations, &mut steps, step, step_started);
                     break 'steps;
                 }
                 VerificationStatus::NoOp => {
@@ -2844,8 +2881,12 @@ where
                                             step.failure_reason = Some(err.to_string());
                                             terminal_status = Some(AgentRunStatus::Failed);
                                             failure_reason = Some(err.to_string());
-                                            log_agent_step(&step);
-                                            steps.push(step);
+                                            commit_step(
+                                                confirmations,
+                                                &mut steps,
+                                                step,
+                                                step_started,
+                                            );
                                             break 'steps;
                                         }
                                     }
@@ -2893,8 +2934,7 @@ where
                             step.failure_reason = Some(reason.clone());
                             terminal_status = Some(AgentRunStatus::Failed);
                             failure_reason = Some(reason);
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             break 'steps;
                         }
                         NoProgressOutcome::Recovering(stage) => {
@@ -2902,15 +2942,13 @@ where
                                 "[screenie] agent step {} stuck-recovery stage={:?}",
                                 step_number, stage
                             );
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             continue 'steps;
                         }
                         NoProgressOutcome::Recorded => {
                             force_visual_replan_next =
                                 Some(format!("after-no-op:{}", entry.normalized_action));
-                            log_agent_step(&step);
-                            steps.push(step);
+                            commit_step(confirmations, &mut steps, step, step_started);
                             continue 'steps;
                         }
                     }
@@ -5253,9 +5291,7 @@ fn summarize_observation_diff(before: &[Element], after: &[Element]) -> String {
     let focused_before = before.iter().find(|element| element.focused);
     let focused_after = after.iter().find(|element| element.focused);
     let focus_change = match (focused_before, focused_after) {
-        (Some(previous), Some(current)) if previous.signature != current.signature => {
-            Some(current)
-        }
+        (Some(previous), Some(current)) if previous.signature != current.signature => Some(current),
         (None, Some(current)) => Some(current),
         _ => None,
     };
@@ -5406,13 +5442,30 @@ fn rects_match(a: Rect, b: Rect) -> bool {
         && (a.height - b.height).abs() <= EPSILON
 }
 
+/// Stamp the step's duration, log it, notify UI surfaces of the settled
+/// result, and append it to the run report.
+fn commit_step<Q: ConfirmationRequester>(
+    confirmations: &Q,
+    steps: &mut Vec<AgentStepReport>,
+    mut step: AgentStepReport,
+    started: Instant,
+) {
+    step.duration_ms = Some(started.elapsed().as_millis() as u64);
+    log_agent_step(&step);
+    confirmations.notify_step_result(&step);
+    steps.push(step);
+}
+
 fn step_history_result(step: &AgentStepReport) -> String {
     let mut result = if let Some(reason) = &step.failure_reason {
         format!("failed: {reason}")
     } else if step.execution_policy.is_dry_run() {
         format!("dry-run; verification={:?}", step.verification.status)
     } else if step.executed {
-        match (step.verification.status, step.verification.reason.as_deref()) {
+        match (
+            step.verification.status,
+            step.verification.reason.as_deref(),
+        ) {
             (VerificationStatus::Progressed | VerificationStatus::NoOp, Some(detail)) => {
                 format!("executed; {detail}")
             }
@@ -6665,11 +6718,8 @@ mod tests {
 
         // The exact failure from the log: address bar holds a stale URL, the
         // model types a bare domain over it. openUrl is the reliable path.
-        let stale = text_field_with_value(
-            6,
-            "smart search field",
-            "https://claude.ai/design#examples",
-        );
+        let stale =
+            text_field_with_value(6, "smart search field", "https://claude.ai/design#examples");
         let action = Action::Type {
             id: 6,
             text: "amazon.com".into(),
@@ -6993,8 +7043,8 @@ mod tests {
             normalized_action: "click:abc".into(),
         };
         let feed = |recent: &mut VecDeque<ProgressLoopEntry>,
-                        recovery: &mut StuckRecovery,
-                        force_replan: &mut Option<String>| {
+                    recovery: &mut StuckRecovery,
+                    force_replan: &mut Option<String>| {
             handle_no_progress_entry(recent, recovery, entry.clone(), 8, 3, force_replan)
         };
 
@@ -7163,8 +7213,7 @@ mod tests {
         let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 8]);
         let report = block_on(run_stub_agent_loop(
             &observer,
-            &StubPlanner::single(Action::Wait { ms: 30 })
-                .with_fallback(Action::Wait { ms: 30 }),
+            &StubPlanner::single(Action::Wait { ms: 30 }).with_fallback(Action::Wait { ms: 30 }),
             StubAgentOptions {
                 execution_policy: Some(ExecutionPolicy::Auto),
                 max_steps: Some(50),
@@ -7194,7 +7243,10 @@ mod tests {
     fn destructive_keyword_matching_uses_word_boundaries() {
         assert!(keyword_matches_word_boundary("Send message", "send"));
         assert!(keyword_matches_word_boundary("Buy now!", "buy now"));
-        assert!(keyword_matches_word_boundary("Move to Trash", "move to trash"));
+        assert!(keyword_matches_word_boundary(
+            "Move to Trash",
+            "move to trash"
+        ));
         assert!(!keyword_matches_word_boundary("Sender list", "send"));
         assert!(!keyword_matches_word_boundary("sort ascending", "send"));
         assert!(!keyword_matches_word_boundary("repayments", "pay"));
@@ -7390,9 +7442,10 @@ mod tests {
 
     #[test]
     fn read_page_is_intercepted_and_feeds_next_goal() {
-        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]).with_page_texts(
-            vec![Ok("Mac mini M2 refurbished $429.00 at B&H Photo".to_string())],
-        );
+        let observer =
+            FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]).with_page_texts(vec![Ok(
+                "Mac mini M2 refurbished $429.00 at B&H Photo".to_string(),
+            )]);
         let goals = Rc::new(RefCell::new(Vec::<String>::new()));
         let planner = GoalRecordingActionPlanner {
             actions: vec![Action::ReadPage, Action::Done],
@@ -7448,7 +7501,12 @@ mod tests {
                 None,
                 VerificationReport::skipped_no_change_expected(),
             ),
-            executed_step(2, Action::Scroll { dx: 0, dy: 300 }, None, VerificationReport::progressed(1)),
+            executed_step(
+                2,
+                Action::Scroll { dx: 0, dy: 300 },
+                None,
+                VerificationReport::progressed(1),
+            ),
         ];
         assert!(planner_action_rejection_reason(
             &Action::ReadPage,
@@ -8240,7 +8298,10 @@ mod tests {
             report.steps[0].verification.status,
             VerificationStatus::Progressed
         );
-        assert_eq!(*observer.set_value_texts.borrow(), vec!["hello".to_string()]);
+        assert_eq!(
+            *observer.set_value_texts.borrow(),
+            vec!["hello".to_string()]
+        );
         assert!(
             events.borrow().is_empty(),
             "AXSetValue must not click or paste"
@@ -8289,10 +8350,13 @@ mod tests {
         assert_eq!(clicks.get(), 1);
         // The fallback must replace, never append: a failed set_value can
         // leave partial text behind.
+        assert!(events.borrow().contains(&RecordedInput::Key(
+            select_all_modifier(),
+            InputDirection::Press
+        )));
         assert!(events
             .borrow()
-            .contains(&RecordedInput::Key(select_all_modifier(), InputDirection::Press)));
-        assert!(events.borrow().contains(&RecordedInput::Text("hello".into())));
+            .contains(&RecordedInput::Text("hello".into())));
     }
 
     #[test]
@@ -8414,10 +8478,8 @@ mod tests {
     fn secure_field_typing_confirms_even_under_auto_and_redacts_text() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let field = secure_field(7, "Password");
-        let observer = FakeObserver::new(vec![
-            Ok(vec![field.clone()]),
-            Ok(vec![element(2, "Done")]),
-        ]);
+        let observer =
+            FakeObserver::new(vec![Ok(vec![field.clone()]), Ok(vec![element(2, "Done")])]);
         let requester = FakeConfirmationRequester::single(ConfirmationStatus::Approved);
         let confirmation_calls = requester.calls();
         let report = block_on(run_stub_agent_loop(
@@ -8443,7 +8505,11 @@ mod tests {
             &AgentAbortState::default(),
         ));
 
-        assert_eq!(confirmation_calls.get(), 1, "auto policy must still confirm");
+        assert_eq!(
+            confirmation_calls.get(),
+            1,
+            "auto policy must still confirm"
+        );
         let step = &report.steps[0];
         assert_eq!(
             step.safety_gate.as_ref().unwrap().reason,
@@ -8512,7 +8578,11 @@ mod tests {
     fn ask_everything_confirms_each_action_without_caching() {
         let observer = FakeObserver::new(vec![
             Ok(vec![element(1, "One"), element(2, "Two")]),
-            Ok(vec![element(1, "One"), element(2, "Two"), element(3, "Extra")]),
+            Ok(vec![
+                element(1, "One"),
+                element(2, "Two"),
+                element(3, "Extra"),
+            ]),
             Ok(vec![element(4, "Other")]),
         ]);
         let requester = FakeConfirmationRequester::sequence(vec![
@@ -8610,8 +8680,8 @@ mod tests {
             .map(|_| Ok(vec![element(1, "Ask")]))
             .collect::<Vec<_>>();
         let observer = FakeObserver::new(observations);
-        let requester = FakeConfirmationRequester::sequence(Vec::new())
-            .with_answers(vec![answered("Stop")]);
+        let requester =
+            FakeConfirmationRequester::sequence(Vec::new()).with_answers(vec![answered("Stop")]);
         let input_calls = requester.input_calls.clone();
         let report = block_on(run_stub_agent_loop(
             &observer,
@@ -8634,7 +8704,11 @@ mod tests {
             &AgentAbortState::default(),
         ));
 
-        assert_eq!(input_calls.get(), 1, "the run asks the user once when stuck");
+        assert_eq!(
+            input_calls.get(),
+            1,
+            "the run asks the user once when stuck"
+        );
         assert_eq!(report.status, AgentRunStatus::Failed);
         assert!(
             report
@@ -8659,10 +8733,8 @@ mod tests {
             _obs: &[Element],
             history: &[PlannerHistoryEntry],
         ) -> PlannerDecision {
-            *self.seen_results.borrow_mut() = history
-                .iter()
-                .map(|entry| entry.result.clone())
-                .collect();
+            *self.seen_results.borrow_mut() =
+                history.iter().map(|entry| entry.result.clone()).collect();
             if history.is_empty() {
                 PlannerDecision::new(
                     "need a choice",
@@ -8671,6 +8743,145 @@ mod tests {
                         options: vec!["Budget v2".into(), "Budget final".into()],
                     },
                 )
+            } else {
+                PlannerDecision::new("stop", Action::Done)
+            }
+        }
+    }
+
+    #[test]
+    fn batched_followups_execute_without_extra_model_calls() {
+        let planner_calls = Rc::new(Cell::new(0));
+        let planner = BatchingPlanner {
+            primary: Action::Type {
+                id: 7,
+                text: "hello".into(),
+            },
+            followups: vec![Action::Key {
+                combo: "Return".into(),
+            }],
+            calls: planner_calls.clone(),
+        };
+        let field = text_field(7, "Search");
+        let mut typed = field.clone();
+        typed.value = Some("hello".into());
+        typed.refresh_signature();
+        let observer = FakeObserver::new(vec![
+            Ok(vec![field]),
+            Ok(vec![typed]),
+            Ok(vec![element(9, "Results")]),
+        ])
+        .with_set_values(vec![Ok(true)]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(
+            planner_calls.get(),
+            2,
+            "type + Return ride on one decision; only Done needs another"
+        );
+        assert_eq!(report.steps.len(), 3);
+        assert!(matches!(report.steps[1].action, Action::Key { .. }));
+        assert!(report.steps[1]
+            .planner_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("batched:"));
+        assert_eq!(
+            report.steps[1].verification.status,
+            VerificationStatus::Progressed
+        );
+    }
+
+    #[test]
+    fn batch_drains_when_a_step_does_not_verify() {
+        let planner_calls = Rc::new(Cell::new(0));
+        let planner = BatchingPlanner {
+            primary: Action::Click { id: 1 },
+            followups: vec![Action::Key {
+                combo: "Return".into(),
+            }],
+            calls: planner_calls.clone(),
+        };
+        let target = element(1, "Ask");
+        // The click never changes anything: NoOp, so the queued Return must
+        // be dropped instead of fired blindly.
+        let observer = FakeObserver::new(vec![
+            Ok(vec![target.clone()]),
+            Ok(vec![target.clone()]),
+            Ok(vec![target.clone()]),
+        ]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            PreflightFactory {
+                events: events.clone(),
+                clicks: clicks.clone(),
+                location_offset: ClickPoint { x: 0, y: 0 },
+            },
+            &FakeCalibrationProbe::hit(TargetSummary::from(&target)),
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(planner_calls.get(), 2);
+        assert!(
+            !report
+                .steps
+                .iter()
+                .any(|step| matches!(step.action, Action::Key { .. })),
+            "the queued Return must not run after a no-op click"
+        );
+    }
+
+    struct BatchingPlanner {
+        primary: Action,
+        followups: Vec<Action>,
+        calls: Rc<Cell<u32>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for BatchingPlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            self.calls.set(self.calls.get() + 1);
+            if history.is_empty() {
+                PlannerDecision::new("batched decision", self.primary.clone())
+                    .with_followups(self.followups.clone())
             } else {
                 PlannerDecision::new("stop", Action::Done)
             }
@@ -8689,10 +8900,8 @@ mod tests {
             _obs: &[Element],
             history: &[PlannerHistoryEntry],
         ) -> PlannerDecision {
-            *self.seen_results.borrow_mut() = history
-                .iter()
-                .map(|entry| entry.result.clone())
-                .collect();
+            *self.seen_results.borrow_mut() =
+                history.iter().map(|entry| entry.result.clone()).collect();
             if history.is_empty() {
                 PlannerDecision::new(
                     "try a misspelled menu item",
@@ -8824,7 +9033,10 @@ mod tests {
 
         fn set_value(&self, _el: &Element, text: &str) -> Result<bool, String> {
             self.set_value_texts.borrow_mut().push(text.to_string());
-            self.set_values.borrow_mut().pop_front().unwrap_or(Ok(false))
+            self.set_values
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(false))
         }
 
         fn press_menu_path(&self, path: &[String]) -> Result<MenuPressOutcome, String> {
@@ -9364,6 +9576,7 @@ mod tests {
             execution_policy: ExecutionPolicy::Auto,
             executed: true,
             mechanism: None,
+            duration_ms: None,
             safety_gate: None,
             confirmation: None,
             verification: VerificationReport::progressed(1),
@@ -9395,6 +9608,7 @@ mod tests {
             execution_policy: ExecutionPolicy::Auto,
             executed: true,
             mechanism: None,
+            duration_ms: None,
             safety_gate: None,
             confirmation: None,
             verification,

@@ -298,13 +298,26 @@ fn decision_error_is_retryable(err: Option<&AiError>) -> bool {
     }
 }
 
+/// The system prompt is identical on every step of a run, so it is marked as
+/// a cache breakpoint. Below Anthropic's minimum cacheable prefix the field
+/// is silently ignored, so this is safe for short prompts too.
+fn anthropic_cached_system(prompt: &DecisionPrompt) -> Value {
+    json!([
+        {
+            "type": "text",
+            "text": prompt.system_prompt,
+            "cache_control": { "type": "ephemeral" }
+        }
+    ])
+}
+
 pub(crate) fn anthropic_decision_body(prompt: &DecisionPrompt, model: &str) -> Value {
     json!({
         "model": model,
         "max_tokens": MAX_DECISION_TOKENS,
         "stream": false,
         "temperature": 0,
-        "system": prompt.system_prompt,
+        "system": anthropic_cached_system(prompt),
         "messages": [
             {
                 "role": "user",
@@ -328,7 +341,7 @@ pub(crate) fn anthropic_vision_decision_body(
         "max_tokens": MAX_DECISION_TOKENS,
         "stream": false,
         "temperature": 0,
-        "system": prompt.system_prompt,
+        "system": anthropic_cached_system(prompt),
         "messages": [
             {
                 "role": "user",
@@ -528,7 +541,8 @@ pub(crate) fn openai_strict_decision_schema() -> Value {
             "reason_detail",
             "note",
             "expect",
-            "milestone_done"
+            "milestone_done",
+            "next"
         ],
         "properties": {
             "reason": { "type": "string" },
@@ -557,7 +571,27 @@ pub(crate) fn openai_strict_decision_schema() -> Value {
             "reason_detail": { "type": ["string", "null"] },
             "note": { "type": ["string", "null"] },
             "expect": { "type": ["string", "null"] },
-            "milestone_done": { "type": ["boolean", "null"] }
+            "milestone_done": { "type": ["boolean", "null"] },
+            "next": {
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["action", "id", "text", "combo", "dx", "dy", "ms"],
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["click", "type", "key", "scroll", "wait"]
+                        },
+                        "id": { "type": ["integer", "null"], "minimum": 0 },
+                        "text": { "type": ["string", "null"] },
+                        "combo": { "type": ["string", "null"] },
+                        "dx": { "type": ["integer", "null"] },
+                        "dy": { "type": ["integer", "null"] },
+                        "ms": { "type": ["integer", "null"], "minimum": 0 }
+                    }
+                }
+            }
         }
     })
 }
@@ -979,6 +1013,9 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["output_config"]["type"], "json_schema");
         assert_eq!(body["output_config"]["schema"], prompt.schema);
+        // The static system prompt is a cache breakpoint on every step.
+        assert_eq!(body["system"][0]["text"], "system");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

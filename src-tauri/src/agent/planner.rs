@@ -20,6 +20,7 @@ const MAX_MENU_TITLE_CHARS: usize = 80;
 const MAX_QUESTION_CHARS: usize = 200;
 const MAX_QUESTION_OPTIONS: usize = 4;
 const MAX_QUESTION_OPTION_CHARS: usize = 80;
+const MAX_BATCH_FOLLOWUPS: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct StubPlanner {
@@ -625,9 +626,10 @@ pub(crate) fn build_system_prompt() -> String {
         "- note: a short fact worth remembering for later steps (a price, name, or URL). Saved notes are shown back to you under 'Notes you saved earlier'. Use it whenever you read something you will need again.",
         "- expect: a short phrase that should be visible after this action. You will be told whether it was found.",
         "- milestone_done: set true when the CURRENT milestone in the plan is visibly complete.",
+        "- next: up to 2 follow-up actions you are CONFIDENT about (only click, type, key, scroll, wait). Each runs only if the previous action visibly worked, with no extra thinking turn - use it for sure sequences like type then key Return. Never anything destructive in next.",
         "Examples (follow this format exactly):",
         r#"Observation: [4] AXTextField "Address and Search" = """#,
-        r#"Output: {"reason":"search for refurbished mac minis","action":"type","id":4,"text":"refurbished mac mini","expect":"refurbished mac mini"}"#,
+        r#"Output: {"reason":"search for refurbished mac minis","action":"type","id":4,"text":"refurbished mac mini","expect":"refurbished mac mini","next":[{"action":"key","combo":"Return"}]}"#,
         r#"Observation: [4] AXTextField "Address and Search" = "refurbished mac mini" (focused)"#,
         r#"Output: {"reason":"submit the typed search","action":"key","combo":"Return","expect":"search results"}"#,
         r#"Observation: [12] AXLink "Mac mini M2 refurbished - $429.00" = """#,
@@ -920,7 +922,28 @@ pub(crate) fn planner_response_schema() -> Value {
             "reason_detail": { "type": "string" },
             "note": { "type": "string", "maxLength": MAX_NOTE_CHARS },
             "expect": { "type": "string", "maxLength": MAX_EXPECT_CHARS },
-            "milestone_done": { "type": "boolean" }
+            "milestone_done": { "type": "boolean" },
+            "next": {
+                "type": "array",
+                "maxItems": MAX_BATCH_FOLLOWUPS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["action"],
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["click", "type", "key", "scroll", "wait"]
+                        },
+                        "id": { "type": "integer", "minimum": 0 },
+                        "text": { "type": "string" },
+                        "combo": { "type": "string" },
+                        "dx": { "type": "integer" },
+                        "dy": { "type": "integer" },
+                        "ms": { "type": "integer", "minimum": 0 }
+                    }
+                }
+            }
         }
     })
 }
@@ -1009,7 +1032,24 @@ pub(crate) fn parse_planner_decision(
         serde_json::from_value(value).map_err(|err| format!("invalid JSON: {err}"))?;
 
     let reason = normalize_reason(&raw.reason)?;
+    let action = parse_raw_planner_action(&raw, obs)?;
+    let followups = raw
+        .next
+        .as_deref()
+        .map(|items| parse_followup_actions(items, obs))
+        .unwrap_or_default();
 
+    Ok(PlannerDecision::new(reason, action)
+        .with_followups(followups)
+        .with_note(normalize_optional_field(raw.note.as_deref(), MAX_NOTE_CHARS))
+        .with_expect(normalize_optional_field(
+            raw.expect.as_deref(),
+            MAX_EXPECT_CHARS,
+        ))
+        .with_milestone_done(raw.milestone_done.unwrap_or(false)))
+}
+
+fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result<Action, String> {
     let action = match raw.action.as_str() {
         "activateApp" | "activate_app" => {
             reject_fields(&raw, FieldSet::APP)?;
@@ -1127,13 +1167,45 @@ pub(crate) fn parse_planner_decision(
         other => return Err(format!("unknown action '{other}'")),
     };
 
-    Ok(PlannerDecision::new(reason, action)
-        .with_note(normalize_optional_field(raw.note.as_deref(), MAX_NOTE_CHARS))
-        .with_expect(normalize_optional_field(
-            raw.expect.as_deref(),
-            MAX_EXPECT_CHARS,
-        ))
-        .with_milestone_done(raw.milestone_done.unwrap_or(false)))
+    Ok(action)
+}
+
+/// Parse the optional `next` batch. Weak-model tolerant: any invalid or
+/// non-batchable item truncates the batch instead of failing the decision.
+fn parse_followup_actions(items: &[Value], obs: &[Element]) -> Vec<Action> {
+    let mut followups = Vec::new();
+    for item in items.iter().take(MAX_BATCH_FOLLOWUPS) {
+        let value = coerce_planner_value(item.clone());
+        let Some(map) = value.as_object() else { break };
+        let mut map = map.clone();
+        map.entry("reason".to_string())
+            .or_insert_with(|| json!("batched"));
+        let Ok(raw) = serde_json::from_value::<RawPlannerResponse>(Value::Object(map)) else {
+            break;
+        };
+        let Ok(action) = parse_raw_planner_action(&raw, obs) else {
+            break;
+        };
+        if !batchable_followup(&action) {
+            break;
+        }
+        followups.push(action);
+    }
+    followups
+}
+
+/// Only cheap, target-resolved, non-terminal actions ride in a batch; the
+/// executor still verifies and safety-gates each one individually.
+fn batchable_followup(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Click { .. }
+            | Action::Type { .. }
+            | Action::Key { .. }
+            | Action::Scroll { .. }
+            | Action::ScrollAt { .. }
+            | Action::Wait { .. }
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1636,6 +1708,7 @@ fn coerce_planner_value(mut value: Value) -> Value {
         "milestone_done",
         "url",
         "query",
+        "next",
     ];
     map.retain(|key, _| KNOWN_FIELDS.contains(&key.as_str()));
 
@@ -1924,6 +1997,8 @@ struct RawPlannerResponse {
     note: Option<String>,
     expect: Option<String>,
     milestone_done: Option<bool>,
+    /// Optional batch of follow-up action objects (same flat shape).
+    next: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2361,6 +2436,48 @@ mod tests {
             &obs,
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_followup_batch_truncates_on_invalid_or_non_batchable_items() {
+        let obs = vec![element(4, "Search"), element(5, "Go")];
+
+        let decision = parse_planner_decision(
+            r#"{"reason":"search","action":"type","id":4,"text":"hello","next":[{"action":"key","combo":"Return"}]}"#,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.followups,
+            vec![Action::Key {
+                combo: "Return".into()
+            }]
+        );
+
+        // An invalid item (unknown id) truncates the batch but never fails
+        // the decision itself.
+        let decision = parse_planner_decision(
+            r#"{"reason":"search","action":"type","id":4,"text":"hello","next":[{"action":"click","id":99},{"action":"key","combo":"Return"}]}"#,
+            &obs,
+        )
+        .unwrap();
+        assert!(decision.followups.is_empty());
+
+        // Terminal/non-batchable actions never ride in a batch.
+        let decision = parse_planner_decision(
+            r#"{"reason":"search","action":"type","id":4,"text":"hello","next":[{"action":"done"}]}"#,
+            &obs,
+        )
+        .unwrap();
+        assert!(decision.followups.is_empty());
+
+        // The batch is capped at two follow-ups.
+        let decision = parse_planner_decision(
+            r#"{"reason":"s","action":"type","id":4,"text":"h","next":[{"action":"key","combo":"Return"},{"action":"click","id":5},{"action":"wait","ms":100}]}"#,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(decision.followups.len(), 2);
     }
 
     #[test]

@@ -943,8 +943,26 @@ struct AgentConfirmationRequestedPayload {
 #[serde(rename_all = "camelCase")]
 struct AgentStepUpdatePayload {
     step: u32,
+    /// "planned" fires before execution; "completed" after verification with
+    /// the final mechanism and duration.
+    phase: &'static str,
     reason: Option<String>,
     action: agent::Action,
+    mechanism: Option<agent::ActionMechanism>,
+    duration_ms: Option<u64>,
+    target: Option<String>,
+    verification: Option<String>,
+}
+
+fn agent_step_target_summary(step: &agent::AgentStepReport) -> Option<String> {
+    step.target.as_ref().map(|target| {
+        let name = target.name.trim();
+        if name.is_empty() {
+            target.role.clone()
+        } else {
+            format!("{} '{}'", target.role, name)
+        }
+    })
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -965,11 +983,32 @@ impl agent::ConfirmationRequester for TauriConfirmationRequester {
     fn notify_step(&self, step: &agent::AgentStepReport) {
         let payload = AgentStepUpdatePayload {
             step: step.step,
+            phase: "planned",
             reason: step.planner_reason.clone(),
             action: step.action.clone(),
+            mechanism: None,
+            duration_ms: None,
+            target: agent_step_target_summary(step),
+            verification: None,
         };
         if let Err(err) = self.window.emit("agent-step-update", payload) {
             eprintln!("[screenie] emit agent step update failed: {err}");
+        }
+    }
+
+    fn notify_step_result(&self, step: &agent::AgentStepReport) {
+        let payload = AgentStepUpdatePayload {
+            step: step.step,
+            phase: "completed",
+            reason: step.planner_reason.clone(),
+            action: step.action.clone(),
+            mechanism: step.mechanism,
+            duration_ms: step.duration_ms,
+            target: agent_step_target_summary(step),
+            verification: Some(format!("{:?}", step.verification.status)),
+        };
+        if let Err(err) = self.window.emit("agent-step-update", payload) {
+            eprintln!("[screenie] emit agent step result failed: {err}");
         }
     }
 

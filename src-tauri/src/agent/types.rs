@@ -786,6 +786,10 @@ impl Action {
 pub struct PlannerDecision {
     pub reason: String,
     pub action: Action,
+    /// Optional batched follow-up actions (≤2) the planner is confident
+    /// about; each runs only if the previous action verifiably progressed,
+    /// without another model call.
+    pub followups: Vec<Action>,
     /// Fact the planner wants remembered across steps (prices, names, URLs).
     pub note: Option<String>,
     /// Short phrase the planner expects to be visible after the action.
@@ -799,10 +803,16 @@ impl PlannerDecision {
         Self {
             reason: reason.into(),
             action,
+            followups: Vec::new(),
             note: None,
             expect: None,
             milestone_done: false,
         }
+    }
+
+    pub fn with_followups(mut self, followups: Vec<Action>) -> Self {
+        self.followups = followups;
+        self
     }
 
     pub fn with_note(mut self, note: Option<String>) -> Self {

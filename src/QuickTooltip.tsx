@@ -117,9 +117,37 @@ type AgentTaskFinished = {
 
 type AgentStepUpdate = {
   step: number;
+  phase?: "planned" | "completed";
   reason?: string | null;
   action: AgentAction;
+  mechanism?: string | null;
+  durationMs?: number | null;
+  target?: string | null;
+  verification?: string | null;
 };
+
+const AGENT_MECHANISM_LABELS: Record<string, string> = {
+  axPress: "ax",
+  axSetValue: "ax",
+  menuPress: "menu",
+  syntheticClick: "click",
+  clipboardPaste: "paste",
+  syntheticInput: "keys",
+};
+
+function agentStepDetail(update: AgentStepUpdate): string {
+  const parts: string[] = [];
+  if (update.phase === "completed") {
+    const mechanism = update.mechanism
+      ? AGENT_MECHANISM_LABELS[update.mechanism] ?? update.mechanism
+      : null;
+    if (mechanism) parts.push(mechanism);
+    if (typeof update.durationMs === "number") {
+      parts.push(`${update.durationMs}ms`);
+    }
+  }
+  return parts.length > 0 ? ` (${parts.join(" · ")})` : "";
+}
 
 type ProviderInfo = {
   provider: Provider;
@@ -1279,7 +1307,9 @@ export default function QuickTooltip() {
                     ? `Step ${agentStatus.step} — ${
                         agentStatus.reason?.trim() ||
                         formatAgentAction(agentStatus.action)
-                      }`
+                      }${
+                        agentStatus.target ? ` · ${agentStatus.target}` : ""
+                      }${agentStepDetail(agentStatus)}`
                     : "Starting…"}
                 </div>
               </div>
