@@ -96,6 +96,9 @@ const MAX_TARGET_SUMMARY_VALUE_CHARS: usize = 240;
 #[serde(rename_all = "camelCase")]
 pub enum ExecutionPolicy {
     DryRun,
+    /// Every input-emitting action confirms, with no approval caching.
+    AskEverything,
+    /// Default: only destructive/risky actions confirm.
     #[default]
     Confirmed,
     Auto,
@@ -526,6 +529,28 @@ pub enum ConfirmationStatus {
     Unavailable,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentQuestionRequest {
+    pub question: String,
+    pub options: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UserAnswerStatus {
+    Answered,
+    TimedOut,
+    Aborted,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserAnswerOutcome {
+    pub status: UserAnswerStatus,
+    pub answer: Option<String>,
+}
+
 #[async_trait::async_trait(?Send)]
 pub trait ConfirmationRequester {
     async fn request_confirmation(
@@ -539,6 +564,21 @@ pub trait ConfirmationRequester {
     /// a step's action has been planned and is about to run. Default is a
     /// no-op so test requesters need no changes.
     fn notify_step(&self, _step: &AgentStepReport) {}
+
+    /// Blocking free-text question to the user (the `ask` action and the
+    /// stuck-recovery prompt). Default is unavailable so headless and test
+    /// requesters keep working.
+    async fn request_user_input(
+        &self,
+        _request: AgentQuestionRequest,
+        _timeout: Duration,
+        _abort: &AgentAbortState,
+    ) -> UserAnswerOutcome {
+        UserAnswerOutcome {
+            status: UserAnswerStatus::Unavailable,
+            answer: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1113,6 +1153,7 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
             }
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
+            | PreparedKind::Ask { .. }
             | PreparedKind::Done
             | PreparedKind::Fail { .. } => {}
         }
@@ -1580,6 +1621,51 @@ where
             ));
             break;
         }
+        // Stuck-recovery's last stop: one blocking question to the user
+        // before failing the run. "Keep trying" (or any guidance) resets the
+        // loop window but keeps banned actions; anything else stops.
+        if let Some(context) = stuck_recovery.pending_question.take() {
+            let outcome = confirmations
+                .request_user_input(
+                    AgentQuestionRequest {
+                        question: format!(
+                            "I'm stuck: {context}. Should I keep trying a different way, or stop?"
+                        ),
+                        options: vec!["Keep trying".into(), "Stop".into()],
+                    },
+                    confirmation_timeout,
+                    abort,
+                )
+                .await;
+            match outcome.status {
+                UserAnswerStatus::Answered => {
+                    let answer = outcome.answer.unwrap_or_default();
+                    if normalize_text_for_match(&answer) == "stop" {
+                        terminal_status = Some(AgentRunStatus::Failed);
+                        failure_reason = Some(format!("stopped by user while stuck: {context}"));
+                        break;
+                    }
+                    push_agent_note(&mut notes, &format!("user said: {answer}"));
+                    recent_no_progress.clear();
+                    stuck_recovery.notice = Some(format!(
+                        "You were stuck ({context}). The user said: \"{answer}\". Previously banned actions stay banned; follow the user's guidance or try a different approach."
+                    ));
+                }
+                UserAnswerStatus::Aborted => {
+                    terminal_status = Some(AgentRunStatus::Aborted);
+                    failure_reason = Some("agent aborted".into());
+                    break;
+                }
+                UserAnswerStatus::TimedOut | UserAnswerStatus::Unavailable => {
+                    terminal_status = Some(AgentRunStatus::Failed);
+                    failure_reason = Some(format!(
+                        "{context} (asked the user for guidance and got no answer)"
+                    ));
+                    break;
+                }
+            }
+        }
+
         step_index = step_index.saturating_add(1);
         let step_number = step_index;
         if abort.is_aborted() {
@@ -1986,6 +2072,51 @@ where
                 steps.push(step);
                 continue 'steps;
             }
+            PreparedKind::Ask { question, options: choices } => {
+                // Read-only like readPage: no input events, no safety gate.
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: ask skipped".to_string()
+                } else {
+                    let outcome = confirmations
+                        .request_user_input(
+                            AgentQuestionRequest {
+                                question: question.clone(),
+                                options: choices.clone(),
+                            },
+                            confirmation_timeout,
+                            abort,
+                        )
+                        .await;
+                    match outcome.status {
+                        UserAnswerStatus::Answered => {
+                            let answer = outcome.answer.unwrap_or_default();
+                            step.executed = true;
+                            push_agent_note(&mut notes, &format!("user said: {answer}"));
+                            format!("user answered: \"{answer}\"")
+                        }
+                        UserAnswerStatus::Aborted => {
+                            step.failure_reason = Some("agent aborted".into());
+                            terminal_status = Some(AgentRunStatus::Aborted);
+                            failure_reason = Some("agent aborted".into());
+                            log_agent_step(&step);
+                            steps.push(step);
+                            break;
+                        }
+                        UserAnswerStatus::TimedOut | UserAnswerStatus::Unavailable => {
+                            "user did not answer; proceed with your best judgment or fail with reason_detail"
+                                .to_string()
+                        }
+                    }
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                log_agent_step(&step);
+                steps.push(step);
+                continue 'steps;
+            }
             _ => {}
         }
 
@@ -2141,8 +2272,11 @@ where
                 };
             }
             // Secure-field confirmations are never cached: every keystroke
-            // into a password field gets its own explicit approval.
-            let confirmation_key = if gate.reason == SECURE_FIELD_CONFIRM_REASON {
+            // into a password field gets its own explicit approval. Same for
+            // ask-everything — caching would silently auto-approve repeats.
+            let confirmation_key = if gate.reason == SECURE_FIELD_CONFIRM_REASON
+                || options.execution_policy == ExecutionPolicy::AskEverything
+            {
                 None
             } else {
                 confirmation_approval_key(&action, prepared.target.as_ref(), &gate.reason)
@@ -2833,6 +2967,29 @@ fn safety_gate(
             reason: "dry-run policy logs without execution".into(),
             focused_app: Some(focused_app.clone()),
         },
+        ExecutionPolicy::AskEverything => {
+            // Destructive checks still run first so their richer reasons win.
+            if let Some(reason) = destructive_action_reason(action, target, options) {
+                return SafetyGateReport {
+                    decision: SafetyDecision::RequireConfirm,
+                    reason,
+                    focused_app: Some(focused_app.clone()),
+                };
+            }
+            if matches!(action, Action::Wait { .. }) {
+                SafetyGateReport {
+                    decision: SafetyDecision::Allow,
+                    reason: "ask-everything policy: wait sends no input".into(),
+                    focused_app: Some(focused_app.clone()),
+                }
+            } else {
+                SafetyGateReport {
+                    decision: SafetyDecision::RequireConfirm,
+                    reason: "ask-everything policy confirms every action".into(),
+                    focused_app: Some(focused_app.clone()),
+                }
+            }
+        }
         ExecutionPolicy::Auto => SafetyGateReport {
             decision: SafetyDecision::Allow,
             reason: "auto policy allows action".into(),
@@ -2892,6 +3049,7 @@ fn confirmation_approval_key(
         Action::OpenUrl { url } => format!("openUrl:{}", url.trim()),
         Action::WebSearch { query } => format!("webSearch:{}", query.trim()),
         Action::ReadPage => "readPage".into(),
+        Action::Ask { question, .. } => format!("ask:{}", question.trim()),
         Action::Scroll { dx, dy } => format!("scroll:{dx}:{dy}"),
         Action::ScrollAt { dx, dy, .. } => format!("scrollAt:{dx}:{dy}"),
         Action::Wait { ms } => format!("wait:{ms}"),
@@ -3225,6 +3383,15 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
             }))
         }
         Action::ReadPage => Ok(PreparedAction::without_target(PreparedKind::ReadPage)),
+        Action::Ask { question, options } => {
+            if question.trim().is_empty() {
+                return Err(ExecutionError::Input("ask requires a question".into()));
+            }
+            Ok(PreparedAction::without_target(PreparedKind::Ask {
+                question: question.clone(),
+                options: options.clone(),
+            }))
+        }
         Action::Click { id } => {
             let target = target_element_by_id(obs, *id)?;
             Ok(PreparedAction::with_target(
@@ -3389,6 +3556,7 @@ impl PreparedAction {
             PreparedKind::Scroll { dx, dy } => dx != 0 || dy != 0,
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
+            | PreparedKind::Ask { .. }
             | PreparedKind::Done
             | PreparedKind::Fail { .. } => false,
         }
@@ -3503,6 +3671,13 @@ fn planner_action_rejection_reason(
             let last = steps.last()?;
             (matches!(last.action, Action::ReadPage) && last.failure_reason.is_none()).then(|| {
                 "you already read this page; act on its text or navigate somewhere new before reading again"
+                    .to_string()
+            })
+        }
+        Action::Ask { .. } => {
+            let last = steps.last()?;
+            matches!(last.action, Action::Ask { .. }).then(|| {
+                "you just asked the user a question; act on the answer in your history instead of asking again"
                     .to_string()
             })
         }
@@ -4078,6 +4253,8 @@ enum StuckRecoveryStage {
     StuckNotice,
     VisionReplan,
     KeyboardHint,
+    /// Last stop before failing: ask the user whether to keep trying.
+    AskUser,
     Exhausted,
 }
 
@@ -4086,6 +4263,9 @@ struct StuckRecovery {
     stage: StuckRecoveryStage,
     banned_actions: Vec<String>,
     notice: Option<String>,
+    /// Set when the ladder reaches AskUser; the run loop pops it and blocks
+    /// on a question to the user before the next step.
+    pending_question: Option<String>,
 }
 
 impl StuckRecovery {
@@ -4093,6 +4273,7 @@ impl StuckRecovery {
         self.stage = StuckRecoveryStage::Normal;
         self.banned_actions.clear();
         self.notice = None;
+        self.pending_question = None;
     }
 
     fn notice(&self) -> Option<&str> {
@@ -4115,7 +4296,8 @@ impl StuckRecovery {
             StuckRecoveryStage::Normal => StuckRecoveryStage::StuckNotice,
             StuckRecoveryStage::StuckNotice => StuckRecoveryStage::VisionReplan,
             StuckRecoveryStage::VisionReplan => StuckRecoveryStage::KeyboardHint,
-            StuckRecoveryStage::KeyboardHint | StuckRecoveryStage::Exhausted => {
+            StuckRecoveryStage::KeyboardHint => StuckRecoveryStage::AskUser,
+            StuckRecoveryStage::AskUser | StuckRecoveryStage::Exhausted => {
                 StuckRecoveryStage::Exhausted
             }
         };
@@ -4151,7 +4333,8 @@ impl StuckRecovery {
             StuckRecoveryStage::Normal => StuckRecoveryStage::StuckNotice,
             StuckRecoveryStage::StuckNotice => StuckRecoveryStage::VisionReplan,
             StuckRecoveryStage::VisionReplan => StuckRecoveryStage::KeyboardHint,
-            StuckRecoveryStage::KeyboardHint | StuckRecoveryStage::Exhausted => {
+            StuckRecoveryStage::KeyboardHint => StuckRecoveryStage::AskUser,
+            StuckRecoveryStage::AskUser | StuckRecoveryStage::Exhausted => {
                 StuckRecoveryStage::Exhausted
             }
         };
@@ -4167,6 +4350,11 @@ impl StuckRecovery {
             )),
             _ => None,
         };
+        if self.stage == StuckRecoveryStage::AskUser {
+            self.pending_question = Some(format!(
+                "'{normalized_action}' keeps being rejected ({rejection_reason})"
+            ));
+        }
         self.stage
     }
 
@@ -4213,9 +4401,14 @@ fn handle_no_progress_entry(
                 Some(format!("stuck-recovery:{}", entry.normalized_action));
             NoProgressOutcome::Recovering(stage)
         }
+        StuckRecoveryStage::AskUser => {
+            recent.clear();
+            recovery.pending_question = Some(loop_detection_reason(&entry));
+            NoProgressOutcome::Recovering(stage)
+        }
         StuckRecoveryStage::Normal | StuckRecoveryStage::Exhausted => {
             NoProgressOutcome::Exhausted(format!(
-                "{} after stuck-recovery escalation (stuck notice, vision replan, and keyboard hint all failed)",
+                "{} after stuck-recovery escalation (stuck notice, vision replan, keyboard hint, and asking the user all failed)",
                 loop_detection_reason(&entry)
             ))
         }
@@ -4304,6 +4497,7 @@ fn synthetic_mechanism(kind: &PreparedKind) -> Option<ActionMechanism> {
         | PreparedKind::OpenUrl { .. }
         | PreparedKind::Menu { .. }
         | PreparedKind::ReadPage
+        | PreparedKind::Ask { .. }
         | PreparedKind::Wait { .. }
         | PreparedKind::Done
         | PreparedKind::Fail { .. } => None,
@@ -4544,6 +4738,7 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
         Action::OpenUrl { url } => format!("openUrl:{}", url.trim()),
         Action::WebSearch { query } => format!("webSearch:{}", normalize_text_for_match(query)),
         Action::ReadPage => "readPage".into(),
+        Action::Ask { question, .. } => format!("ask:{}", normalize_text_for_match(question)),
         Action::Click { .. } | Action::ClickTarget { .. } => format!(
             "click:{}",
             prepared
@@ -4691,6 +4886,11 @@ enum PreparedKind {
     },
     Wait {
         ms: u64,
+    },
+    /// Blocking question to the user; emits no input events.
+    Ask {
+        question: String,
+        options: Vec<String>,
     },
     Done,
     Fail {
@@ -6733,12 +6933,14 @@ mod tests {
             StuckRecoveryStage::KeyboardHint
         );
         assert!(recovery.notice().unwrap().contains("keyboard"));
+        assert_eq!(recovery.escalate(&entry, 3), StuckRecoveryStage::AskUser);
         assert_eq!(recovery.escalate(&entry, 3), StuckRecoveryStage::Exhausted);
 
         recovery.on_progress();
         assert_eq!(recovery.stage, StuckRecoveryStage::Normal);
         assert!(recovery.rejection_for("click:abc").is_none());
         assert!(recovery.notice().is_none());
+        assert!(recovery.pending_question.is_none());
     }
 
     #[test]
@@ -6762,6 +6964,16 @@ mod tests {
             recovery.escalate_rejection("type:abc", hint),
             StuckRecoveryStage::KeyboardHint
         );
+        // The last stop before exhaustion queues a question for the user.
+        assert_eq!(
+            recovery.escalate_rejection("type:abc", hint),
+            StuckRecoveryStage::AskUser
+        );
+        assert!(recovery
+            .pending_question
+            .as_deref()
+            .unwrap()
+            .contains("type:abc"));
         assert_eq!(
             recovery.escalate_rejection("type:abc", hint),
             StuckRecoveryStage::Exhausted
@@ -6790,6 +7002,7 @@ mod tests {
             StuckRecoveryStage::StuckNotice,
             StuckRecoveryStage::VisionReplan,
             StuckRecoveryStage::KeyboardHint,
+            StuckRecoveryStage::AskUser,
         ];
         for expected in expected_stages {
             for _ in 0..2 {
@@ -6805,6 +7018,7 @@ mod tests {
             assert!(recent.is_empty());
         }
         assert!(force_replan.as_deref().unwrap().contains("stuck-recovery"));
+        assert!(recovery.pending_question.is_some());
 
         for _ in 0..2 {
             assert!(matches!(
@@ -8294,6 +8508,175 @@ mod tests {
         field
     }
 
+    #[test]
+    fn ask_everything_confirms_each_action_without_caching() {
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "One"), element(2, "Two")]),
+            Ok(vec![element(1, "One"), element(2, "Two"), element(3, "Extra")]),
+            Ok(vec![element(4, "Other")]),
+        ]);
+        let requester = FakeConfirmationRequester::sequence(vec![
+            ConfirmationStatus::Approved,
+            ConfirmationStatus::Approved,
+        ]);
+        let confirmation_calls = requester.calls();
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::sequence(vec![Action::Click { id: 1 }, Action::Click { id: 2 }]),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::AskEverything),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &requester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(
+            confirmation_calls.get(),
+            2,
+            "every action confirms separately, nothing is cached"
+        );
+        assert!(report.steps[0]
+            .safety_gate
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("ask-everything"));
+    }
+
+    #[test]
+    fn ask_action_blocks_for_answer_and_feeds_history() {
+        let seen_results = Rc::new(RefCell::new(Vec::new()));
+        let planner = AskThenDonePlanner {
+            seen_results: seen_results.clone(),
+        };
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask")]),
+        ]);
+        let requester = FakeConfirmationRequester::sequence(Vec::new())
+            .with_answers(vec![answered("Budget v2")]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(2),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &requester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(report.steps[0].executed);
+        assert!(matches!(report.steps[0].action, Action::Ask { .. }));
+        let results = seen_results.borrow();
+        assert!(
+            results
+                .iter()
+                .any(|result| result.contains("user answered: \"Budget v2\"")),
+            "the answer must reach the planner's history, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn stuck_recovery_asks_user_before_failing() {
+        let goals = Rc::new(RefCell::new(Vec::new()));
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![Action::Click { id: 1 }],
+            goals,
+        };
+        // Same element forever: every click verifies as NoOp.
+        let observations = (0..40)
+            .map(|_| Ok(vec![element(1, "Ask")]))
+            .collect::<Vec<_>>();
+        let observer = FakeObserver::new(observations);
+        let requester = FakeConfirmationRequester::sequence(Vec::new())
+            .with_answers(vec![answered("Stop")]);
+        let input_calls = requester.input_calls.clone();
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(12),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                progress_loop_threshold: Some(1),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &requester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(input_calls.get(), 1, "the run asks the user once when stuck");
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        assert!(
+            report
+                .failure_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("stopped by user"),
+            "got: {:?}",
+            report.failure_reason
+        );
+    }
+
+    struct AskThenDonePlanner {
+        seen_results: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for AskThenDonePlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            *self.seen_results.borrow_mut() = history
+                .iter()
+                .map(|entry| entry.result.clone())
+                .collect();
+            if history.is_empty() {
+                PlannerDecision::new(
+                    "need a choice",
+                    Action::Ask {
+                        question: "Which draft should I send?".into(),
+                        options: vec!["Budget v2".into(), "Budget final".into()],
+                    },
+                )
+            } else {
+                PlannerDecision::new("stop", Action::Done)
+            }
+        }
+    }
+
     struct MenuFeedbackPlanner {
         seen_results: Rc<RefCell<Vec<String>>>,
     }
@@ -8569,18 +8952,38 @@ mod tests {
     struct FakeConfirmationRequester {
         outcomes: RefCell<VecDeque<ConfirmationStatus>>,
         calls: Rc<Cell<u32>>,
+        answers: RefCell<VecDeque<UserAnswerOutcome>>,
+        input_calls: Rc<Cell<u32>>,
     }
 
     impl FakeConfirmationRequester {
         fn single(status: ConfirmationStatus) -> Self {
+            Self::sequence(vec![status])
+        }
+
+        fn sequence(statuses: Vec<ConfirmationStatus>) -> Self {
             Self {
-                outcomes: RefCell::new(vec![status].into()),
+                outcomes: RefCell::new(statuses.into()),
                 calls: Rc::new(Cell::new(0)),
+                answers: RefCell::new(VecDeque::new()),
+                input_calls: Rc::new(Cell::new(0)),
             }
+        }
+
+        fn with_answers(self, answers: Vec<UserAnswerOutcome>) -> Self {
+            *self.answers.borrow_mut() = answers.into();
+            self
         }
 
         fn calls(&self) -> Rc<Cell<u32>> {
             self.calls.clone()
+        }
+    }
+
+    fn answered(answer: &str) -> UserAnswerOutcome {
+        UserAnswerOutcome {
+            status: UserAnswerStatus::Answered,
+            answer: Some(answer.to_string()),
         }
     }
 
@@ -8601,6 +9004,22 @@ mod tests {
                     .pop_front()
                     .unwrap_or(ConfirmationStatus::Unavailable),
             }
+        }
+
+        async fn request_user_input(
+            &self,
+            _request: AgentQuestionRequest,
+            _timeout: Duration,
+            _abort: &AgentAbortState,
+        ) -> UserAnswerOutcome {
+            self.input_calls.set(self.input_calls.get() + 1);
+            self.answers
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(UserAnswerOutcome {
+                    status: UserAnswerStatus::Unavailable,
+                    answer: None,
+                })
         }
     }
 

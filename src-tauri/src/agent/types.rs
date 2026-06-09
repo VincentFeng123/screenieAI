@@ -337,6 +337,9 @@ pub enum Action {
     /// Extract the visible text of the focused page/window into the
     /// planner's next prompt. Emits no input events.
     ReadPage,
+    /// Pause and ask the user one short question; the answer arrives in the
+    /// planner's history. Emits no input events.
+    Ask { question: String, options: Vec<String> },
     Done,
     Fail { reason: String },
 }
@@ -365,6 +368,7 @@ impl Serialize for Action {
             | Self::Fail { .. } => 2,
             Self::Type { .. } | Self::TypeTarget { .. } => 3,
             Self::Drag { .. } => 3,
+            Self::Ask { .. } => 3,
             Self::ScrollAt { .. } => 4,
         };
         let mut state = serializer.serialize_struct("Action", field_count)?;
@@ -450,6 +454,11 @@ impl Serialize for Action {
             Self::ReadPage => {
                 state.serialize_field("action", "readPage")?;
             }
+            Self::Ask { question, options } => {
+                state.serialize_field("action", "ask")?;
+                state.serialize_field("question", question)?;
+                state.serialize_field("options", options)?;
+            }
             Self::Done => {
                 state.serialize_field("action", "done")?;
             }
@@ -481,6 +490,8 @@ impl<'de> Deserialize<'de> for Action {
             text: Option<String>,
             combo: Option<String>,
             path: Option<Vec<String>>,
+            question: Option<String>,
+            options: Option<Vec<String>>,
             dx: Option<i32>,
             dy: Option<i32>,
             ms: Option<u64>,
@@ -531,6 +542,8 @@ impl<'de> Deserialize<'de> for Action {
             ("text", raw.text.is_some()),
             ("combo", raw.combo.is_some()),
             ("path", raw.path.is_some()),
+            ("question", raw.question.is_some()),
+            ("options", raw.options.is_some()),
             ("dx", raw.dx.is_some()),
             ("dy", raw.dy.is_some()),
             ("ms", raw.ms.is_some()),
@@ -679,6 +692,18 @@ impl<'de> Deserialize<'de> for Action {
                 reject_extra::<D::Error>(&raw.action, &present, &[])?;
                 Ok(Self::ReadPage)
             }
+            "ask" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["question", "options"])?;
+                let question = required_string::<D::Error>("question", raw.question)?;
+                let options = raw
+                    .options
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|option| option.trim().to_string())
+                    .filter(|option| !option.is_empty())
+                    .collect();
+                Ok(Self::Ask { question, options })
+            }
             "done" => {
                 reject_extra::<D::Error>(&raw.action, &present, &[])?;
                 Ok(Self::Done)
@@ -734,6 +759,7 @@ impl Action {
             | Self::OpenUrl { .. }
             | Self::WebSearch { .. }
             | Self::ReadPage
+            | Self::Ask { .. }
             | Self::Done
             | Self::Fail { .. } => Vec::new(),
         }

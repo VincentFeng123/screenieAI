@@ -17,6 +17,9 @@ const MAX_MILESTONE_CHARS: usize = 80;
 const MAX_REPAIR_SNIPPET_CHARS: usize = 200;
 const MAX_MENU_PATH_COMPONENTS: usize = 4;
 const MAX_MENU_TITLE_CHARS: usize = 80;
+const MAX_QUESTION_CHARS: usize = 200;
+const MAX_QUESTION_OPTIONS: usize = 4;
+const MAX_QUESTION_OPTION_CHARS: usize = 80;
 
 #[derive(Clone, Debug)]
 pub struct StubPlanner {
@@ -581,6 +584,7 @@ pub(crate) fn build_system_prompt() -> String {
         "webSearch runs a web search in ONE step - prefer it for any 'find/search the web' goal.",
         "menu presses one item in the frontmost app's menu bar by title path - prefer it for app commands (Save, Export, Print, Preferences, New Window, View options) over hunting for on-screen buttons. Write titles as a human reads them; a trailing '\u{2026}' is optional. If the path is wrong, the step result lists that menu's real items so you can correct it.",
         "The observation lists only clickable controls. To read page CONTENT (prices, article text, search results), emit readPage; its text arrives in your next prompt.",
+        "ask pauses the task and asks the user ONE short question when the goal is ambiguous or needs information only the user has (a choice, a missing detail). The answer arrives in your history. Use it sparingly; never ask for passwords or secrets.",
         "For shopping or price-comparison goals: webSearch first, readPage to compare offers, save each price with note, openUrl the best offer's page, then emit done at the product/buy page. Do NOT click Buy, Add to Cart, or Checkout unless the user explicitly asked to purchase.",
         "Never type placeholder words like 'search', 'query', or 'text' into a field. Type the real value the goal needs; if the goal gives no specific value, infer a sensible one or emit fail with reason_detail.",
         "After typing into a search field, emit key Return to submit it before doing anything else; do not retype.",
@@ -614,6 +618,7 @@ pub(crate) fn build_system_prompt() -> String {
         r#"{"reason":"brief reason","action":"openUrl","url":"https://example.com"}"#,
         r#"{"reason":"brief reason","action":"webSearch","query":"refurbished mac mini"}"#,
         r#"{"reason":"brief reason","action":"readPage"}"#,
+        r#"{"reason":"two drafts match","action":"ask","question":"Which draft should I send?","options":["Budget v2","Budget final"]}"#,
         r#"{"reason":"brief reason","action":"done"}"#,
         r#"{"reason":"brief reason","action":"fail","reason_detail":"..."}"#,
         "Optional fields you may add to any object:",
@@ -890,7 +895,7 @@ pub(crate) fn planner_response_schema() -> Value {
             "reason": { "type": "string", "maxLength": MAX_REASON_CHARS },
             "action": {
                 "type": "string",
-                "enum": ["activateApp", "click", "doubleClick", "type", "key", "menu", "scroll", "wait", "openUrl", "webSearch", "readPage", "done", "fail"]
+                "enum": ["activateApp", "click", "doubleClick", "type", "key", "menu", "scroll", "wait", "openUrl", "webSearch", "readPage", "ask", "done", "fail"]
             },
             "app": { "type": "string" },
             "id": { "type": "integer", "minimum": 0 },
@@ -900,6 +905,12 @@ pub(crate) fn planner_response_schema() -> Value {
                 "type": "array",
                 "maxItems": MAX_MENU_PATH_COMPONENTS,
                 "items": { "type": "string", "maxLength": MAX_MENU_TITLE_CHARS }
+            },
+            "question": { "type": "string", "maxLength": MAX_QUESTION_CHARS },
+            "options": {
+                "type": "array",
+                "maxItems": MAX_QUESTION_OPTIONS,
+                "items": { "type": "string", "maxLength": MAX_QUESTION_OPTION_CHARS }
             },
             "url": { "type": "string" },
             "query": { "type": "string" },
@@ -1086,6 +1097,22 @@ pub(crate) fn parse_planner_decision(
         "readPage" | "read_page" => {
             reject_fields(&raw, FieldSet::NONE)?;
             Action::ReadPage
+        }
+        "ask" => {
+            reject_fields(&raw, FieldSet::QUESTION)?;
+            let question = normalize_optional_field(raw.question.as_deref(), MAX_QUESTION_CHARS)
+                .ok_or_else(|| "ask requires question".to_string())?;
+            let options = raw
+                .options
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|option| {
+                    normalize_optional_field(Some(option.as_str()), MAX_QUESTION_OPTION_CHARS)
+                })
+                .take(MAX_QUESTION_OPTIONS)
+                .collect();
+            Action::Ask { question, options }
         }
         "done" => {
             reject_fields(&raw, FieldSet::NONE)?;
@@ -1598,6 +1625,8 @@ fn coerce_planner_value(mut value: Value) -> Value {
         "text",
         "combo",
         "path",
+        "question",
+        "options",
         "dx",
         "dy",
         "ms",
@@ -1623,6 +1652,7 @@ fn canonical_action_name(action: &str) -> String {
         "press" | "press_key" | "hotkey" | "keypress" | "key_press" | "shortcut" => "key".into(),
         "menu_click" | "menuclick" | "click_menu" | "menu_item" | "menuitem" | "select_menu"
         | "menu_select" => "menu".into(),
+        "ask_user" | "askuser" | "ask_human" | "question" => "ask".into(),
         "finish" | "complete" | "end" | "stop" | "terminate" => "done".into(),
         "open_url" | "openurl" | "navigate" | "goto" | "go_to_url" => "openUrl".into(),
         "web_search" | "websearch" | "search" => "webSearch".into(),
@@ -1736,6 +1766,12 @@ fn reject_fields(raw: &RawPlannerResponse, allowed: FieldSet) -> Result<(), Stri
     if raw.path.is_some() && !allowed.path {
         extras.push("path");
     }
+    if raw.question.is_some() && !allowed.question {
+        extras.push("question");
+    }
+    if raw.options.is_some() && !allowed.options {
+        extras.push("options");
+    }
     if raw.dx.is_some() && !allowed.dx {
         extras.push("dx");
     }
@@ -1776,6 +1812,8 @@ struct FieldSet {
     text: bool,
     combo: bool,
     path: bool,
+    question: bool,
+    options: bool,
     dx: bool,
     dy: bool,
     ms: bool,
@@ -1794,6 +1832,8 @@ impl FieldSet {
         text: false,
         combo: false,
         path: false,
+        question: false,
+        options: false,
         dx: false,
         dy: false,
         ms: false,
@@ -1803,6 +1843,11 @@ impl FieldSet {
     };
     const PATH: Self = Self {
         path: true,
+        ..Self::NONE
+    };
+    const QUESTION: Self = Self {
+        question: true,
+        options: true,
         ..Self::NONE
     };
     const URL: Self = Self {
@@ -1867,6 +1912,8 @@ struct RawPlannerResponse {
     text: Option<String>,
     combo: Option<String>,
     path: Option<Vec<String>>,
+    question: Option<String>,
+    options: Option<Vec<String>>,
     dx: Option<i32>,
     dy: Option<i32>,
     ms: Option<u64>,

@@ -491,6 +491,9 @@ struct AppState {
     chat_seed: Mutex<Option<ChatSeed>>,
     /// Pending destructive-action confirmation requests keyed by UUID.
     agent_confirmations: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// Pending agent questions to the user (ask action + stuck recovery),
+    /// keyed by UUID; the answer is free text.
+    agent_questions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// Global agent kill-switch state shared by the loop and hotkey handler.
     agent_abort: Arc<agent::AgentAbortState>,
     /// Shared grounding runtime manager. It warms each configured local
@@ -944,6 +947,14 @@ struct AgentStepUpdatePayload {
     action: agent::Action,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentQuestionRequestedPayload {
+    request_id: String,
+    question: String,
+    options: Vec<String>,
+}
+
 struct TauriConfirmationRequester {
     app: AppHandle,
     window: WebviewWindow,
@@ -1038,6 +1049,96 @@ impl agent::ConfirmationRequester for TauriConfirmationRequester {
             status,
         }
     }
+
+    async fn request_user_input(
+        &self,
+        request: agent::AgentQuestionRequest,
+        timeout: std::time::Duration,
+        abort: &agent::AgentAbortState,
+    ) -> agent::UserAnswerOutcome {
+        if abort.is_aborted() {
+            return agent::UserAnswerOutcome {
+                status: agent::UserAnswerStatus::Aborted,
+                answer: None,
+            };
+        }
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let Some(state) = self.app.try_state::<AppState>() else {
+            return agent::UserAnswerOutcome {
+                status: agent::UserAnswerStatus::Unavailable,
+                answer: None,
+            };
+        };
+        {
+            let mut pending = lock_poison_safe(&state.agent_questions);
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let payload = AgentQuestionRequestedPayload {
+            request_id: request_id.clone(),
+            question: request.question,
+            options: request.options,
+        };
+        if let Err(err) = self.window.emit("agent-question-requested", payload) {
+            if let Some(state) = self.app.try_state::<AppState>() {
+                let _ = lock_poison_safe(&state.agent_questions).remove(&request_id);
+            }
+            eprintln!("[screenie] emit agent question failed: {err}");
+            return agent::UserAnswerOutcome {
+                status: agent::UserAnswerStatus::Unavailable,
+                answer: None,
+            };
+        }
+
+        let outcome = tokio::select! {
+            biased;
+            _ = abort.notified() => agent::UserAnswerOutcome {
+                status: agent::UserAnswerStatus::Aborted,
+                answer: None,
+            },
+            result = rx => {
+                if abort.is_aborted() {
+                    agent::UserAnswerOutcome {
+                        status: agent::UserAnswerStatus::Aborted,
+                        answer: None,
+                    }
+                } else {
+                    match result {
+                        Ok(answer) => agent::UserAnswerOutcome {
+                            status: agent::UserAnswerStatus::Answered,
+                            answer: Some(answer),
+                        },
+                        Err(_) => agent::UserAnswerOutcome {
+                            status: agent::UserAnswerStatus::Unavailable,
+                            answer: None,
+                        },
+                    }
+                }
+            }
+            _ = tokio::time::sleep(timeout) => {
+                if abort.is_aborted() {
+                    agent::UserAnswerOutcome {
+                        status: agent::UserAnswerStatus::Aborted,
+                        answer: None,
+                    }
+                } else {
+                    agent::UserAnswerOutcome {
+                        status: agent::UserAnswerStatus::TimedOut,
+                        answer: None,
+                    }
+                }
+            }
+        };
+
+        if let Some(state) = self.app.try_state::<AppState>() {
+            let _ = lock_poison_safe(&state.agent_questions).remove(&request_id);
+        }
+
+        outcome
+    }
 }
 
 fn drain_pending_agent_confirmations(state: &AppState) -> usize {
@@ -1052,11 +1153,23 @@ fn drain_pending_agent_confirmations(state: &AppState) -> usize {
     count
 }
 
+/// Dropping the senders resolves any awaiting question as Unavailable.
+fn drain_pending_agent_questions(state: &AppState) -> usize {
+    let pending = {
+        let mut guard = lock_poison_safe(&state.agent_questions);
+        std::mem::take(&mut *guard)
+    };
+    pending.len()
+}
+
 fn abort_agent_runs(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         state.agent_abort.abort();
         let drained = drain_pending_agent_confirmations(&state);
-        eprintln!("[screenie] agent abort requested; drained {drained} pending confirmations");
+        let drained_questions = drain_pending_agent_questions(&state);
+        eprintln!(
+            "[screenie] agent abort requested; drained {drained} pending confirmations and {drained_questions} pending questions"
+        );
     }
 }
 
@@ -1082,6 +1195,24 @@ fn respond_to_confirmation(
             Ok(())
         }
         None => Err("confirmation request not found".into()),
+    }
+}
+
+#[tauri::command]
+fn respond_to_user_question(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+    answer: String,
+) -> Result<(), String> {
+    require_window(&window, "quick_tooltip")?;
+    let sender = lock_poison_safe(&state.agent_questions).remove(&request_id);
+    match sender {
+        Some(sender) => {
+            let _ = sender.send(answer);
+            Ok(())
+        }
+        None => Err("question request not found".into()),
     }
 }
 
@@ -1117,12 +1248,24 @@ fn run_stub_agent(
     }
 }
 
+/// Maps the UI's autonomy setting onto the executor policy. Unknown values
+/// fall back to the default (confirm-destructive).
+fn execution_policy_from_autonomy(autonomy: Option<&str>) -> Option<agent::ExecutionPolicy> {
+    match autonomy?.trim().to_ascii_lowercase().as_str() {
+        "ask" | "ask-everything" => Some(agent::ExecutionPolicy::AskEverything),
+        "confirm" | "confirm-destructive" => Some(agent::ExecutionPolicy::Confirmed),
+        "auto" | "full-auto" => Some(agent::ExecutionPolicy::Auto),
+        _ => None,
+    }
+}
+
 fn agent_task_options_from_goal(
     goal: &str,
     provider: Option<String>,
     model: Option<String>,
     vision_provider: Option<String>,
     vision_model: Option<String>,
+    autonomy: Option<String>,
 ) -> Option<agent::StubAgentOptions> {
     let goal = goal.trim();
     if goal.is_empty() {
@@ -1134,6 +1277,7 @@ fn agent_task_options_from_goal(
         model,
         vision_provider,
         vision_model,
+        execution_policy: execution_policy_from_autonomy(autonomy.as_deref()),
         ..Default::default()
     })
 }
@@ -1147,11 +1291,17 @@ fn start_agent_task(
     model: Option<String>,
     vision_provider: Option<String>,
     vision_model: Option<String>,
+    autonomy: Option<String>,
 ) -> Result<(), String> {
     require_window(&window, "quick_tooltip")?;
-    let Some(mut options) =
-        agent_task_options_from_goal(&goal, provider, model, vision_provider, vision_model)
-    else {
+    let Some(mut options) = agent_task_options_from_goal(
+        &goal,
+        provider,
+        model,
+        vision_provider,
+        vision_model,
+        autonomy,
+    ) else {
         return Ok(());
     };
 
@@ -1241,6 +1391,7 @@ fn prepare_stub_agent_run(
     let state = app.state::<AppState>();
     state.agent_abort.reset();
     let _ = drain_pending_agent_confirmations(&state);
+    let _ = drain_pending_agent_questions(&state);
     Ok((text_config, vision_config, state.agent_abort.clone()))
 }
 
@@ -4091,6 +4242,7 @@ pub fn run() {
         start_agent_task,
         stop_agent_task,
         respond_to_confirmation,
+        respond_to_user_question,
         crop_capture,
         refresh_overlay_backdrop_capture,
         refresh_overlay_capture,
@@ -4446,14 +4598,15 @@ mod tests {
 
     #[test]
     fn agent_task_options_empty_goal_is_noop() {
-        assert!(agent_task_options_from_goal("", None, None, None, None).is_none());
-        assert!(agent_task_options_from_goal(" \n\t ", None, None, None, None).is_none());
+        assert!(agent_task_options_from_goal("", None, None, None, None, None).is_none());
+        assert!(agent_task_options_from_goal(" \n\t ", None, None, None, None, None).is_none());
     }
 
     #[test]
     fn agent_task_options_trim_goal() {
         let options =
-            agent_task_options_from_goal("  open settings  ", None, None, None, None).unwrap();
+            agent_task_options_from_goal("  open settings  ", None, None, None, None, None)
+                .unwrap();
         assert_eq!(options.goal.as_deref(), Some("open settings"));
     }
 
@@ -4465,12 +4618,52 @@ mod tests {
             Some("gemini-2.5-flash".into()),
             Some("gemini".into()),
             Some("gemini-2.5-flash".into()),
+            None,
         )
         .unwrap();
         assert_eq!(options.provider.as_deref(), Some("gemini"));
         assert_eq!(options.model.as_deref(), Some("gemini-2.5-flash"));
         assert_eq!(options.vision_provider.as_deref(), Some("gemini"));
         assert_eq!(options.vision_model.as_deref(), Some("gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn agent_task_options_map_autonomy_to_execution_policy() {
+        let ask = agent_task_options_from_goal(
+            "open settings",
+            None,
+            None,
+            None,
+            None,
+            Some("ask".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            ask.execution_policy,
+            Some(agent::ExecutionPolicy::AskEverything)
+        );
+
+        let auto = agent_task_options_from_goal(
+            "open settings",
+            None,
+            None,
+            None,
+            None,
+            Some("auto".into()),
+        )
+        .unwrap();
+        assert_eq!(auto.execution_policy, Some(agent::ExecutionPolicy::Auto));
+
+        let unknown = agent_task_options_from_goal(
+            "open settings",
+            None,
+            None,
+            None,
+            None,
+            Some("bogus".into()),
+        )
+        .unwrap();
+        assert_eq!(unknown.execution_policy, None);
     }
 
     // ---------- quick_tooltip config ----------

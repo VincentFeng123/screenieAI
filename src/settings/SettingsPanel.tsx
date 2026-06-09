@@ -62,10 +62,18 @@ type SectionId =
   | "providers"
   | "overlay"
   | "ai-output"
+  | "agent"
   | "appearance"
   | "templates"
   | "history"
   | "maintenance";
+
+type AgentAutonomy = "ask" | "confirm" | "auto";
+
+function readAgentAutonomy(): AgentAutonomy {
+  const saved = localStorage.getItem("agent_autonomy");
+  return saved === "ask" || saved === "auto" ? saved : "confirm";
+}
 
 type ProviderMeta = {
   id: Provider;
@@ -79,6 +87,7 @@ const settingsSections: { id: SectionId; label: string }[] = [
   { id: "providers", label: "Providers" },
   { id: "overlay", label: "Overlay" },
   { id: "ai-output", label: "AI Output" },
+  { id: "agent", label: "Agent" },
   { id: "templates", label: "Templates" },
   { id: "history", label: "History" },
   { id: "appearance", label: "Appearance" },
@@ -145,6 +154,15 @@ export default function SettingsPanel({
   const [preferences, setPreferences] = useState<ScreeniePreferences>(() =>
     readPreferences(),
   );
+  const [agentAutonomy, setAgentAutonomyState] = useState<AgentAutonomy>(() =>
+    readAgentAutonomy(),
+  );
+  const saveAgentAutonomy = (value: string) => {
+    const next: AgentAutonomy =
+      value === "ask" || value === "auto" ? value : "confirm";
+    localStorage.setItem("agent_autonomy", next);
+    setAgentAutonomyState(next);
+  };
   // The frosted-glass effect is now provided by the macOS native sidebar
   // window effect + CSS `backdrop-filter` on `.settings-shell` (settings.css).
   // Both update LIVE — the desktop content visible through the window
@@ -819,6 +837,43 @@ export default function SettingsPanel({
                 onChange={(value) => savePreference("aiRenderDensity", value)}
                 ariaLabel="Panel density"
               />
+            </PreferenceRow>
+          </SettingsCard>
+        </SettingsSection>
+
+        <SettingsSection
+          id="agent"
+          active={activeSection === "agent"}
+          title="Agent"
+          description="Control how much the computer-use agent is allowed to do on its own."
+        >
+          <SettingsCard>
+            <PreferenceRow
+              title="Autonomy"
+              help={
+                agentAutonomy === "auto"
+                  ? "Full auto skips routine confirmations. Destructive actions in password fields still confirm. Use with care."
+                  : agentAutonomy === "ask"
+                    ? "Every action waits for your approval before it runs."
+                    : "Only risky actions (send, delete, purchase, quit, password fields) wait for approval."
+              }
+            >
+              <SegmentedControl
+                value={agentAutonomy}
+                options={[
+                  { value: "ask", label: "Ask everything" },
+                  { value: "confirm", label: "Confirm risky" },
+                  { value: "auto", label: "Full auto" },
+                ]}
+                onChange={saveAgentAutonomy}
+                ariaLabel="Agent autonomy"
+              />
+            </PreferenceRow>
+            <PreferenceRow
+              title="Secrets"
+              help="The agent never reads password fields and always asks before typing into one. Never give the agent real passwords — type them yourself."
+            >
+              <span className="settings-muted">Always guarded</span>
             </PreferenceRow>
           </SettingsCard>
         </SettingsSection>

@@ -89,6 +89,27 @@ type AgentConfirmationRequest = {
   reason: string;
 };
 
+type AgentQuestionRequest = {
+  requestId: string;
+  question: string;
+  options: string[];
+};
+
+type AgentAutonomy = "ask" | "confirm" | "auto";
+
+const AGENT_AUTONOMY_STORAGE_KEY = "agent_autonomy";
+
+const AGENT_AUTONOMY_OPTIONS: CustomDropdownOption[] = [
+  { value: "ask", label: "Ask everything" },
+  { value: "confirm", label: "Confirm risky" },
+  { value: "auto", label: "Full auto" },
+];
+
+function readAgentAutonomy(): AgentAutonomy {
+  const saved = localStorage.getItem(AGENT_AUTONOMY_STORAGE_KEY);
+  return saved === "ask" || saved === "auto" ? saved : "confirm";
+}
+
 type AgentTaskFinished = {
   status?: string;
   failureReason?: string | null;
@@ -123,7 +144,7 @@ const QUICK_TOOLTIP_FROST_REGION_SELECTOR = [
   ".screenie-select-menu-portal",
 ].join(", ");
 const QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR =
-  ".quick-tooltip-error, .quick-tooltip-confirmation, .quick-tooltip-agent-progress";
+  ".quick-tooltip-error, .quick-tooltip-confirmation, .quick-tooltip-question, .quick-tooltip-agent-progress";
 const QUICK_TOOLTIP_STATUS_MIN_HEIGHT = 82;
 const QUICK_TOOLTIP_STATUS_MAX_HEIGHT = 420;
 
@@ -386,9 +407,15 @@ export default function QuickTooltip() {
   const [agentStatus, setAgentStatus] = useState<AgentStepUpdate | null>(null);
   const [confirmation, setConfirmation] =
     useState<AgentConfirmationRequest | null>(null);
+  const [question, setQuestion] = useState<AgentQuestionRequest | null>(null);
+  const [questionAnswer, setQuestionAnswer] = useState("");
+  const [autonomy, setAutonomy] = useState<AgentAutonomy>(() =>
+    readAgentAutonomy(),
+  );
   const [providerInfo, setProviderInfo] = useState<ProviderInfo>(() =>
     readProviderInfo(),
   );
+  const questionInputRef = useRef<HTMLInputElement>(null);
   const runSeqRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -406,7 +433,7 @@ export default function QuickTooltip() {
     () => selectedModelLabel(modelOptions, providerInfo.model),
     [modelOptions, providerInfo.model],
   );
-  const hasStatus = Boolean(error || confirmation || agentRunning);
+  const hasStatus = Boolean(error || confirmation || question || agentRunning);
   const chatVisible = expanded && !hasStatus;
   const canStartNewChat =
     messages.length > 0 || prompt.trim().length > 0 || streaming !== null || error !== null;
@@ -425,7 +452,10 @@ export default function QuickTooltip() {
   }, [agentInputOpen]);
 
   useEffect(() => {
-    const onStorage = () => setProviderInfo(readProviderInfo());
+    const onStorage = () => {
+      setProviderInfo(readProviderInfo());
+      setAutonomy(readAgentAutonomy());
+    };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, []);
@@ -465,10 +495,52 @@ export default function QuickTooltip() {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     getCurrentWindow()
+      .listen<AgentQuestionRequest>("agent-question-requested", (event) => {
+        if (cancelled) return;
+        setQuestion(event.payload);
+        setQuestionAnswer("");
+        setExpanded(false);
+        agentInputOpenRef.current = false;
+        setAgentInputOpen(false);
+        setAgentModelMenuOpen(false);
+        // Free-text answers need keystrokes routed to the tooltip.
+        invoke("set_quick_tooltip_keyboard_mode", { enabled: true }).catch((e) => {
+          console.error("set_quick_tooltip_keyboard_mode(true) failed:", e);
+        });
+        window.setTimeout(() => questionInputRef.current?.focus(), 60);
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      })
+      .catch((e) => {
+        console.error("agent question listener failed:", e);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    getCurrentWindow()
       .listen<AgentTaskFinished>("agent-task-finished", (event) => {
         if (cancelled) return;
         setAgentRunning(false);
         setAgentStatus(null);
+        setQuestion((current) => {
+          if (current) {
+            invoke("set_quick_tooltip_keyboard_mode", { enabled: false }).catch(
+              () => {},
+            );
+          }
+          return null;
+        });
         const status = event.payload?.status;
         const failure = event.payload?.failureReason?.trim();
         if ((status === "failed" || status === "maxStepsReached") && failure) {
@@ -592,7 +664,7 @@ export default function QuickTooltip() {
       window.cancelAnimationFrame(raf);
       ro.disconnect();
     };
-  }, [agentRunning, agentStatus, confirmation, error, hasStatus, measureStatusHeight]);
+  }, [agentRunning, agentStatus, confirmation, question, error, hasStatus, measureStatusHeight]);
 
   useEffect(() => {
     if (!confirmation) return;
@@ -724,6 +796,13 @@ export default function QuickTooltip() {
     setProviderInfo(readProviderInfo());
   };
 
+  const updateAutonomy = (value: string) => {
+    const next: AgentAutonomy =
+      value === "ask" || value === "auto" ? value : "confirm";
+    localStorage.setItem(AGENT_AUTONOMY_STORAGE_KEY, next);
+    setAutonomy(next);
+  };
+
   const runAi = async (history: ChatMessage[]) => {
     const info = readProviderInfo();
     setProviderInfo(info);
@@ -836,6 +915,21 @@ export default function QuickTooltip() {
     }
   };
 
+  const respondToQuestion = async (answer: string) => {
+    const requestId = question?.requestId;
+    const trimmed = answer.trim();
+    if (!requestId || !trimmed) return;
+    setQuestion(null);
+    setQuestionAnswer("");
+    restoreQuickTooltipKeyboardMode();
+    try {
+      await invoke("respond_to_user_question", { requestId, answer: trimmed });
+    } catch (e) {
+      console.error("respond_to_user_question failed:", e);
+      setError(errorText(e));
+    }
+  };
+
   const stopAgentTask = async () => {
     try {
       await invoke("stop_agent_task");
@@ -867,6 +961,7 @@ export default function QuickTooltip() {
         model: info.model,
         visionProvider: info.provider,
         visionModel: info.model,
+        autonomy: readAgentAutonomy(),
       });
     } catch (e) {
       setAgentRunning(false);
@@ -1012,6 +1107,30 @@ export default function QuickTooltip() {
                   }
                 />
               </div>
+              <div className="screenie-chat-model-select quick-tooltip-agent-autonomy-select">
+                <CustomDropdown
+                  value={autonomy}
+                  options={AGENT_AUTONOMY_OPTIONS}
+                  onChange={updateAutonomy}
+                  ariaLabel="Agent autonomy"
+                  variant="ghost"
+                  disabled={agentRunning}
+                  placement="below"
+                  onOpenChange={setAgentModelMenuOpen}
+                  triggerLabel={
+                    <span className="quick-tooltip-agent-model-label">
+                      <ShieldCheck size={11} strokeWidth={1.9} aria-hidden />
+                      <span className="quick-tooltip-agent-model-name">
+                        {
+                          AGENT_AUTONOMY_OPTIONS.find(
+                            (option) => option.value === autonomy,
+                          )?.label
+                        }
+                      </span>
+                    </span>
+                  }
+                />
+              </div>
             </div>
           </div>
         </section>
@@ -1024,11 +1143,13 @@ export default function QuickTooltip() {
           aria-label={
             confirmation
               ? "Agent confirmation"
-              : error
-                ? "Screenie status"
-                : "Agent progress"
+              : question
+                ? "Agent question"
+                : error
+                  ? "Screenie status"
+                  : "Agent progress"
           }
-          role={error && !confirmation ? "alert" : undefined}
+          role={error && !confirmation && !question ? "alert" : undefined}
           onMouseDown={(e) => e.stopPropagation()}
         >
           {confirmation ? (
@@ -1064,6 +1185,57 @@ export default function QuickTooltip() {
                   }}
                 >
                   Allow
+                </button>
+              </div>
+            </div>
+          ) : question ? (
+            <div className="quick-tooltip-question">
+              <div className="quick-tooltip-status-heading">
+                <Bot size={14} strokeWidth={1.9} aria-hidden />
+                <span>Agent question</span>
+              </div>
+              <div className="quick-tooltip-question-text">
+                {question.question}
+              </div>
+              {question.options.length > 0 && (
+                <div className="quick-tooltip-question-options">
+                  {question.options.map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      className="quick-tooltip-confirm-btn"
+                      onClick={() => {
+                        void respondToQuestion(option);
+                      }}
+                    >
+                      {option}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="quick-tooltip-question-answer">
+                <input
+                  ref={questionInputRef}
+                  value={questionAnswer}
+                  onChange={(e) => setQuestionAnswer(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void respondToQuestion(questionAnswer);
+                    }
+                  }}
+                  placeholder="Type an answer"
+                  aria-label="Answer the agent"
+                />
+                <button
+                  type="button"
+                  className="quick-tooltip-confirm-btn primary"
+                  onClick={() => {
+                    void respondToQuestion(questionAnswer);
+                  }}
+                  disabled={!questionAnswer.trim()}
+                >
+                  Send
                 </button>
               </div>
             </div>

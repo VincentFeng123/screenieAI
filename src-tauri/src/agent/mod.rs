@@ -16,11 +16,11 @@ pub(crate) use executor::run_stub_agent_loop_with_grounder;
 pub(crate) use executor::EnigoBackendFactory;
 pub use executor::{
     element_to_click_point, ActionMechanism, AgentAbortState, AgentConfirmationRequest,
-    AgentRunReport, AgentRunStatus, AgentStepReport, CalibrationReport, ClickPoint,
-    ClickPreflightReport, ClickPreflightStatus, ConfirmationOutcome, ConfirmationRequester,
-    ConfirmationStatus, ExecutionPolicy, ResolvedStubAgentOptions, SafetyDecision,
-    SafetyGateReport, SettleStatus, StubAgentOptions, TargetSummary, VerificationReport,
-    VerificationStatus,
+    AgentQuestionRequest, AgentRunReport, AgentRunStatus, AgentStepReport, CalibrationReport,
+    ClickPoint, ClickPreflightReport, ClickPreflightStatus, ConfirmationOutcome,
+    ConfirmationRequester, ConfirmationStatus, ExecutionPolicy, ResolvedStubAgentOptions,
+    SafetyDecision, SafetyGateReport, SettleStatus, StubAgentOptions, TargetSummary,
+    UserAnswerOutcome, UserAnswerStatus, VerificationReport, VerificationStatus,
 };
 pub(crate) use grounding::GrounderManager;
 pub use grounding::{GroundingMode, GroundingPixel, GroundingReport};
