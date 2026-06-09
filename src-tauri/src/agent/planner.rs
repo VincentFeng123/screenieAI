@@ -554,6 +554,14 @@ fn planner_fail(reason: &str, reason_detail: String) -> PlannerDecision {
     )
 }
 
+/// True for the synthetic Fail decisions produced when the model's output
+/// could not be parsed even after the repair retry. The executor treats
+/// these as rejected attempts (bounded by the rejection cap) rather than
+/// terminal failures — one malformed reply must not kill a progressing run.
+pub(crate) fn is_invalid_output_reason(reason: &str) -> bool {
+    reason == "planner output invalid" || reason == "vision planner output invalid"
+}
+
 const MILESTONES_SYSTEM_PROMPT: &str = "Break the user's computer-use goal into 3-6 short, concrete milestones a GUI agent can verify on screen. Return only JSON: {\"milestones\":[\"...\",\"...\"]}. Each milestone is one observable outcome, e.g. \"search results for 'refurbished mac mini' visible\". Do not include the obvious final 'emit done' step.";
 
 /// One-shot task decomposition at run start. Failure-tolerant by design: any
@@ -1807,7 +1815,68 @@ fn coerce_planner_value(mut value: Value) -> Value {
     ];
     map.retain(|key, _| KNOWN_FIELDS.contains(&key.as_str()));
 
+    // Drop fields that don't belong to the chosen action instead of failing
+    // the whole decision — the flat schema can't express per-action fields,
+    // so models legally emit harmless extras (a stray "url" on a type action
+    // killed real runs). Coordinates (x/y) and "target" are deliberately
+    // kept so their explicit rejections keep teaching the model.
+    if let Some(allowed) = map
+        .get("action")
+        .and_then(Value::as_str)
+        .and_then(action_specific_fields)
+    {
+        map.retain(|key, _| {
+            !DROPPABLE_ACTION_FIELDS.contains(&key.as_str()) || allowed.contains(&key.as_str())
+        });
+    }
+
     value
+}
+
+/// Action-scoped fields that may be silently dropped when they don't belong
+/// to the chosen action. Excludes x/y/target on purpose: those still hit
+/// `reject_fields` so the repair retry tells the model exactly what's wrong.
+const DROPPABLE_ACTION_FIELDS: &[&str] = &[
+    "app",
+    "id",
+    "text",
+    "combo",
+    "path",
+    "question",
+    "options",
+    "script",
+    "name",
+    "input",
+    "file",
+    "dx",
+    "dy",
+    "ms",
+    "url",
+    "query",
+    "reason_detail",
+];
+
+/// Which scoped fields each action legitimately uses. `None` for unknown
+/// action names so the "unknown action" error stays intact.
+fn action_specific_fields(action: &str) -> Option<&'static [&'static str]> {
+    Some(match action {
+        "activateApp" | "activate_app" => &["app"],
+        "click" | "doubleClick" | "double_click" => &["id"],
+        "type" => &["id", "text"],
+        "key" => &["combo"],
+        "menu" => &["path"],
+        "scroll" => &["dx", "dy"],
+        "wait" => &["ms"],
+        "openUrl" | "open_url" => &["url"],
+        "webSearch" | "web_search" => &["query"],
+        "readPage" | "read_page" | "done" => &[],
+        "ask" => &["question", "options"],
+        "applescript" | "apple_script" | "osascript" => &["script"],
+        "shortcut" | "run_shortcut" | "runShortcut" => &["name", "input"],
+        "moveToTrash" | "move_to_trash" => &["file"],
+        "fail" => &["reason_detail"],
+        _ => return None,
+    })
 }
 
 fn canonical_action_name(action: &str) -> String {
@@ -2567,6 +2636,55 @@ mod tests {
         .is_err());
         assert!(parse_planner_decision(
             r#"{"reason":"open menu","action":"menu"}"#,
+            &obs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_drops_harmless_fields_that_belong_to_other_actions() {
+        let obs = vec![element(4, "To")];
+
+        // The real-world failure: a type action carrying a stray url killed
+        // a run with "type does not allow field(s): url".
+        let decision = parse_planner_decision(
+            r#"{"reason":"type the recipient","action":"type","id":4,"text":"a@b.com","url":"https://mail.google.com"}"#,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::Type {
+                id: 4,
+                text: "a@b.com".into()
+            }
+        );
+
+        // done with leftover junk still finishes.
+        let decision = parse_planner_decision(
+            r#"{"reason":"finished","action":"done","text":"all set","url":"https://x.test"}"#,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(decision.action, Action::Done);
+
+        // key with a stray id still presses the combo.
+        let decision = parse_planner_decision(
+            r#"{"reason":"submit","action":"key","combo":"Return","id":4}"#,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::Key {
+                combo: "Return".into()
+            }
+        );
+
+        // Raw coordinates keep their explicit rejection — that error is the
+        // feedback that teaches the model to use ids.
+        assert!(parse_planner_decision(
+            r#"{"reason":"click","action":"click","x":10,"y":20}"#,
             &obs,
         )
         .is_err());

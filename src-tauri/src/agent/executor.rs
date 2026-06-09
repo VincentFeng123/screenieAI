@@ -1834,6 +1834,31 @@ where
                     .next_action(&planner_goal, &before, &planning_history)
                     .await;
                 decision_followups = decision.followups.clone();
+
+                // A reply the parser could not salvage (even after the repair
+                // retry) rejects this attempt instead of failing the run: the
+                // parse error goes back to the model through history, bounded
+                // by the same cap as any other rejected action.
+                if super::planner::is_invalid_output_reason(&decision.reason)
+                    && duplicate_rejections < MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP
+                {
+                    if let Action::Fail { reason } = &decision.action {
+                        eprintln!(
+                            "[screenie] agent step {} planner output invalid; asking again: {reason}",
+                            step_number
+                        );
+                        planning_history.push(PlannerHistoryEntry::new(
+                            decision.action.clone(),
+                            decision.reason.clone(),
+                            format!(
+                                "your last reply was invalid and nothing was executed: {reason}. Reply with exactly ONE JSON object matching the action schema."
+                            ),
+                        ));
+                        duplicate_rejections = duplicate_rejections.saturating_add(1);
+                        continue;
+                    }
+                }
+
                 if let Some(note) = decision.note.as_deref() {
                     push_agent_note(&mut notes, note);
                 }
@@ -9251,6 +9276,114 @@ mod tests {
                     "make a note",
                     Action::AppleScript {
                         script: "tell application \"Notes\" to make new note".into(),
+                    },
+                )
+            } else {
+                PlannerDecision::new("stop", Action::Done)
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_planner_output_is_retried_within_the_step() {
+        let calls = Rc::new(Cell::new(0));
+        let planner = InvalidOutputPlanner {
+            invalid_replies: 1,
+            calls: calls.clone(),
+        };
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(
+            report.status,
+            AgentRunStatus::Done,
+            "one malformed reply must not kill the run: {:?}",
+            report.failure_reason
+        );
+        assert_eq!(calls.get(), 2, "the planner is asked again with feedback");
+        assert_eq!(report.steps.len(), 1);
+    }
+
+    #[test]
+    fn persistently_invalid_planner_output_still_fails_bounded() {
+        let calls = Rc::new(Cell::new(0));
+        let planner = InvalidOutputPlanner {
+            invalid_replies: u32::MAX,
+            calls: calls.clone(),
+        };
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        assert!(report
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("does not allow field(s)"));
+        assert_eq!(
+            calls.get(),
+            u32::from(MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP) + 1,
+            "retries stay bounded by the rejection cap"
+        );
+    }
+
+    struct InvalidOutputPlanner {
+        invalid_replies: u32,
+        calls: Rc<Cell<u32>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for InvalidOutputPlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            _history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() <= self.invalid_replies {
+                // Mirrors planner_fail's shape for an unparseable reply.
+                PlannerDecision::new(
+                    "planner output invalid",
+                    Action::Fail {
+                        reason: "planner output invalid after retry: type does not allow field(s): url"
+                            .into(),
                     },
                 )
             } else {
