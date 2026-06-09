@@ -40,18 +40,15 @@ impl Default for VisionFallbackOptions {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum ObservationSource {
+    #[default]
     Ax,
     VisionMarks,
     VisionCoordinate,
     VisionGrounding,
 }
 
-impl Default for ObservationSource {
-    fn default() -> Self {
-        Self::Ax
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

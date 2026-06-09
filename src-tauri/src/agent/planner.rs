@@ -718,7 +718,7 @@ pub(crate) fn build_user_prompt(
 
 fn build_mark_vision_system_prompt(scripting_enabled: bool) -> String {
     let mut prompt = build_system_prompt(scripting_enabled);
-    prompt.push_str("\n");
+    prompt.push('\n');
     prompt.push_str("The attached PNG is the current screen annotated with red numbered boxes.\n");
     prompt.push_str(
         "The label text on each box is exactly the element id. Choose ids from the observation only.\n",
@@ -1114,7 +1114,7 @@ pub(crate) fn parse_planner_decision(
 fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result<Action, String> {
     let action = match raw.action.as_str() {
         "activateApp" | "activate_app" => {
-            reject_fields(&raw, FieldSet::APP)?;
+            reject_fields(raw, FieldSet::APP)?;
             let app = require_string("app", raw.app.as_deref())?.trim();
             if app.is_empty() {
                 return Err("app is required".into());
@@ -1124,20 +1124,20 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
         }
         "click" => {
-            reject_fields(&raw, FieldSet::ID)?;
-            let id = require_id(&raw)?;
+            reject_fields(raw, FieldSet::ID)?;
+            let id = require_id(raw)?;
             validate_id_exists(id, obs)?;
             Action::Click { id }
         }
         "doubleClick" | "double_click" => {
-            reject_fields(&raw, FieldSet::ID)?;
-            let id = require_id(&raw)?;
+            reject_fields(raw, FieldSet::ID)?;
+            let id = require_id(raw)?;
             validate_id_exists(id, obs)?;
             Action::DoubleClick { id }
         }
         "type" => {
-            reject_fields(&raw, FieldSet::ID_TEXT)?;
-            let id = require_id(&raw)?;
+            reject_fields(raw, FieldSet::ID_TEXT)?;
+            let id = require_id(raw)?;
             validate_id_exists(id, obs)?;
             Action::Type {
                 id,
@@ -1145,13 +1145,13 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
         }
         "key" => {
-            reject_fields(&raw, FieldSet::COMBO)?;
+            reject_fields(raw, FieldSet::COMBO)?;
             let combo = require_string("combo", raw.combo.as_deref())?.to_string();
             validate_key_combo(&combo)?;
             Action::Key { combo }
         }
         "menu" => {
-            reject_fields(&raw, FieldSet::PATH)?;
+            reject_fields(raw, FieldSet::PATH)?;
             let path = raw
                 .path
                 .clone()
@@ -1174,34 +1174,34 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             Action::Menu { path }
         }
         "scroll" => {
-            reject_fields(&raw, FieldSet::DX_DY)?;
-            let (dx, dy) = parse_scroll_axes(&raw)?;
+            reject_fields(raw, FieldSet::DX_DY)?;
+            let (dx, dy) = parse_scroll_axes(raw)?;
             Action::Scroll { dx, dy }
         }
         "wait" => {
-            reject_fields(&raw, FieldSet::MS)?;
+            reject_fields(raw, FieldSet::MS)?;
             Action::Wait {
                 ms: raw.ms.ok_or_else(|| "wait requires ms".to_string())?,
             }
         }
         "openUrl" | "open_url" => {
-            reject_fields(&raw, FieldSet::URL)?;
+            reject_fields(raw, FieldSet::URL)?;
             Action::OpenUrl {
                 url: require_string("url", raw.url.as_deref())?.to_string(),
             }
         }
         "webSearch" | "web_search" => {
-            reject_fields(&raw, FieldSet::QUERY)?;
+            reject_fields(raw, FieldSet::QUERY)?;
             Action::WebSearch {
                 query: require_string("query", raw.query.as_deref())?.to_string(),
             }
         }
         "readPage" | "read_page" => {
-            reject_fields(&raw, FieldSet::NONE)?;
+            reject_fields(raw, FieldSet::NONE)?;
             Action::ReadPage
         }
         "ask" => {
-            reject_fields(&raw, FieldSet::QUESTION)?;
+            reject_fields(raw, FieldSet::QUESTION)?;
             let question = normalize_optional_field(raw.question.as_deref(), MAX_QUESTION_CHARS)
                 .ok_or_else(|| "ask requires question".to_string())?;
             let options = raw
@@ -1217,7 +1217,7 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             Action::Ask { question, options }
         }
         "applescript" | "apple_script" | "osascript" => {
-            reject_fields(&raw, FieldSet::SCRIPT)?;
+            reject_fields(raw, FieldSet::SCRIPT)?;
             let script = require_string("script", raw.script.as_deref())?.to_string();
             if script.chars().count() > MAX_SCRIPT_CHARS {
                 return Err(format!(
@@ -1227,7 +1227,7 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             Action::AppleScript { script }
         }
         "shortcut" | "run_shortcut" | "runShortcut" => {
-            reject_fields(&raw, FieldSet::SHORTCUT)?;
+            reject_fields(raw, FieldSet::SHORTCUT)?;
             Action::RunShortcut {
                 name: require_string("name", raw.name.as_deref())?.to_string(),
                 input: raw
@@ -1237,17 +1237,17 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
         }
         "moveToTrash" | "move_to_trash" => {
-            reject_fields(&raw, FieldSet::FILE)?;
+            reject_fields(raw, FieldSet::FILE)?;
             Action::MoveToTrash {
                 path: require_string("file", raw.file.as_deref())?.to_string(),
             }
         }
         "done" => {
-            reject_fields(&raw, FieldSet::NONE)?;
+            reject_fields(raw, FieldSet::NONE)?;
             Action::Done
         }
         "fail" => {
-            reject_fields(&raw, FieldSet::REASON_DETAIL)?;
+            reject_fields(raw, FieldSet::REASON_DETAIL)?;
             Action::Fail {
                 reason: require_string("reason_detail", raw.reason_detail.as_deref())?.to_string(),
             }

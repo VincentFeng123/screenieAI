@@ -881,7 +881,7 @@ fn frontmost_application_info() -> Result<Option<FocusedApp>, ObservationError> 
 
         let pid = objc_send_i32(app, selector(b"processIdentifier\0"));
         if pid <= 0 {
-            return Ok(None);
+            Ok(None)
         } else {
             let name = objc_send_nsstring(app, selector(b"localizedName\0"))
                 .or_else(|| objc_send_nsstring(app, selector(b"bundleIdentifier\0")))
@@ -950,7 +950,7 @@ fn copy_attribute(
         )),
         other => Err(ObservationError::AxReadFailed(format!(
             "AXUIElementCopyAttributeValue({}) returned {}",
-            attribute.to_string(),
+            attribute,
             other
         ))),
     }

@@ -5516,13 +5516,13 @@ fn verify_expected_effect_with_sleep<O, S>(
     pre_state_hash: &str,
     timeout: Duration,
     poll: Duration,
-    mut sleep: S,
+    sleep: S,
 ) -> (VerificationReport, Option<StableObservation>)
 where
     O: ScreenObserver + ObservationMetadataProvider,
     S: FnMut(Duration),
 {
-    match observe_until_stable_with_sleep(observer, timeout, poll, |duration| sleep(duration)) {
+    match observe_until_stable_with_sleep(observer, timeout, poll, sleep) {
         Ok(after) => {
             let report = if after.semantic_hash != pre_state_hash {
                 VerificationReport::progressed(1)

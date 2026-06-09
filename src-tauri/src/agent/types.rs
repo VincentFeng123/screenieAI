@@ -32,7 +32,9 @@ impl Rect {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[derive(Default)]
 pub enum CoordinateSpace {
+    #[default]
     AxPoints,
     WindowPixels {
         origin_x: f64,
@@ -41,11 +43,6 @@ pub enum CoordinateSpace {
     },
 }
 
-impl Default for CoordinateSpace {
-    fn default() -> Self {
-        Self::AxPoints
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

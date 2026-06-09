@@ -3223,23 +3223,20 @@ async fn capture_and_show_overlay(app: AppHandle) {
             ));
             let _ = w.set_size(LogicalSize::<f64>::new(logical_w as f64, logical_h as f64));
             let app_for_event = app.clone();
-            w.on_window_event(move |event| match event {
-                WindowEvent::Destroyed => {
-                    // Window-event callbacks fire on the main loop on macOS,
-                    // but `finish_overlay_session` flips the activation
-                    // policy and re-shows the main settings window — non-
-                    // trivial AppKit work that we don't want running
-                    // synchronously inside the event-loop tick. Defer to the
-                    // async runtime so this callback returns immediately and
-                    // the queued AppKit messages are serviced on the next
-                    // loop iteration (`restore_main_window` below then re-
-                    // enters the main thread via `run_on_main_thread`).
-                    let app_for_task = app_for_event.clone();
-                    tauri::async_runtime::spawn(async move {
-                        finish_overlay_session(&app_for_task);
-                    });
-                }
-                _ => {}
+            w.on_window_event(move |event| if let WindowEvent::Destroyed = event {
+                // Window-event callbacks fire on the main loop on macOS,
+                // but `finish_overlay_session` flips the activation
+                // policy and re-shows the main settings window — non-
+                // trivial AppKit work that we don't want running
+                // synchronously inside the event-loop tick. Defer to the
+                // async runtime so this callback returns immediately and
+                // the queued AppKit messages are serviced on the next
+                // loop iteration (`restore_main_window` below then re-
+                // enters the main thread via `run_on_main_thread`).
+                let app_for_task = app_for_event.clone();
+                tauri::async_runtime::spawn(async move {
+                    finish_overlay_session(&app_for_task);
+                });
             });
             show_overlay_window(&app, &w);
             eprintln!("[screenie] overlay window created and shown");
@@ -3376,11 +3373,11 @@ fn save_quick_tooltip_moved_position(
 }
 
 fn quick_tooltip_blocked_by_visible_surface(app: &AppHandle) -> bool {
-    let overlay_visible = app
+    
+    app
         .get_webview_window("overlay")
         .map(|w| w.is_visible().unwrap_or(false))
-        .unwrap_or(false);
-    overlay_visible
+        .unwrap_or(false)
 }
 
 fn ensure_quick_tooltip_window(app: &AppHandle) -> Result<WebviewWindow, String> {
@@ -3520,7 +3517,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             true,
             None::<&str>,
         )?;
-        return Menu::with_items(
+        Menu::with_items(
             app,
             &[
                 &tooltip_item,
@@ -3529,7 +3526,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                 &separator,
                 &quit_item,
             ],
-        );
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
