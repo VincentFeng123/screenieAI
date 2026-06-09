@@ -1,6 +1,6 @@
 use super::types::{
     Action, CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider,
-    ObservationError, Rect, ScreenObserver,
+    MenuPressOutcome, ObservationError, Rect, ScreenObserver,
 };
 use ab_glyph::FontArc;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -373,6 +373,28 @@ where
             ElementSource::VisionDetected => self.refresh_detected_element(el),
             ElementSource::VisionCoordinate => self.refresh_coordinate_element(el),
         }
+    }
+
+    // Semantic actions only make sense on real AX elements; vision-derived
+    // synthetic elements have no platform handle, so they fall back cleanly.
+    fn perform_press(&self, el: &Element) -> Result<bool, String> {
+        if el.source == ElementSource::Ax {
+            self.base.perform_press(el)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn set_value(&self, el: &Element, text: &str) -> Result<bool, String> {
+        if el.source == ElementSource::Ax {
+            self.base.set_value(el, text)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn press_menu_path(&self, path: &[String]) -> Result<MenuPressOutcome, String> {
+        self.base.press_menu_path(path)
     }
 }
 

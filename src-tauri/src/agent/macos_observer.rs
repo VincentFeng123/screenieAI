@@ -6,7 +6,8 @@ use super::observer::{
 use super::safari_dom;
 use super::types::{
     normalize_signature_name, CoordinateSpace, Element, ElementSource, FocusedApp,
-    FocusedAppProvider, ObservationError, PlatformElementHandle, Rect, ScreenObserver,
+    FocusedAppProvider, MenuPressOutcome, ObservationError, PlatformElementHandle, Rect,
+    ScreenObserver,
 };
 use super::vision::{ObservationMetadata, ObservationMetadataProvider};
 use core_foundation::base::TCFType;
@@ -23,7 +24,7 @@ use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::number::{CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef};
 use core_foundation_sys::string::{CFStringGetTypeID, CFStringRef};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::fmt;
 use std::mem;
@@ -74,6 +75,12 @@ extern "C" {
         attribute: CFStringRef,
         value: *mut CFTypeRef,
     ) -> i32;
+    fn AXUIElementSetAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        value: CFTypeRef,
+    ) -> i32;
+    fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> i32;
     fn AXUIElementCopyElementAtPosition(
         application: AXUIElementRef,
         x: f32,
@@ -98,14 +105,38 @@ extern "C" {
 /// with a top-left origin. For Milestone 3, those AX points and enigo's
 /// CGEvent global positioning are assumed to be 1:1. Screenshot pixel
 /// conversion belongs to a later milestone.
+/// Electron exposes its AX tree only after a client writes
+/// `AXManualAccessibility`; Chromium wants `AXEnhancedUserInterface` (the
+/// VoiceOver flag — drop it from this list if apps misbehave under it).
+/// Native apps reject both writes; that is expected and silent.
+const ELECTRON_UNLOCK_ATTRIBUTES: &[&str] = &["AXManualAccessibility", "AXEnhancedUserInterface"];
+
 #[derive(Clone, Debug, Default)]
 pub struct MacObserver {
     handles: AxHandleRegistry,
+    unlocked_pids: Rc<RefCell<HashSet<Pid>>>,
 }
 
 impl MacObserver {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn ensure_app_ax_unlocked(&self, pid: Pid, app: AXUIElementRef) {
+        if !should_attempt_ax_unlock(&mut self.unlocked_pids.borrow_mut(), pid) {
+            return;
+        }
+        for attribute in ELECTRON_UNLOCK_ATTRIBUTES {
+            let name = CFString::new(attribute);
+            let value = CFBoolean::true_value();
+            unsafe {
+                let _ = AXUIElementSetAttributeValue(
+                    app,
+                    name.as_concrete_TypeRef(),
+                    value.as_CFTypeRef(),
+                );
+            }
+        }
     }
 
     fn observe_frontmost_app(&self) -> Result<Vec<Element>, ObservationError> {
@@ -119,6 +150,7 @@ impl MacObserver {
             return Err(ObservationError::NoFrontmostApp);
         }
         let _app_ref = OwnedCf::new(app);
+        self.ensure_app_ax_unlocked(pid, app);
 
         self.handles.clear();
         let mut walker = AxTreeWalker::new(self.handles.clone(), safari_mode);
@@ -220,6 +252,7 @@ impl MacObserver {
             return Err(ObservationError::NoFrontmostApp);
         }
         let _app_ref = OwnedCf::new(app);
+        self.ensure_app_ax_unlocked(pid, app);
 
         let mut walker = AxTreeWalker::new(AxHandleRegistry::default(), safari_mode);
         let walked_windows = if let Some(windows) = copy_array_attribute(app, "AXWindows")? {
@@ -299,6 +332,141 @@ impl ScreenObserver for MacObserver {
     fn read_page_text(&self) -> Result<String, String> {
         let focused = self.focused_app().map_err(|err| err.to_string())?;
         super::page_reader::read_focused_page_text(self, &focused)
+    }
+
+    fn perform_press(&self, el: &Element) -> Result<bool, String> {
+        let Some(PlatformElementHandle::MacAx { key }) = el.platform_handle.as_ref() else {
+            return Ok(false);
+        };
+        let Some(handle) = self.handles.get(*key) else {
+            return Ok(false);
+        };
+        let action = CFString::new("AXPress");
+        let err = unsafe { AXUIElementPerformAction(handle, action.as_concrete_TypeRef()) };
+        // Any non-success means no press happened, so the synthetic-click
+        // fallback is always safe; a press that "succeeded" without effect is
+        // caught by the caller's post-action verification.
+        Ok(err == AX_ERROR_SUCCESS)
+    }
+
+    fn set_value(&self, el: &Element, text: &str) -> Result<bool, String> {
+        let Some(PlatformElementHandle::MacAx { key }) = el.platform_handle.as_ref() else {
+            return Ok(false);
+        };
+        let Some(handle) = self.handles.get(*key) else {
+            return Ok(false);
+        };
+
+        // Focus first: bail out before writing any text unless keyboard focus
+        // verifiably lands on the field. A following "key Return" must go to
+        // this field, and a half-finished set_value may leave at worst a
+        // focused field — never stray text the synthetic fallback would
+        // double up on.
+        let focused_attr = CFString::new("AXFocused");
+        let truthy = CFBoolean::true_value();
+        unsafe {
+            let _ = AXUIElementSetAttributeValue(
+                handle,
+                focused_attr.as_concrete_TypeRef(),
+                truthy.as_CFTypeRef(),
+            );
+        }
+        let focused = copy_bool_attribute(handle, "AXFocused").map_err(|err| err.to_string())?;
+        if focused != Some(true) {
+            return Ok(false);
+        }
+
+        let value = CFString::new(text);
+        let value_attr = CFString::new("AXValue");
+        let err = unsafe {
+            AXUIElementSetAttributeValue(
+                handle,
+                value_attr.as_concrete_TypeRef(),
+                value.as_CFTypeRef(),
+            )
+        };
+        if err != AX_ERROR_SUCCESS {
+            return Ok(false);
+        }
+
+        // Read back: WebKit bodies and JS-backed inputs accept the write and
+        // silently ignore it; only a matching read-back counts as success.
+        let written =
+            copy_value_string_attribute(handle, "AXValue").map_err(|err| err.to_string())?;
+        let matches = match written.as_deref() {
+            Some(value) => value.trim() == text.trim(),
+            None => text.trim().is_empty(),
+        };
+        Ok(matches)
+    }
+
+    fn press_menu_path(&self, path: &[String]) -> Result<MenuPressOutcome, String> {
+        ensure_accessibility_permission_with(system_accessibility_trusted, prompt_accessibility)
+            .map_err(|err| err.to_string())?;
+
+        let focused_app = frontmost_application_info()
+            .map_err(|err| err.to_string())?
+            .ok_or("no frontmost application")?;
+        let pid = focused_app.pid.ok_or("no frontmost application pid")?;
+        let app = unsafe { AXUIElementCreateApplication(pid) };
+        if app.is_null() {
+            return Err("no frontmost application".into());
+        }
+        let _app_ref = OwnedCf::new(app);
+
+        let Some(menu_bar) = copy_attribute(app, "AXMenuBar").map_err(|err| err.to_string())?
+        else {
+            return Ok(MenuPressOutcome::NotFound {
+                depth: 0,
+                available: Vec::new(),
+            });
+        };
+
+        let mut current = menu_bar;
+        let mut resolved_path = Vec::with_capacity(path.len());
+        for (depth, wanted) in path.iter().enumerate() {
+            let items = menu_level_items(current.as_type_ref())?;
+            let titles = items.iter().map(|(_, title)| title.clone()).collect::<Vec<_>>();
+            let Some(index) = match_menu_title(&titles, wanted) else {
+                return Ok(MenuPressOutcome::NotFound {
+                    depth,
+                    available: titles
+                        .into_iter()
+                        .filter(|title| !title.is_empty())
+                        .take(MAX_MENU_TITLES_IN_FEEDBACK)
+                        .collect(),
+                });
+            };
+            let (element, title) = items
+                .into_iter()
+                .nth(index)
+                .expect("matched index is within items");
+            resolved_path.push(title);
+            current = element;
+        }
+
+        if copy_bool_attribute(current.as_type_ref(), "AXEnabled")
+            .map_err(|err| err.to_string())?
+            == Some(false)
+        {
+            return Err(format!(
+                "menu item '{}' is disabled right now",
+                resolved_path.join(" > ")
+            ));
+        }
+
+        // Pressing a deep AXMenuItem triggers it without opening the parent
+        // menus on screen — the tree is fully readable while menus are closed.
+        let action = CFString::new("AXPress");
+        let err =
+            unsafe { AXUIElementPerformAction(current.as_type_ref(), action.as_concrete_TypeRef()) };
+        if err != AX_ERROR_SUCCESS {
+            return Err(format!(
+                "pressing menu item '{}' failed (AX error {err})",
+                resolved_path.join(" > ")
+            ));
+        }
+        Ok(MenuPressOutcome::Pressed { resolved_path })
     }
 
     fn refresh_element(&self, el: &Element) -> Option<Element> {
@@ -549,6 +717,100 @@ impl Drop for OwnedCf {
 
 fn system_accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
+}
+
+/// One unlock attempt per pid per observer lifetime; repeated writes are
+/// wasted IPC round-trips into the target app.
+fn should_attempt_ax_unlock(unlocked: &mut HashSet<Pid>, pid: Pid) -> bool {
+    unlocked.insert(pid)
+}
+
+const MAX_MENU_TITLES_IN_FEEDBACK: usize = 30;
+const MAX_MENU_WRAPPER_DEPTH: usize = 2;
+
+/// Children of a menu element, with the interposed `AXMenu` wrapper unwrapped:
+/// an `AXMenuBarItem`/`AXMenuItem` parents a single `AXMenu` whose children
+/// are the actual items.
+fn menu_level_items(element: AXUIElementRef) -> Result<Vec<(OwnedCf, String)>, String> {
+    let mut items = Vec::new();
+    collect_menu_children(element, 0, &mut items)?;
+    Ok(items)
+}
+
+fn collect_menu_children(
+    element: AXUIElementRef,
+    wrapper_depth: usize,
+    items: &mut Vec<(OwnedCf, String)>,
+) -> Result<(), String> {
+    let Some(children) =
+        copy_array_attribute(element, "AXChildren").map_err(|err| err.to_string())?
+    else {
+        return Ok(());
+    };
+    let count = cf_array_len(&children)
+        .map_err(|err| err.to_string())?
+        .min(MAX_AX_CHILDREN_PER_NODE);
+    for index in 0..count {
+        let child = unsafe {
+            CFArrayGetValueAtIndex(
+                children.as_array_ref().map_err(|err| err.to_string())?,
+                index as isize,
+            ) as AXUIElementRef
+        };
+        if child.is_null() {
+            continue;
+        }
+        let role = copy_string_attribute(child, "AXRole")
+            .map_err(|err| err.to_string())?
+            .unwrap_or_default();
+        if role == "AXMenu" {
+            if wrapper_depth < MAX_MENU_WRAPPER_DEPTH {
+                collect_menu_children(child, wrapper_depth + 1, items)?;
+            }
+            continue;
+        }
+        let title = copy_nonempty_string_attribute(child, "AXTitle")
+            .map_err(|err| err.to_string())?
+            .unwrap_or_default();
+        let retained = unsafe { CFRetain(child) };
+        items.push((OwnedCf::new(retained), title));
+    }
+    Ok(())
+}
+
+/// Match a model-supplied menu title against the level's real titles:
+/// normalized exact match first, then a unique prefix match. Returns the
+/// index of the matched title.
+pub(crate) fn match_menu_title(titles: &[String], wanted: &str) -> Option<usize> {
+    let wanted = normalize_menu_title(wanted);
+    if wanted.is_empty() {
+        return None;
+    }
+    if let Some(index) = titles
+        .iter()
+        .position(|title| normalize_menu_title(title) == wanted)
+    {
+        return Some(index);
+    }
+    let prefix_matches = titles
+        .iter()
+        .enumerate()
+        .filter(|(_, title)| normalize_menu_title(title).starts_with(&wanted))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if prefix_matches.len() == 1 {
+        return Some(prefix_matches[0]);
+    }
+    None
+}
+
+fn normalize_menu_title(title: &str) -> String {
+    title
+        .trim()
+        .trim_end_matches('…')
+        .trim_end_matches("...")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn prompt_accessibility() {
@@ -930,6 +1192,33 @@ mod tests {
             name: "Safari".into(),
             pid: Some(1),
         }));
+    }
+
+    #[test]
+    fn ax_unlock_is_attempted_once_per_pid() {
+        let mut unlocked = HashSet::new();
+        assert!(should_attempt_ax_unlock(&mut unlocked, 100));
+        assert!(!should_attempt_ax_unlock(&mut unlocked, 100));
+        assert!(should_attempt_ax_unlock(&mut unlocked, 200));
+    }
+
+    #[test]
+    fn menu_title_match_normalizes_ellipsis_case_and_unique_prefix() {
+        let titles = vec![
+            "File".to_string(),
+            "Export as PDF…".to_string(),
+            "Export All".to_string(),
+            "Print...".to_string(),
+        ];
+
+        assert_eq!(match_menu_title(&titles, "export as pdf"), Some(1));
+        assert_eq!(match_menu_title(&titles, "Export as PDF…"), Some(1));
+        assert_eq!(match_menu_title(&titles, "Print"), Some(3));
+        assert_eq!(match_menu_title(&titles, "Export as"), Some(1));
+        // "Export" prefixes two entries — ambiguous, no match.
+        assert_eq!(match_menu_title(&titles, "Export"), None);
+        assert_eq!(match_menu_title(&titles, "Quit"), None);
+        assert_eq!(match_menu_title(&titles, "  "), None);
     }
 
     #[test]

@@ -517,6 +517,7 @@ pub(crate) fn openai_strict_decision_schema() -> Value {
             "id",
             "text",
             "combo",
+            "path",
             "dx",
             "dy",
             "ms",
@@ -531,12 +532,16 @@ pub(crate) fn openai_strict_decision_schema() -> Value {
             "reason": { "type": "string" },
             "action": {
                 "type": "string",
-                "enum": ["activateApp", "click", "doubleClick", "type", "key", "scroll", "wait", "openUrl", "webSearch", "readPage", "done", "fail"]
+                "enum": ["activateApp", "click", "doubleClick", "type", "key", "menu", "scroll", "wait", "openUrl", "webSearch", "readPage", "done", "fail"]
             },
             "app": { "type": ["string", "null"] },
             "id": { "type": ["integer", "null"], "minimum": 0 },
             "text": { "type": ["string", "null"] },
             "combo": { "type": ["string", "null"] },
+            "path": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
             "dx": { "type": ["integer", "null"] },
             "dy": { "type": ["integer", "null"] },
             "ms": { "type": ["integer", "null"], "minimum": 0 },

@@ -15,6 +15,8 @@ const MAX_EXPECT_CHARS: usize = 120;
 const MAX_MILESTONES: usize = 6;
 const MAX_MILESTONE_CHARS: usize = 80;
 const MAX_REPAIR_SNIPPET_CHARS: usize = 200;
+const MAX_MENU_PATH_COMPONENTS: usize = 4;
+const MAX_MENU_TITLE_CHARS: usize = 80;
 
 #[derive(Clone, Debug)]
 pub struct StubPlanner {
@@ -575,6 +577,7 @@ pub(crate) fn build_system_prompt() -> String {
         "For web, URL, tab, or search goals, activate Safari first if the focused app is not a browser.",
         "openUrl opens a URL in the default browser in ONE step - always prefer it over activating a browser and typing into the address bar.",
         "webSearch runs a web search in ONE step - prefer it for any 'find/search the web' goal.",
+        "menu presses one item in the frontmost app's menu bar by title path - prefer it for app commands (Save, Export, Print, Preferences, New Window, View options) over hunting for on-screen buttons. Write titles as a human reads them; a trailing '\u{2026}' is optional. If the path is wrong, the step result lists that menu's real items so you can correct it.",
         "The observation lists only clickable controls. To read page CONTENT (prices, article text, search results), emit readPage; its text arrives in your next prompt.",
         "For shopping or price-comparison goals: webSearch first, readPage to compare offers, save each price with note, openUrl the best offer's page, then emit done at the product/buy page. Do NOT click Buy, Add to Cart, or Checkout unless the user explicitly asked to purchase.",
         "Never type placeholder words like 'search', 'query', or 'text' into a field. Type the real value the goal needs; if the goal gives no specific value, infer a sensible one or emit fail with reason_detail.",
@@ -603,6 +606,7 @@ pub(crate) fn build_system_prompt() -> String {
         r#"{"reason":"brief reason","action":"doubleClick","id":14}"#,
         r#"{"reason":"brief reason","action":"type","id":9,"text":"..."}"#,
         r#"{"reason":"brief reason","action":"key","combo":"cmd+s"}"#,
+        r#"{"reason":"brief reason","action":"menu","path":["File","Export as PDF"]}"#,
         r#"{"reason":"brief reason","action":"scroll","dx":0,"dy":300}"#,
         r#"{"reason":"brief reason","action":"wait","ms":200}"#,
         r#"{"reason":"brief reason","action":"openUrl","url":"https://example.com"}"#,
@@ -881,12 +885,17 @@ pub(crate) fn planner_response_schema() -> Value {
             "reason": { "type": "string", "maxLength": MAX_REASON_CHARS },
             "action": {
                 "type": "string",
-                "enum": ["activateApp", "click", "doubleClick", "type", "key", "scroll", "wait", "openUrl", "webSearch", "readPage", "done", "fail"]
+                "enum": ["activateApp", "click", "doubleClick", "type", "key", "menu", "scroll", "wait", "openUrl", "webSearch", "readPage", "done", "fail"]
             },
             "app": { "type": "string" },
             "id": { "type": "integer", "minimum": 0 },
             "text": { "type": "string" },
             "combo": { "type": "string" },
+            "path": {
+                "type": "array",
+                "maxItems": MAX_MENU_PATH_COMPONENTS,
+                "items": { "type": "string", "maxLength": MAX_MENU_TITLE_CHARS }
+            },
             "url": { "type": "string" },
             "query": { "type": "string" },
             "dx": { "type": "integer" },
@@ -1022,6 +1031,29 @@ pub(crate) fn parse_planner_decision(
             let combo = require_string("combo", raw.combo.as_deref())?.to_string();
             validate_key_combo(&combo)?;
             Action::Key { combo }
+        }
+        "menu" => {
+            reject_fields(&raw, FieldSet::PATH)?;
+            let path = raw
+                .path
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>();
+            if path.len() < 2 {
+                return Err(
+                    "menu requires a path with the menu title and the item, e.g. [\"File\",\"Save\"]"
+                        .into(),
+                );
+            }
+            if path.len() > MAX_MENU_PATH_COMPONENTS {
+                return Err(format!(
+                    "menu path supports at most {MAX_MENU_PATH_COMPONENTS} levels"
+                ));
+            }
+            Action::Menu { path }
         }
         "scroll" => {
             reject_fields(&raw, FieldSet::DX_DY)?;
@@ -1537,6 +1569,19 @@ fn coerce_planner_value(mut value: Value) -> Value {
         }
     }
 
+    // Weak models often write a menu path as one string: "File > Export".
+    if let Some(Value::String(text)) = map.get("path") {
+        let parts = text
+            .split(['>', '/'])
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(|part| json!(part))
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            map.insert("path".into(), Value::Array(parts));
+        }
+    }
+
     const KNOWN_FIELDS: &[&str] = &[
         "reason",
         "action",
@@ -1547,6 +1592,7 @@ fn coerce_planner_value(mut value: Value) -> Value {
         "y",
         "text",
         "combo",
+        "path",
         "dx",
         "dy",
         "ms",
@@ -1570,6 +1616,8 @@ fn canonical_action_name(action: &str) -> String {
             "type".into()
         }
         "press" | "press_key" | "hotkey" | "keypress" | "key_press" | "shortcut" => "key".into(),
+        "menu_click" | "menuclick" | "click_menu" | "menu_item" | "menuitem" | "select_menu"
+        | "menu_select" => "menu".into(),
         "finish" | "complete" | "end" | "stop" | "terminate" => "done".into(),
         "open_url" | "openurl" | "navigate" | "goto" | "go_to_url" => "openUrl".into(),
         "web_search" | "websearch" | "search" => "webSearch".into(),
@@ -1680,6 +1728,9 @@ fn reject_fields(raw: &RawPlannerResponse, allowed: FieldSet) -> Result<(), Stri
     if raw.combo.is_some() && !allowed.combo {
         extras.push("combo");
     }
+    if raw.path.is_some() && !allowed.path {
+        extras.push("path");
+    }
     if raw.dx.is_some() && !allowed.dx {
         extras.push("dx");
     }
@@ -1719,6 +1770,7 @@ struct FieldSet {
     y: bool,
     text: bool,
     combo: bool,
+    path: bool,
     dx: bool,
     dy: bool,
     ms: bool,
@@ -1736,12 +1788,17 @@ impl FieldSet {
         y: false,
         text: false,
         combo: false,
+        path: false,
         dx: false,
         dy: false,
         ms: false,
         url: false,
         query: false,
         reason_detail: false,
+    };
+    const PATH: Self = Self {
+        path: true,
+        ..Self::NONE
     };
     const URL: Self = Self {
         url: true,
@@ -1804,6 +1861,7 @@ struct RawPlannerResponse {
     y: Option<serde_json::Value>,
     text: Option<String>,
     combo: Option<String>,
+    path: Option<Vec<String>>,
     dx: Option<i32>,
     dy: Option<i32>,
     ms: Option<u64>,
@@ -2196,6 +2254,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decision.action, Action::Done);
+    }
+
+    #[test]
+    fn parse_menu_action_accepts_arrays_and_coerces_string_paths() {
+        let obs = vec![element(3, "Ask")];
+
+        let decision = parse_planner_decision(
+            r#"{"reason":"export","action":"menu","path":["File","Export as PDF…"]}"#,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::Menu {
+                path: vec!["File".into(), "Export as PDF…".into()]
+            }
+        );
+
+        // Weak models often emit the path as one string.
+        let decision = parse_planner_decision(
+            r#"{"reason":"export","action":"menu","path":"File > Export as PDF"}"#,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::Menu {
+                path: vec!["File".into(), "Export as PDF".into()]
+            }
+        );
+
+        // Action-name synonyms map onto menu.
+        let decision = parse_planner_decision(
+            r#"{"reason":"export","action":"menu_click","path":["File","Save"]}"#,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::Menu {
+                path: vec!["File".into(), "Save".into()]
+            }
+        );
+
+        // A single component is not a usable path.
+        assert!(parse_planner_decision(
+            r#"{"reason":"open menu","action":"menu","path":["File"]}"#,
+            &obs,
+        )
+        .is_err());
+        assert!(parse_planner_decision(
+            r#"{"reason":"open menu","action":"menu"}"#,
+            &obs,
+        )
+        .is_err());
     }
 
     #[test]

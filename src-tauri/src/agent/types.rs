@@ -222,6 +222,20 @@ pub enum ObservationError {
     UnsupportedPlatform,
 }
 
+/// Result of resolving and pressing a menu-bar title path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuPressOutcome {
+    Pressed {
+        resolved_path: Vec<String>,
+    },
+    /// `path[depth]` did not match; `available` lists that level's real
+    /// titles so the planner can self-correct.
+    NotFound {
+        depth: usize,
+        available: Vec<String>,
+    },
+}
+
 pub trait ScreenObserver {
     fn observe(&self) -> Result<Vec<Element>, ObservationError>;
 
@@ -230,6 +244,29 @@ pub trait ScreenObserver {
     /// stub and test observers working without page-reading support.
     fn read_page_text(&self) -> Result<String, String> {
         Err("page reading is not supported by this observer".into())
+    }
+
+    /// Try the platform's semantic press (kAXPressAction on macOS) on the
+    /// element's retained platform handle. `Ok(true)` means the press was
+    /// delivered; `Ok(false)` means no handle or unsupported here, and the
+    /// caller falls back to a synthetic click. Effect verification stays with
+    /// the caller either way.
+    fn perform_press(&self, _el: &Element) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Try writing `text` straight into the element's value (AXValue on
+    /// macOS) instead of synthesizing keystrokes. `Ok(true)` only when the
+    /// write stuck (read-back matches) and keyboard focus landed on the
+    /// element; `Ok(false)` falls back to click+type.
+    fn set_value(&self, _el: &Element, _text: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Resolve a menu-bar title path on the frontmost app and press the leaf
+    /// item. Platform observers override this.
+    fn press_menu_path(&self, _path: &[String]) -> Result<MenuPressOutcome, String> {
+        Err("menu actions are not supported by this observer".into())
     }
 
     fn refresh_element(&self, el: &Element) -> Option<Element> {
@@ -281,6 +318,9 @@ pub enum Action {
     Move { id: u32 },
     Drag { from_id: u32, to_id: u32 },
     Key { combo: String },
+    /// Press one item in the frontmost app's menu bar by title path, e.g.
+    /// `["File", "Export as PDF…"]`.
+    Menu { path: Vec<String> },
     Scroll { dx: i32, dy: i32 },
     ScrollAt { id: u32, dx: i32, dy: i32 },
     Wait { ms: u64 },
@@ -311,6 +351,7 @@ impl Serialize for Action {
             | Self::RightClick { .. }
             | Self::Move { .. }
             | Self::Key { .. }
+            | Self::Menu { .. }
             | Self::Scroll { .. }
             | Self::Wait { .. }
             | Self::OpenUrl { .. }
@@ -373,6 +414,10 @@ impl Serialize for Action {
                 state.serialize_field("action", "key")?;
                 state.serialize_field("combo", combo)?;
             }
+            Self::Menu { path } => {
+                state.serialize_field("action", "menu")?;
+                state.serialize_field("path", path)?;
+            }
             Self::Scroll { dx, dy } => {
                 state.serialize_field("action", "scroll")?;
                 state.serialize_field("dx", dx)?;
@@ -429,6 +474,7 @@ impl<'de> Deserialize<'de> for Action {
             target: Option<String>,
             text: Option<String>,
             combo: Option<String>,
+            path: Option<Vec<String>>,
             dx: Option<i32>,
             dy: Option<i32>,
             ms: Option<u64>,
@@ -478,6 +524,7 @@ impl<'de> Deserialize<'de> for Action {
             ("target", raw.target.is_some()),
             ("text", raw.text.is_some()),
             ("combo", raw.combo.is_some()),
+            ("path", raw.path.is_some()),
             ("dx", raw.dx.is_some()),
             ("dy", raw.dy.is_some()),
             ("ms", raw.ms.is_some()),
@@ -576,6 +623,20 @@ impl<'de> Deserialize<'de> for Action {
                 let combo = required_string::<D::Error>("combo", raw.combo)?;
                 Ok(Self::Key { combo })
             }
+            "menu" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["path"])?;
+                let path = raw
+                    .path
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>();
+                if path.is_empty() {
+                    return Err(serde::de::Error::custom("menu requires a non-empty path"));
+                }
+                Ok(Self::Menu { path })
+            }
             "scroll" => {
                 reject_extra::<D::Error>(&raw.action, &present, &["id", "dx", "dy"])?;
                 match raw.id {
@@ -661,6 +722,7 @@ impl Action {
             | Self::TypeTarget { .. }
             | Self::TypeFocused { .. }
             | Self::Key { .. }
+            | Self::Menu { .. }
             | Self::Scroll { .. }
             | Self::Wait { .. }
             | Self::OpenUrl { .. }
@@ -814,6 +876,23 @@ mod tests {
     fn action_json_contract_parses_done() {
         let action = Action::from_json_strict(r#"{"action":"done"}"#).unwrap();
         assert_eq!(action, Action::Done);
+    }
+
+    #[test]
+    fn action_json_contract_round_trips_menu_paths() {
+        let menu = Action::Menu {
+            path: vec!["File".into(), "Export as PDF…".into()],
+        };
+        let json = menu.to_json().unwrap();
+        assert_eq!(
+            json,
+            r#"{"action":"menu","path":["File","Export as PDF…"]}"#
+        );
+        assert_eq!(Action::from_json_strict(&json).unwrap(), menu);
+
+        assert!(Action::from_json_strict(r#"{"action":"menu"}"#).is_err());
+        assert!(Action::from_json_strict(r#"{"action":"menu","path":[]}"#).is_err());
+        assert!(Action::from_json_strict(r#"{"action":"menu","path":["  "]}"#).is_err());
     }
 
     #[test]

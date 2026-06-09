@@ -7,7 +7,8 @@ use super::grounding::{
 use super::grounding::{GroundingPixel, NoopGrounder};
 use super::types::{
     normalize_signature_name, Action, CoordinateSpace, Element, ElementSource, FocusedApp,
-    FocusedAppProvider, ObservationError, Planner, PlannerHistoryEntry, Rect, ScreenObserver,
+    FocusedAppProvider, MenuPressOutcome, ObservationError, Planner, PlannerHistoryEntry, Rect,
+    ScreenObserver,
 };
 use super::vision::{
     click_point_from_rect, coordinate_element, CaptureSize, ObservationMetadata,
@@ -398,6 +399,19 @@ pub enum AgentRunStatus {
     Aborted,
 }
 
+/// How a step's input actually reached the target app: a semantic
+/// accessibility call, or synthesized mouse/keyboard events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActionMechanism {
+    AxPress,
+    AxSetValue,
+    MenuPress,
+    SyntheticClick,
+    ClipboardPaste,
+    SyntheticInput,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStepReport {
@@ -409,6 +423,7 @@ pub struct AgentStepReport {
     pub click_preflight: Option<ClickPreflightReport>,
     pub execution_policy: ExecutionPolicy,
     pub executed: bool,
+    pub mechanism: Option<ActionMechanism>,
     pub safety_gate: Option<SafetyGateReport>,
     pub confirmation: Option<ConfirmationOutcome>,
     pub verification: VerificationReport,
@@ -1091,6 +1106,11 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
                         .map_err(ExecutionError::Input)?;
                 }
             }
+            PreparedKind::Menu { .. } => {
+                return Err(ExecutionError::Input(
+                    "menu actions are executed through the accessibility bridge".into(),
+                ));
+            }
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
             | PreparedKind::Done
@@ -1718,6 +1738,7 @@ where
                             click_preflight: None,
                             execution_policy: options.execution_policy,
                             executed: false,
+                            mechanism: None,
                             safety_gate: None,
                             confirmation: None,
                             verification: VerificationReport::skipped_no_change_expected(),
@@ -1761,6 +1782,7 @@ where
                         click_preflight: None,
                         execution_policy: options.execution_policy,
                         executed: false,
+                        mechanism: None,
                         safety_gate: None,
                         confirmation: None,
                         verification: VerificationReport::skipped_no_change_expected(),
@@ -1829,6 +1851,7 @@ where
                         click_preflight: None,
                         execution_policy: options.execution_policy,
                         executed: false,
+                        mechanism: None,
                         safety_gate: None,
                         confirmation: None,
                         verification: VerificationReport::skipped_no_change_expected(),
@@ -1886,6 +1909,7 @@ where
             click_preflight: None,
             execution_policy: options.execution_policy,
             executed: false,
+            mechanism: None,
             safety_gate: None,
             confirmation: None,
             verification: VerificationReport::skipped_no_change_expected(),
@@ -1956,6 +1980,11 @@ where
                 .as_ref()
                 .is_some_and(|report| report.mode == GroundingMode::OnePass)
         {
+            max_attempts = max_attempts.max(2);
+        }
+        // A Type that goes through AXSetValue first earns one synthetic
+        // retry; the plain paste path stays non-retryable.
+        if ax_set_value_eligible(&prepared) {
             max_attempts = max_attempts.max(2);
         }
 
@@ -2290,8 +2319,64 @@ where
                 }
             }
 
+            // Rung 3 of the action ladder: semantic AX actions before
+            // synthetic input. Attempt 1 only — an AXPress/AXSetValue whose
+            // verification shows no effect falls back to the synthetic path
+            // on the retry attempt.
+            let mut ax_semantic_mechanism: Option<ActionMechanism> = None;
+            if attempt == 1 && !options.execution_policy.is_dry_run() {
+                if ax_press_eligible(&prepared) {
+                    if let Some(element) = prepared.target_element.as_ref() {
+                        match observer.perform_press(element) {
+                            Ok(true) => {
+                                ax_semantic_mechanism = Some(ActionMechanism::AxPress);
+                            }
+                            Ok(false) => {}
+                            Err(err) => eprintln!(
+                                "[screenie] agent step {} ax-press failed; falling back to synthetic click: {err}",
+                                step_number
+                            ),
+                        }
+                    }
+                } else if ax_set_value_eligible(&prepared) {
+                    let mut set_value_fell_back = false;
+                    if let (Some(element), PreparedKind::Type { text, .. }) =
+                        (prepared.target_element.as_ref(), &prepared.kind)
+                    {
+                        match observer.set_value(element, text) {
+                            Ok(true) => {
+                                ax_semantic_mechanism = Some(ActionMechanism::AxSetValue);
+                            }
+                            Ok(false) => set_value_fell_back = true,
+                            Err(err) => {
+                                eprintln!(
+                                    "[screenie] agent step {} ax-set-value failed; falling back to click+paste: {err}",
+                                    step_number
+                                );
+                                set_value_fell_back = true;
+                            }
+                        }
+                    }
+                    if set_value_fell_back {
+                        // A failed set_value may have left partial text in
+                        // the field; the paste fallback must replace, never
+                        // append.
+                        if let PreparedKind::Type {
+                            replace_existing, ..
+                        } = &mut prepared.kind
+                        {
+                            *replace_existing = true;
+                        }
+                    }
+                }
+            }
+            let ax_semantic_done = ax_semantic_mechanism.is_some();
+
             let mut click_target_preflighted = false;
-            if action_needs_click_preflight(&prepared) && !options.execution_policy.is_dry_run() {
+            if action_needs_click_preflight(&prepared)
+                && !ax_semantic_done
+                && !options.execution_policy.is_dry_run()
+            {
                 log_agent_phase(
                     step_number,
                     "click-preflight-start",
@@ -2378,7 +2463,34 @@ where
                 &action,
                 prepared.target.as_ref(),
             );
-            let execution_result = if click_target_preflighted {
+            let mut menu_feedback: Option<String> = None;
+            let execution_result = if let PreparedKind::Menu { path } = &prepared.kind {
+                if options.execution_policy.is_dry_run() {
+                    Ok(false)
+                } else {
+                    match observer.press_menu_path(path) {
+                        Ok(MenuPressOutcome::Pressed { resolved_path }) => {
+                            ax_semantic_mechanism = Some(ActionMechanism::MenuPress);
+                            eprintln!(
+                                "[screenie] agent step {} menu pressed: {}",
+                                step_number,
+                                resolved_path.join(" > ")
+                            );
+                            Ok(true)
+                        }
+                        Ok(MenuPressOutcome::NotFound { depth, available }) => {
+                            menu_feedback = Some(menu_not_found_note(path, depth, &available));
+                            Ok(false)
+                        }
+                        Err(err) => {
+                            menu_feedback = Some(format!("menu action failed: {err}"));
+                            Ok(false)
+                        }
+                    }
+                }
+            } else if ax_semantic_done {
+                Ok(true)
+            } else if click_target_preflighted {
                 executor.execute_after_click_preflight(&prepared)
             } else {
                 executor.execute(&prepared)
@@ -2386,6 +2498,10 @@ where
             match execution_result {
                 Ok(executed) => {
                     step.executed = step.executed || executed;
+                    if executed {
+                        step.mechanism = ax_semantic_mechanism
+                            .or_else(|| synthetic_mechanism(&prepared.kind));
+                    }
                     log_agent_phase(step_number, "execute-ok", &action, prepared.target.as_ref());
                 }
                 Err(err) => {
@@ -2397,6 +2513,54 @@ where
                     log_agent_step(&step);
                     steps.push(step);
                     break 'steps;
+                }
+            }
+
+            // A missed menu path is planner feedback, not a failure: hand the
+            // available titles back through history and let the next decision
+            // correct the path.
+            if let Some(note) = menu_feedback {
+                step.verification = VerificationReport::skipped_no_change_expected()
+                    .with_attempts(attempt.min(u8::MAX as u32) as u8);
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    note,
+                ));
+                let entry = ProgressLoopEntry {
+                    pre_state_hash: pre_state_hash.clone(),
+                    normalized_action: normalized_action.clone(),
+                };
+                match handle_no_progress_entry(
+                    &mut recent_no_progress,
+                    &mut stuck_recovery,
+                    entry,
+                    options.progress_loop_window,
+                    options.progress_loop_threshold,
+                    &mut force_visual_replan_next,
+                ) {
+                    NoProgressOutcome::Exhausted(reason) => {
+                        step.failure_reason = Some(reason.clone());
+                        terminal_status = Some(AgentRunStatus::Failed);
+                        failure_reason = Some(reason);
+                        log_agent_step(&step);
+                        steps.push(step);
+                        break 'steps;
+                    }
+                    NoProgressOutcome::Recovering(stage) => {
+                        eprintln!(
+                            "[screenie] agent step {} stuck-recovery stage={:?}",
+                            step_number, stage
+                        );
+                        log_agent_step(&step);
+                        steps.push(step);
+                        continue 'steps;
+                    }
+                    NoProgressOutcome::Recorded => {
+                        log_agent_step(&step);
+                        steps.push(step);
+                        continue 'steps;
+                    }
                 }
             }
 
@@ -2687,6 +2851,7 @@ fn confirmation_approval_key(
         Action::Move { .. } => "move".to_string(),
         Action::Drag { .. } => "drag".to_string(),
         Action::Key { combo } => format!("key:{}", normalize_key_combo_for_safety(combo)),
+        Action::Menu { path } => format!("menu:{}", normalize_text_for_match(&path.join(" "))),
         Action::ActivateApp { app } => format!("activateApp:{}", app.trim()),
         Action::OpenUrl { url } => format!("openUrl:{}", url.trim()),
         Action::WebSearch { query } => format!("webSearch:{}", query.trim()),
@@ -2881,6 +3046,14 @@ fn destructive_action_reason(
         }
     }
 
+    // Parity with the cmd+w / cmd+q combo gate: menu items that quit the app
+    // or close the window get the same confirmation treatment.
+    if let Action::Menu { path } = action {
+        if let Some(reason) = menu_path_window_closing_reason(path) {
+            return Some(format!("{reason} requires confirmation"));
+        }
+    }
+
     let haystack = destructive_text_haystack(action, target);
     options
         .destructive_keywords
@@ -2898,6 +3071,9 @@ fn destructive_text_haystack(action: &Action, target: Option<&TargetSummary>) ->
     let mut parts = Vec::new();
     if let Action::ActivateApp { app } = action {
         parts.push(app.clone());
+    }
+    if let Action::Menu { path } = action {
+        parts.push(path.join(" "));
     }
     if let Some(target) = target {
         parts.push(target.role.clone());
@@ -2934,6 +3110,17 @@ fn normalize_key_combo_for_safety(combo: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("+")
+}
+
+fn menu_path_window_closing_reason(path: &[String]) -> Option<&'static str> {
+    let leaf = normalize_text_for_match(path.last()?);
+    if leaf == "quit" || leaf.starts_with("quit ") {
+        return Some("menu item quits the active app");
+    }
+    if leaf == "close" || leaf.starts_with("close window") || leaf.starts_with("close tab") {
+        return Some("menu item closes the active window");
+    }
+    None
 }
 
 fn app_window_closing_key_combo_reason(combo: &str) -> Option<&'static str> {
@@ -3059,6 +3246,16 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
         Action::Key { combo } => Ok(PreparedAction::without_target(PreparedKind::Key {
             combo: parse_key_combo(combo)?,
         })),
+        Action::Menu { path } => {
+            if path.iter().all(|part| part.trim().is_empty()) {
+                return Err(ExecutionError::Input(
+                    "menu requires a non-empty path".into(),
+                ));
+            }
+            Ok(PreparedAction::without_target(PreparedKind::Menu {
+                path: path.clone(),
+            }))
+        }
         Action::Scroll { dx, dy } => Ok(PreparedAction::scroll(
             *dx,
             *dy,
@@ -3151,7 +3348,8 @@ impl PreparedAction {
             | PreparedKind::Drag { .. }
             | PreparedKind::Type { .. }
             | PreparedKind::TypeFocused { .. }
-            | PreparedKind::Key { .. } => true,
+            | PreparedKind::Key { .. }
+            | PreparedKind::Menu { .. } => true,
             PreparedKind::Scroll { dx, dy } => dx != 0 || dy != 0,
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
@@ -3188,6 +3386,8 @@ fn settle_timeout_for(kind: &PreparedKind, options: &ResolvedStubAgentOptions) -
         }
         PreparedKind::ActivateApp { .. } => nav_ms,
         PreparedKind::Key { combo } if combo.main == InputKey::Return => nav_ms,
+        // Menu commands routinely open windows, sheets, and dialogs.
+        PreparedKind::Menu { .. } => nav_ms,
         _ => nav_ms.min(DEFAULT_FAST_SETTLE_TIMEOUT_MS),
     };
     Duration::from_millis(ms)
@@ -3979,6 +4179,80 @@ fn action_needs_click_preflight(prepared: &PreparedAction) -> bool {
         .is_some_and(|target| target.source == ElementSource::VisionCoordinate)
 }
 
+const AX_PRESS_ROLES: &[&str] = &[
+    "AXButton",
+    "AXMenuButton",
+    "AXPopUpButton",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXMenuItem",
+    "AXLink",
+];
+
+/// AXPress replaces a synthetic single click only on control-like roles.
+/// Clicks on text-entry roles and sliders are focus/caret intents where
+/// AXPress is wrong or unsupported.
+fn ax_press_eligible(prepared: &PreparedAction) -> bool {
+    if !matches!(prepared.kind, PreparedKind::Click { times: 1 }) {
+        return false;
+    }
+    prepared.target_element.as_ref().is_some_and(|element| {
+        element.source == ElementSource::Ax && AX_PRESS_ROLES.contains(&element.role.as_str())
+    })
+}
+
+/// AXSetValue replaces click+select-all+paste for text entry on real AX
+/// elements; Safari DOM and vision-derived targets keep the synthetic path.
+fn ax_set_value_eligible(prepared: &PreparedAction) -> bool {
+    matches!(prepared.kind, PreparedKind::Type { .. })
+        && prepared.target_element.as_ref().is_some_and(|element| {
+            element.source == ElementSource::Ax && is_text_entry_role(&element.role)
+        })
+}
+
+fn synthetic_mechanism(kind: &PreparedKind) -> Option<ActionMechanism> {
+    match kind {
+        PreparedKind::Click { .. }
+        | PreparedKind::RightClick
+        | PreparedKind::Move
+        | PreparedKind::Drag { .. } => Some(ActionMechanism::SyntheticClick),
+        PreparedKind::Type { .. } | PreparedKind::TypeFocused { .. } => {
+            Some(ActionMechanism::ClipboardPaste)
+        }
+        PreparedKind::Key { .. } | PreparedKind::Scroll { .. } => {
+            Some(ActionMechanism::SyntheticInput)
+        }
+        PreparedKind::ActivateApp { .. }
+        | PreparedKind::OpenUrl { .. }
+        | PreparedKind::Menu { .. }
+        | PreparedKind::ReadPage
+        | PreparedKind::Wait { .. }
+        | PreparedKind::Done
+        | PreparedKind::Fail { .. } => None,
+    }
+}
+
+const MAX_MENU_TITLES_IN_NOTE: usize = 12;
+
+/// Feedback the planner sees when a menu path misses: the real titles at the
+/// failed level let it correct the path on the next decision.
+fn menu_not_found_note(path: &[String], depth: usize, available: &[String]) -> String {
+    let missing = path.get(depth).map(String::as_str).unwrap_or("");
+    if available.is_empty() {
+        format!(
+            "menu item '{missing}' not found and this app exposes no menu items there; use the visible elements instead"
+        )
+    } else {
+        let titles = available
+            .iter()
+            .take(MAX_MENU_TITLES_IN_NOTE)
+            .map(|title| format!("'{title}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("menu item '{missing}' not found; available items: {titles}")
+    }
+}
+
 fn run_click_preflight<O, F, C>(
     executor: &mut ActionExecutor<F>,
     observer: &O,
@@ -4242,6 +4516,7 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
         ),
         Action::TypeFocused { text } => format!("typeFocused:{}", normalize_text_for_match(text)),
         Action::Key { combo } => format!("key:{}", normalize_key_combo_for_safety(combo)),
+        Action::Menu { path } => format!("menu:{}", normalize_text_for_match(&path.join(" "))),
         Action::Scroll { dx, dy } => format!("scroll:{dx}:{dy}"),
         Action::ScrollAt { dx, dy, .. } => format!(
             "scrollAt:{}:{dx}:{dy}",
@@ -4326,6 +4601,11 @@ enum PreparedKind {
     },
     Key {
         combo: ParsedKeyCombo,
+    },
+    /// Pressed through the observer's accessibility bridge, never through the
+    /// input backend.
+    Menu {
+        path: Vec<String>,
     },
     Scroll {
         dx: i32,
@@ -7537,6 +7817,330 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ax_press_replaces_synthetic_click_and_records_mechanism() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(2, "Done")]),
+        ])
+        .with_presses(vec![Ok(true)]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(report.steps[0].executed);
+        assert_eq!(report.steps[0].mechanism, Some(ActionMechanism::AxPress));
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::Progressed
+        );
+        assert_eq!(*observer.pressed_element_ids.borrow(), vec![1]);
+        assert!(
+            events.borrow().is_empty(),
+            "AXPress must not move the cursor or click synthetically"
+        );
+    }
+
+    #[test]
+    fn ax_press_no_op_falls_back_to_synthetic_click_on_retry() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let target = element(1, "Ask");
+        let observer = FakeObserver::new(vec![
+            Ok(vec![target.clone()]),
+            // Verification after the AXPress: nothing changed.
+            Ok(vec![target.clone()]),
+            // Verification after the synthetic retry: progressed.
+            Ok(vec![element(2, "Done")]),
+        ])
+        .with_presses(vec![Ok(true)]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(1),
+                ..Default::default()
+            },
+            PreflightFactory {
+                events: events.clone(),
+                clicks: clicks.clone(),
+                location_offset: ClickPoint { x: 0, y: 0 },
+            },
+            &FakeCalibrationProbe::hit(TargetSummary::from(&target)),
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(clicks.get(), 1, "the retry attempt clicks synthetically");
+        assert_eq!(
+            report.steps[0].mechanism,
+            Some(ActionMechanism::SyntheticClick)
+        );
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::Progressed
+        );
+    }
+
+    #[test]
+    fn ax_set_value_skips_click_and_paste() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let field = text_field(7, "Search");
+        let mut updated = field.clone();
+        updated.value = Some("hello".into());
+        updated.refresh_signature();
+        let observer = FakeObserver::new(vec![Ok(vec![field]), Ok(vec![updated])])
+            .with_set_values(vec![Ok(true)]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Type {
+                id: 7,
+                text: "hello".into(),
+            }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(report.steps[0].executed);
+        assert_eq!(report.steps[0].mechanism, Some(ActionMechanism::AxSetValue));
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::Progressed
+        );
+        assert_eq!(*observer.set_value_texts.borrow(), vec!["hello".to_string()]);
+        assert!(
+            events.borrow().is_empty(),
+            "AXSetValue must not click or paste"
+        );
+    }
+
+    #[test]
+    fn ax_set_value_failure_falls_back_to_replacing_paste() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let field = text_field(7, "Search");
+        let mut updated = field.clone();
+        updated.value = Some("hello".into());
+        updated.refresh_signature();
+        let observer = FakeObserver::new(vec![Ok(vec![field.clone()]), Ok(vec![updated])])
+            .with_set_values(vec![Ok(false)]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Type {
+                id: 7,
+                text: "hello".into(),
+            }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            PreflightFactory {
+                events: events.clone(),
+                clicks: clicks.clone(),
+                location_offset: ClickPoint { x: 0, y: 0 },
+            },
+            &FakeCalibrationProbe::hit(TargetSummary::from(&field)),
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(
+            report.steps[0].mechanism,
+            Some(ActionMechanism::ClipboardPaste)
+        );
+        assert_eq!(clicks.get(), 1);
+        // The fallback must replace, never append: a failed set_value can
+        // leave partial text behind.
+        assert!(events
+            .borrow()
+            .contains(&RecordedInput::Key(select_all_modifier(), InputDirection::Press)));
+        assert!(events.borrow().contains(&RecordedInput::Text("hello".into())));
+    }
+
+    #[test]
+    fn menu_action_presses_through_observer_bridge() {
+        let create_calls = Rc::new(Cell::new(0));
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(2, "Done")]),
+        ])
+        .with_menu_results(vec![Ok(MenuPressOutcome::Pressed {
+            resolved_path: vec!["File".into(), "Save".into()],
+        })]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Menu {
+                path: vec!["File".into(), "Save".into()],
+            }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: create_calls.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(report.steps[0].executed);
+        assert_eq!(report.steps[0].mechanism, Some(ActionMechanism::MenuPress));
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::Progressed
+        );
+        assert_eq!(
+            *observer.menu_paths.borrow(),
+            vec![vec!["File".to_string(), "Save".to_string()]]
+        );
+        assert_eq!(create_calls.get(), 0, "input backend never touched");
+    }
+
+    #[test]
+    fn menu_not_found_feeds_available_titles_back_to_planner() {
+        let seen_results = Rc::new(RefCell::new(Vec::new()));
+        let planner = MenuFeedbackPlanner {
+            seen_results: seen_results.clone(),
+        };
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask")]),
+        ])
+        .with_menu_results(vec![Ok(MenuPressOutcome::NotFound {
+            depth: 1,
+            available: vec!["Save".into(), "Export as PDF…".into()],
+        })]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(2),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::SkippedNoUiChangeExpected
+        );
+        assert!(report.steps[0].failure_reason.is_none());
+        let results = seen_results.borrow();
+        assert!(
+            results
+                .iter()
+                .any(|result| result.contains("available items: 'Save', 'Export as PDF…'")),
+            "planner history must list the real menu titles, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn menu_destructive_and_window_closing_paths_require_confirmation() {
+        let options = StubAgentOptions::default().resolve();
+        let trash = Action::Menu {
+            path: vec!["File".into(), "Move to Trash".into()],
+        };
+        assert!(destructive_action_reason(&trash, None, &options).is_some());
+        let quit = Action::Menu {
+            path: vec!["Safari".into(), "Quit Safari".into()],
+        };
+        assert!(destructive_action_reason(&quit, None, &options).is_some());
+        let close = Action::Menu {
+            path: vec!["File".into(), "Close Window".into()],
+        };
+        assert!(destructive_action_reason(&close, None, &options).is_some());
+        let save = Action::Menu {
+            path: vec!["File".into(), "Save".into()],
+        };
+        assert!(destructive_action_reason(&save, None, &options).is_none());
+    }
+
+    struct MenuFeedbackPlanner {
+        seen_results: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for MenuFeedbackPlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            *self.seen_results.borrow_mut() = history
+                .iter()
+                .map(|entry| entry.result.clone())
+                .collect();
+            if history.is_empty() {
+                PlannerDecision::new(
+                    "try a misspelled menu item",
+                    Action::Menu {
+                        path: vec!["File".into(), "Sava".into()],
+                    },
+                )
+            } else {
+                PlannerDecision::new("stop", Action::Done)
+            }
+        }
+    }
+
     struct FakeObserver {
         observations: RefCell<VecDeque<Result<Vec<Element>, ObservationError>>>,
         refreshes: RefCell<VecDeque<Option<Element>>>,
@@ -7545,6 +8149,12 @@ mod tests {
         metadata: RefCell<ObservationMetadata>,
         vision_context: RefCell<Option<VisionFallbackContext>>,
         page_texts: RefCell<VecDeque<Result<String, String>>>,
+        presses: RefCell<VecDeque<Result<bool, String>>>,
+        pressed_element_ids: Rc<RefCell<Vec<u32>>>,
+        set_values: RefCell<VecDeque<Result<bool, String>>>,
+        set_value_texts: Rc<RefCell<Vec<String>>>,
+        menu_results: RefCell<VecDeque<Result<MenuPressOutcome, String>>>,
+        menu_paths: Rc<RefCell<Vec<Vec<String>>>>,
     }
 
     impl FakeObserver {
@@ -7564,11 +8174,32 @@ mod tests {
                 metadata: RefCell::new(ObservationMetadata::default()),
                 vision_context: RefCell::new(None),
                 page_texts: RefCell::new(VecDeque::new()),
+                presses: RefCell::new(VecDeque::new()),
+                pressed_element_ids: Rc::new(RefCell::new(Vec::new())),
+                set_values: RefCell::new(VecDeque::new()),
+                set_value_texts: Rc::new(RefCell::new(Vec::new())),
+                menu_results: RefCell::new(VecDeque::new()),
+                menu_paths: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
         fn with_refreshes(mut self, refreshes: Vec<Option<Element>>) -> Self {
             self.refreshes = RefCell::new(refreshes.into());
+            self
+        }
+
+        fn with_presses(self, presses: Vec<Result<bool, String>>) -> Self {
+            *self.presses.borrow_mut() = presses.into();
+            self
+        }
+
+        fn with_set_values(self, set_values: Vec<Result<bool, String>>) -> Self {
+            *self.set_values.borrow_mut() = set_values.into();
+            self
+        }
+
+        fn with_menu_results(self, results: Vec<Result<MenuPressOutcome, String>>) -> Self {
+            *self.menu_results.borrow_mut() = results.into();
             self
         }
 
@@ -7619,6 +8250,24 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or_else(|| Some(el.clone()))
+        }
+
+        fn perform_press(&self, el: &Element) -> Result<bool, String> {
+            self.pressed_element_ids.borrow_mut().push(el.id);
+            self.presses.borrow_mut().pop_front().unwrap_or(Ok(false))
+        }
+
+        fn set_value(&self, _el: &Element, text: &str) -> Result<bool, String> {
+            self.set_value_texts.borrow_mut().push(text.to_string());
+            self.set_values.borrow_mut().pop_front().unwrap_or(Ok(false))
+        }
+
+        fn press_menu_path(&self, path: &[String]) -> Result<MenuPressOutcome, String> {
+            self.menu_paths.borrow_mut().push(path.to_vec());
+            self.menu_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| Err("menu actions are not supported by this observer".into()))
         }
     }
 
@@ -8113,6 +8762,7 @@ mod tests {
             click_preflight: None,
             execution_policy: ExecutionPolicy::Auto,
             executed: true,
+            mechanism: None,
             safety_gate: None,
             confirmation: None,
             verification: VerificationReport::progressed(1),
@@ -8143,6 +8793,7 @@ mod tests {
             click_preflight: None,
             execution_policy: ExecutionPolicy::Auto,
             executed: true,
+            mechanism: None,
             safety_gate: None,
             confirmation: None,
             verification,
