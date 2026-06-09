@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -65,6 +66,8 @@ export default function CustomDropdown({
   variant = "panel",
   disabled = false,
   triggerLabel,
+  placement: placementPreference = "auto",
+  onOpenChange,
 }: {
   value: string;
   options: CustomDropdownOption[];
@@ -73,6 +76,8 @@ export default function CustomDropdown({
   variant?: "panel" | "ghost";
   disabled?: boolean;
   triggerLabel?: ReactNode;
+  placement?: "auto" | "below" | "above";
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -80,7 +85,7 @@ export default function CustomDropdown({
   // Both variants flip between below/above based on available space.
   // The menu is portaled to <body> so flipping never gets clipped by an
   // ancestor's `overflow: hidden` (e.g., the chat panel's rounded rect).
-  const [placement, setPlacement] = useState<"below" | "above">("below");
+  const [resolvedPlacement, setResolvedPlacement] = useState<"below" | "above">("below");
   // Triggered position for the portaled menu. Updated on open + on
   // window resize / scroll while open so the menu stays anchored to the
   // (potentially-moved) trigger. `maxWidth` is set when the trigger lives
@@ -101,6 +106,14 @@ export default function CustomDropdown({
   const showSearch = options.length > SEARCH_THRESHOLD;
   const filteredOptions = options.filter((option) => matchesQuery(option, searchQuery));
 
+  const updateOpen = useCallback((next: boolean | ((current: boolean) => boolean)) => {
+    setOpen((current) => (typeof next === "function" ? next(current) : next));
+  }, []);
+
+  useEffect(() => {
+    onOpenChange?.(open);
+  }, [onOpenChange, open]);
+
   useEffect(() => {
     if (!open) return;
 
@@ -112,10 +125,10 @@ export default function CustomDropdown({
       // Treat clicks inside either as inside the dropdown.
       if (root && root.contains(target)) return;
       if (menu && menu.contains(target)) return;
-      setOpen(false);
+      updateOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") updateOpen(false);
     };
 
     window.addEventListener("pointerdown", onPointerDown);
@@ -124,7 +137,7 @@ export default function CustomDropdown({
       window.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [open]);
+  }, [open, updateOpen]);
 
   useEffect(() => {
     if (!open) setSearchQuery("");
@@ -148,9 +161,14 @@ export default function CustomDropdown({
       // `overflow: hidden`. This matters for the detached chat window
       // where the dropdown sits in the BOTTOM textfield area — opening
       // below would run straight off the bottom of the window.
-      const useAbove = availableAbove > availableBelow;
+      const useAbove =
+        placementPreference === "above"
+          ? true
+          : placementPreference === "below"
+            ? false
+            : availableAbove > availableBelow;
       const available = useAbove ? availableAbove : availableBelow;
-      setPlacement(useAbove ? "above" : "below");
+      setResolvedPlacement(useAbove ? "above" : "below");
       // Cap at 70% of viewport height (or the available side-room, whichever
       // is smaller). The min keeps the menu usable when the trigger sits in
       // a tight slot.
@@ -192,7 +210,7 @@ export default function CustomDropdown({
       window.removeEventListener("resize", compute);
       window.removeEventListener("scroll", compute, true);
     };
-  }, [open]);
+  }, [open, placementPreference]);
 
   return (
     <div
@@ -200,11 +218,11 @@ export default function CustomDropdown({
       className="screenie-select"
       data-open={open}
       data-variant={variant}
-      data-placement={placement}
+      data-placement={resolvedPlacement}
       onKeyDownCapture={(event) => {
         if (!open || event.key !== "Escape") return;
         event.stopPropagation();
-        setOpen(false);
+        updateOpen(false);
       }}
     >
       <button
@@ -215,11 +233,11 @@ export default function CustomDropdown({
         aria-haspopup="listbox"
         aria-expanded={open}
         disabled={disabled || options.length === 0}
-        onClick={() => setOpen((next) => !next)}
+        onClick={() => updateOpen((next) => !next)}
         onKeyDown={(event) => {
           if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
           event.preventDefault();
-          setOpen(true);
+          updateOpen(true);
         }}
       >
         <span className="screenie-select-label">
@@ -249,7 +267,7 @@ export default function CustomDropdown({
             ref={menuRef}
             className="screenie-select-menu screenie-select-menu-portal"
             data-variant={variant}
-            data-placement={placement}
+            data-placement={resolvedPlacement}
             role="listbox"
             aria-label={ariaLabel}
             style={{
@@ -259,7 +277,7 @@ export default function CustomDropdown({
               // trigger's bottom for "below", or its top for "above". For
               // "above" we convert that to a `bottom` value (viewport-anchored)
               // so the menu's bottom edge sits MENU_GAP above the trigger.
-              ...(placement === "above"
+              ...(resolvedPlacement === "above"
                 ? {
                     bottom: window.innerHeight - menuPos.top + MENU_GAP,
                     top: "auto" as const,
@@ -305,7 +323,7 @@ export default function CustomDropdown({
                       const first = filteredOptions[0];
                       if (first) {
                         onChange(first.value);
-                        setOpen(false);
+                        updateOpen(false);
                       }
                     }
                   }}
@@ -333,7 +351,7 @@ export default function CustomDropdown({
                       data-selected={option.value === value}
                       onClick={() => {
                         onChange(option.value);
-                        setOpen(false);
+                        updateOpen(false);
                       }}
                     >
                       <span className="screenie-select-option-label">

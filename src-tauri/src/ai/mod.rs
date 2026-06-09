@@ -13,7 +13,9 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AskEvent {
-    Chunk { text: String },
+    Chunk {
+        text: String,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -21,6 +23,7 @@ pub enum AskEvent {
 }
 
 pub mod anthropic;
+pub(crate) mod decision;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
@@ -228,8 +231,7 @@ pub(crate) fn drain_sse_event(buf: &mut Vec<u8>) -> Result<Option<String>, AiErr
 
     let event_bytes = buf.drain(..end + delimiter_len).collect::<Vec<u8>>();
     let event_bytes = &event_bytes[..end];
-    let event =
-        std::str::from_utf8(event_bytes).map_err(|e| AiError::Decode(e.to_string()))?;
+    let event = std::str::from_utf8(event_bytes).map_err(|e| AiError::Decode(e.to_string()))?;
     Ok(Some(event.to_string()))
 }
 
@@ -342,7 +344,9 @@ fn redact_prefix(s: &str, prefix: &str, min_tail_len: usize) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
-        if i + prefix_bytes.len() <= bytes.len() && &bytes[i..i + prefix_bytes.len()] == prefix_bytes {
+        if i + prefix_bytes.len() <= bytes.len()
+            && &bytes[i..i + prefix_bytes.len()] == prefix_bytes
+        {
             let mut j = i + prefix_bytes.len();
             while j < bytes.len() {
                 let c = bytes[j];
@@ -527,7 +531,8 @@ mod tests {
     fn sanitize_redacts_leaked_key_in_message() {
         // Defense-in-depth: a provider that ever echoes the request
         // Authorization header verbatim must not leak the tail into the toast.
-        let body = r#"{"error":{"message":"unauthorized: Bearer sk-ant-api03-AAAAAAAAAAAAAAAAAAAA"}}"#;
+        let body =
+            r#"{"error":{"message":"unauthorized: Bearer sk-ant-api03-AAAAAAAAAAAAAAAAAAAA"}}"#;
         let out = sanitize_provider_error(body, "anthropic");
         assert!(!out.contains("AAAAAAAA"));
         assert!(out.contains("***"));

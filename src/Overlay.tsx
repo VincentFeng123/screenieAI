@@ -3494,6 +3494,87 @@ function readProviderInfo(): ProviderInfo {
   return { provider: p, cloud: meta.cloud, label: meta.label, model };
 }
 
+function compactTitleSource(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 1800);
+}
+
+function cleanConversationTitle(raw: string): string | null {
+  const firstLine = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (!firstLine) return null;
+  let title = firstLine
+    .replace(/^title\s*:\s*/i, "")
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!title) return null;
+  if (title.length > 72) {
+    title = title.slice(0, 72).replace(/\s+\S*$/, "").trim();
+  }
+  return title || null;
+}
+
+async function generateConversationTitle(
+  info: ProviderInfo,
+  prompt: string,
+  response: string,
+): Promise<string | null> {
+  const userPrompt = compactTitleSource(prompt);
+  const assistantResponse = compactTitleSource(response);
+  if (!userPrompt && !assistantResponse) return null;
+
+  const channel = new Channel<AskEvent>();
+  let acc = "";
+  const usageBox: { value: { inputTokens: number; outputTokens: number } | null } = {
+    value: null,
+  };
+  channel.onmessage = (event) => {
+    if (event.type === "chunk") {
+      acc += event.text;
+    } else if (event.type === "usage") {
+      usageBox.value = usageTokensFromEvent(event);
+    }
+  };
+
+  try {
+    await invoke("ask_ai", {
+      provider: info.provider,
+      model: info.model,
+      responseProfile: "concise",
+      imageB64: "",
+      onChunk: channel,
+      messages: [
+        {
+          role: "user",
+          content: [
+            "Give this conversation a short, useful name.",
+            "Return only the name, with no quotes, no markdown, and no explanation.",
+            "Use 2 to 6 words.",
+            "",
+            `User: ${userPrompt}`,
+            `Assistant: ${assistantResponse}`,
+          ].join("\n"),
+        },
+      ],
+    });
+    const usage = usageBox.value;
+    if (usage) {
+      recordUsage({
+        provider: info.provider as ProviderId,
+        model: info.model,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+      });
+    }
+    return cleanConversationTitle(acc);
+  } catch (e) {
+    console.error("conversation title generation failed:", e);
+    return null;
+  }
+}
+
 function storedCloudModel(
   key: string,
   options: Array<{ id: string }>,
@@ -3810,12 +3891,18 @@ function ResultLayer({
       if (!historySavedRef.current && acc.trim()) {
         historySavedRef.current = true;
         const lastUser = [...history].reverse().find((m) => m.role === "user");
+        const title = await generateConversationTitle(
+          info,
+          lastUser?.content ?? "",
+          acc,
+        );
         saveHistoryEntry({
           pngB64: imageB64,
           width: sendCrop.width,
           height: sendCrop.height,
           provider: info.provider,
           model: info.model,
+          title,
           prompt: lastUser?.content ?? "",
           response: acc,
         });

@@ -5,6 +5,7 @@ export type HistoryEntry = {
   created_at_ms: number;
   provider: string;
   model: string;
+  title?: string | null;
   prompt: string;
   response: string;
   width: number;
@@ -33,6 +34,7 @@ export async function saveHistoryEntry(args: {
   height: number;
   provider: string;
   model: string;
+  title?: string | null;
   prompt: string;
   response: string;
 }): Promise<HistoryEntry | null> {
@@ -43,6 +45,7 @@ export async function saveHistoryEntry(args: {
       height: args.height,
       provider: args.provider,
       model: args.model,
+      title: args.title ?? null,
       prompt: args.prompt,
       response: args.response,
     });
@@ -60,6 +63,9 @@ export async function saveHistoryEntry(args: {
 /// Markdown noise (code fences, inline code, headings, bold/italic, links,
 /// math delimiters) is stripped first so the summary reads as plain prose.
 export function deriveHistoryTitle(entry: HistoryEntry): string {
+  const savedTitle = entry.title?.trim();
+  if (savedTitle) return savedTitle;
+
   const stripMd = (s: string) =>
     s
       .replace(/```[\s\S]*?```/g, " ")

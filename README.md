@@ -30,8 +30,10 @@ After every dev rebuild, run `./scripts/macos-resign-dev.sh` so macOS TCC keeps 
 
 | OS | Permission | Why | When prompted |
 |---|---|---|---|
-| macOS | **Screen Recording** | Capture the selected region | First capture |
-| macOS | **Accessibility** | Consume Esc while the overlay is up (keeps fullscreen Safari from also exiting) and return focus to the previously-frontmost app after capture | First overlay session (the CGEventTap install fails without it) |
+| macOS | **Screen Recording** | Capture the selected region and let agentic mode verify visible UI state before/after actions | First capture or first agentic task |
+| macOS | **Accessibility** | Inspect visible app controls for agentic mode, consume Esc while the overlay is up, and return focus to the previously-frontmost app after capture | First overlay session or first agentic task |
+| macOS | **Input control / PostEvent** | Let agentic mode post approved mouse, keyboard, and scroll actions | First agentic task |
+| macOS | **Automation** | Let agentic mode inspect Safari page controls through Apple Events when Safari is active | First Safari agentic task |
 | Windows | — | None; capture works out of the box via GDI / WinRT OCR | n/a |
 
 To re-prompt on macOS:

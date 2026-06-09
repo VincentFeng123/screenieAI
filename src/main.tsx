@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import Chat from "./Chat";
 import Overlay from "./Overlay";
+import QuickTooltip from "./QuickTooltip";
 
 const params = new URLSearchParams(window.location.search);
 const hashMode = window.location.hash.replace(/^#/, "");
@@ -43,6 +44,15 @@ if (mode === "chat") {
   document.body.style.overflow = "hidden";
 }
 
+if (mode === "tooltip") {
+  document.body.style.margin = "0";
+  document.body.style.background = "transparent";
+  document.documentElement.style.background = "transparent";
+  document.body.style.overflow = "hidden";
+  document.body.style.userSelect = "none";
+  document.body.style.color = "#fff";
+}
+
 // Overlay (and Chat) render without StrictMode because they rely on one-shot
 // side-effects (consuming the pending capture / chat seed from Rust state).
 // StrictMode's dev-only double-invocation of effects would consume the
@@ -52,6 +62,8 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <Overlay />
   ) : mode === "chat" ? (
     <Chat />
+  ) : mode === "tooltip" ? (
+    <QuickTooltip />
   ) : (
     <React.StrictMode>
       <App />

@@ -95,11 +95,7 @@ pub async fn install(on_progress: Channel<InstallStatus>) -> Result<(), InstallE
     //    a "make sure Ollama is running" shortcut too.
     let system_app = Path::new("/Applications/Ollama.app");
     let user_app = home_apps_path().map(|p| p.join("Ollama.app"));
-    let already = system_app.exists()
-        || user_app
-            .as_ref()
-            .map(|p| p.exists())
-            .unwrap_or(false);
+    let already = system_app.exists() || user_app.as_ref().map(|p| p.exists()).unwrap_or(false);
     if already {
         let _ = on_progress.send(InstallStatus::Launching);
         let _ = Command::new("/usr/bin/open").args(["-a", "Ollama"]).spawn();
@@ -146,9 +142,7 @@ pub async fn install(on_progress: Channel<InstallStatus>) -> Result<(), InstallE
         // Throttle UI updates: only emit on integer-percent changes.
         if pct > last_pct {
             last_pct = pct;
-            let _ = on_progress.send(InstallStatus::Downloading {
-                percent: pct as u8,
-            });
+            let _ = on_progress.send(InstallStatus::Downloading { percent: pct as u8 });
         }
     }
     file.flush().await?;
@@ -298,9 +292,7 @@ pub async fn install(on_progress: Channel<InstallStatus>) -> Result<(), InstallE
         };
         if pct > last_pct {
             last_pct = pct;
-            let _ = on_progress.send(InstallStatus::Downloading {
-                percent: pct as u8,
-            });
+            let _ = on_progress.send(InstallStatus::Downloading { percent: pct as u8 });
         }
     }
     file.flush().await?;
@@ -561,7 +553,9 @@ fn try_launch_ollama() {
         Ok(v) => v,
         Err(_) => return,
     };
-    let dir = std::path::PathBuf::from(local).join("Programs").join("Ollama");
+    let dir = std::path::PathBuf::from(local)
+        .join("Programs")
+        .join("Ollama");
     // The Windows installer ships `ollama app.exe` as the system-tray
     // helper which keeps the daemon running. If that's missing, fall back
     // to `ollama.exe serve` which runs the daemon in the foreground.
@@ -570,9 +564,7 @@ fn try_launch_ollama() {
     if app_path.exists() {
         let _ = std::process::Command::new(&app_path).spawn();
     } else if cli_path.exists() {
-        let _ = std::process::Command::new(&cli_path)
-            .arg("serve")
-            .spawn();
+        let _ = std::process::Command::new(&cli_path).arg("serve").spawn();
     }
 }
 
@@ -663,10 +655,7 @@ pub async fn pull_model(
                 return Err(InstallError::Other(err.to_string()));
             }
 
-            let status = v
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
 
             if status == "success" {
                 let _ = on_progress.send(PullStatus::Done);

@@ -26,6 +26,44 @@ static void (*screenieOverlayBackgroundChangedCallback)(void) = NULL;
 static id screenieOverlayMouseLocalMonitor = nil;
 static id screenieMainWindowResizeObserver = nil;
 static id screenieMainWindowLiveResizeObserver = nil;
+static NSArray<NSPasteboardItem *> *screenieAgentPasteboardItems = nil;
+static NSInteger screenieAgentPasteboardInjectedChangeCount = -1;
+static bool screenieAgentPasteboardSnapshotActive = false;
+
+bool screenie_request_screen_capture_access(void) {
+  if (@available(macOS 10.15, *)) {
+    return CGRequestScreenCaptureAccess();
+  }
+  return true;
+}
+
+bool screenie_has_screen_capture_access(void) {
+  if (@available(macOS 10.15, *)) {
+    return CGPreflightScreenCaptureAccess();
+  }
+  return true;
+}
+
+bool screenie_request_accessibility_access(void) {
+  if (AXIsProcessTrusted()) {
+    return true;
+  }
+
+  NSDictionary *options = @{
+    (__bridge id)kAXTrustedCheckOptionPrompt : @YES,
+  };
+  return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+}
+
+bool screenie_request_post_event_access(void) {
+  if (@available(macOS 10.15, *)) {
+    if (CGPreflightPostEventAccess()) {
+      return true;
+    }
+    return CGRequestPostEventAccess();
+  }
+  return true;
+}
 
 static void screenie_apply_corner_mask_to_view(NSView *view, CGFloat radius) {
   if (view == nil) {
@@ -144,6 +182,8 @@ static bool screenieOverlayCaptureDragSuppressing = false;
 static NSInteger screenieOverlayCaptureDragButton = 0;
 static NSPoint screenieOverlayCaptureDragStartPoint = {0.0, 0.0};
 static void (*screenieOverlayCaptureDragCallback)(double dx, double dy, bool ended) = NULL;
+static NSRunningApplication *screenieQuickTooltipPreviousApp = nil;
+static bool screenieQuickTooltipKeyboardMode = false;
 
 typedef struct {
   double x;
@@ -183,6 +223,25 @@ static void screenie_relay_overlay_mouse_down_event(NSEvent *event);
     return;
   }
   [super sendEvent:event];
+}
+@end
+
+@interface ScreenieQuickTooltipWindow : NSWindow
+@end
+
+@implementation ScreenieQuickTooltipWindow
+- (BOOL)canBecomeKeyWindow {
+  return YES;
+}
+- (BOOL)canBecomeMainWindow {
+  return NO;
+}
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+  (void)event;
+  return YES;
+}
+- (BOOL)_isNonactivatingPanel {
+  return !screenieQuickTooltipKeyboardMode;
 }
 @end
 
@@ -240,14 +299,19 @@ static void screenie_enable_first_mouse_for_view(NSView *view) {
   }
 }
 
-static void screenie_overlay_sync_prevents_activation(NSWindow *window) {
+static void screenie_window_set_prevents_activation(NSWindow *window,
+                                                    BOOL preventsActivation) {
   if (window == nil) {
     return;
   }
   SEL sel = NSSelectorFromString(@"_setPreventsActivation:");
   if ([window respondsToSelector:sel]) {
-    ((void (*)(id, SEL, BOOL))objc_msgSend)(window, sel, YES);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(window, sel, preventsActivation);
   }
+}
+
+static void screenie_overlay_sync_prevents_activation(NSWindow *window) {
+  screenie_window_set_prevents_activation(window, YES);
 }
 
 static uint64_t screenie_hash_mix(uint64_t hash, uint64_t value) {
@@ -810,6 +874,104 @@ static bool screenie_can_post_mouse_events(void) {
     }
   }
   return true;
+}
+
+bool screenie_agent_prepare_clipboard_text(const char *utf8_text) {
+  if (utf8_text == NULL) {
+    return false;
+  }
+
+  @try {
+    @autoreleasepool {
+      NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+      NSArray<NSPasteboardItem *> *existingItems =
+          [[pasteboard pasteboardItems] copy];
+      NSMutableArray<NSPasteboardItem *> *itemCopies =
+          [NSMutableArray arrayWithCapacity:[existingItems count]];
+
+      for (NSPasteboardItem *item in existingItems) {
+        NSPasteboardItem *itemCopy = [[NSPasteboardItem alloc] init];
+        for (NSPasteboardType type in [item types]) {
+          NSData *data = [item dataForType:type];
+          if (data != nil) {
+            [itemCopy setData:data forType:type];
+            continue;
+          }
+          NSString *string = [item stringForType:type];
+          if (string != nil) {
+            [itemCopy setString:string forType:type];
+            continue;
+          }
+          id plist = [item propertyListForType:type];
+          if (plist != nil) {
+            [itemCopy setPropertyList:plist forType:type];
+          }
+        }
+        [itemCopies addObject:itemCopy];
+        [itemCopy release];
+      }
+      [existingItems release];
+
+      [screenieAgentPasteboardItems release];
+      screenieAgentPasteboardItems = [itemCopies copy];
+      screenieAgentPasteboardSnapshotActive = true;
+
+      NSString *text = [[NSString alloc] initWithUTF8String:utf8_text];
+      if (text == nil) {
+        return false;
+      }
+
+      [pasteboard clearContents];
+      BOOL ok = [pasteboard setString:text forType:NSPasteboardTypeString];
+      [text release];
+      screenieAgentPasteboardInjectedChangeCount = [pasteboard changeCount];
+      return ok;
+    }
+  } @catch (NSException *exception) {
+    NSLog(@"[screenie] agent clipboard prepare exception: %@ %@",
+          [exception name],
+          [exception reason]);
+    return false;
+  }
+}
+
+bool screenie_agent_restore_clipboard_after_paste(void) {
+  if (!screenieAgentPasteboardSnapshotActive) {
+    return true;
+  }
+
+  @try {
+    @autoreleasepool {
+      NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+      if ([pasteboard changeCount] != screenieAgentPasteboardInjectedChangeCount) {
+        [screenieAgentPasteboardItems release];
+        screenieAgentPasteboardItems = nil;
+        screenieAgentPasteboardSnapshotActive = false;
+        screenieAgentPasteboardInjectedChangeCount = -1;
+        return false;
+      }
+
+      [pasteboard clearContents];
+      BOOL ok = true;
+      if ([screenieAgentPasteboardItems count] > 0) {
+        ok = [pasteboard writeObjects:screenieAgentPasteboardItems];
+      }
+      [screenieAgentPasteboardItems release];
+      screenieAgentPasteboardItems = nil;
+      screenieAgentPasteboardSnapshotActive = false;
+      screenieAgentPasteboardInjectedChangeCount = -1;
+      return ok;
+    }
+  } @catch (NSException *exception) {
+    NSLog(@"[screenie] agent clipboard restore exception: %@ %@",
+          [exception name],
+          [exception reason]);
+    [screenieAgentPasteboardItems release];
+    screenieAgentPasteboardItems = nil;
+    screenieAgentPasteboardSnapshotActive = false;
+    screenieAgentPasteboardInjectedChangeCount = -1;
+    return false;
+  }
 }
 
 static bool screenie_post_mouse_click(CGPoint point, CGMouseButton button) {
@@ -2022,6 +2184,167 @@ bool screenie_configure_overlay_window(void *window_ptr) {
   }
 }
 
+bool screenie_configure_quick_tooltip_window(void *window_ptr) {
+  @try {
+    if (window_ptr == NULL) {
+      NSLog(@"[screenie] configure quick tooltip: null NSWindow");
+      return false;
+    }
+
+    NSWindow *window = (NSWindow *)window_ptr;
+
+    if (![window isKindOfClass:[ScreenieQuickTooltipWindow class]]) {
+      object_setClass(window, [ScreenieQuickTooltipWindow class]);
+    }
+    screenie_enable_first_mouse_for_view([window contentView]);
+
+    NSWindowStyleMask mask = [window styleMask];
+    mask |= NSWindowStyleMaskNonactivatingPanel;
+    mask |= NSWindowStyleMaskFullSizeContentView;
+    [window setStyleMask:mask];
+    screenie_overlay_sync_prevents_activation(window);
+
+    [window setLevel:NSStatusWindowLevel];
+    [window setHidesOnDeactivate:NO];
+    [window setReleasedWhenClosed:NO];
+    [window setAcceptsMouseMovedEvents:YES];
+    [window setOpaque:NO];
+    [window setBackgroundColor:[NSColor clearColor]];
+
+    NSWindowCollectionBehavior behavior = [window collectionBehavior];
+    behavior &= ~NSWindowCollectionBehaviorStationary;
+    behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces;
+    behavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
+    behavior |= NSWindowCollectionBehaviorIgnoresCycle;
+    behavior |= NSWindowCollectionBehaviorTransient;
+    [window setCollectionBehavior:behavior];
+
+    return true;
+  } @catch (NSException *exception) {
+    NSLog(@"[screenie] configure quick tooltip exception: %@ %@",
+          [exception name], [exception reason]);
+    return false;
+  }
+}
+
+static void screenie_remember_quick_tooltip_previous_app(void) {
+  @autoreleasepool {
+    @try {
+      [screenieQuickTooltipPreviousApp release];
+      screenieQuickTooltipPreviousApp = nil;
+
+      NSRunningApplication *app =
+          [[NSWorkspace sharedWorkspace] frontmostApplication];
+      if (app == nil) return;
+      if ([app processIdentifier] == getpid()) return;
+      screenieQuickTooltipPreviousApp = [app retain];
+    } @catch (NSException *exception) {
+      NSLog(@"[screenie] remember quick tooltip previous app exception: %@ %@",
+            [exception name], [exception reason]);
+    }
+  }
+}
+
+static void screenie_reactivate_quick_tooltip_previous_app(void) {
+  @autoreleasepool {
+    @try {
+      NSRunningApplication *app = screenieQuickTooltipPreviousApp;
+      screenieQuickTooltipPreviousApp = nil;
+      if (app == nil) return;
+      pid_t targetPid = [app processIdentifier];
+      if (![app isTerminated]) {
+        [app activateWithOptions:NSApplicationActivateAllWindows];
+
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.35];
+        while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+          NSRunningApplication *frontmost =
+              [[NSWorkspace sharedWorkspace] frontmostApplication];
+          if (frontmost != nil &&
+              [frontmost processIdentifier] == targetPid) {
+            break;
+          }
+          [[NSRunLoop currentRunLoop]
+              runMode:NSDefaultRunLoopMode
+           beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        }
+      }
+      [app release];
+    } @catch (NSException *exception) {
+      NSLog(@"[screenie] reactivate quick tooltip previous app exception: %@ %@",
+            [exception name], [exception reason]);
+    }
+  }
+}
+
+static void screenie_clear_quick_tooltip_previous_app(void) {
+  @autoreleasepool {
+    @try {
+      [screenieQuickTooltipPreviousApp release];
+      screenieQuickTooltipPreviousApp = nil;
+    } @catch (NSException *exception) {
+      NSLog(@"[screenie] clear quick tooltip previous app exception: %@ %@",
+            [exception name], [exception reason]);
+    }
+  }
+}
+
+bool screenie_set_quick_tooltip_keyboard_mode(
+    void *window_ptr,
+    bool enabled,
+    bool restore_previous_app) {
+  @autoreleasepool {
+  @try {
+    if (window_ptr == NULL) {
+      NSLog(@"[screenie] quick tooltip keyboard mode: null NSWindow");
+      return false;
+    }
+
+    NSWindow *window = (NSWindow *)window_ptr;
+    if (![window isKindOfClass:[ScreenieQuickTooltipWindow class]]) {
+      object_setClass(window, [ScreenieQuickTooltipWindow class]);
+    }
+    screenie_enable_first_mouse_for_view([window contentView]);
+    [window setLevel:NSStatusWindowLevel];
+    [window setHidesOnDeactivate:NO];
+    [window setReleasedWhenClosed:NO];
+    [window setAcceptsMouseMovedEvents:YES];
+    [window setOpaque:NO];
+    [window setBackgroundColor:[NSColor clearColor]];
+
+    NSWindowStyleMask mask = [window styleMask];
+    mask |= NSWindowStyleMaskFullSizeContentView;
+
+    if (enabled) {
+      screenie_remember_quick_tooltip_previous_app();
+      screenieQuickTooltipKeyboardMode = true;
+      mask &= ~NSWindowStyleMaskNonactivatingPanel;
+      [window setStyleMask:mask];
+      screenie_window_set_prevents_activation(window, NO);
+      [[NSRunningApplication currentApplication] activateWithOptions:0];
+      [window makeKeyAndOrderFront:nil];
+      [window orderFrontRegardless];
+    } else {
+      screenieQuickTooltipKeyboardMode = false;
+      mask |= NSWindowStyleMaskNonactivatingPanel;
+      [window setStyleMask:mask];
+      screenie_overlay_sync_prevents_activation(window);
+      [window orderFrontRegardless];
+      if (restore_previous_app) {
+        screenie_reactivate_quick_tooltip_previous_app();
+      } else {
+        screenie_clear_quick_tooltip_previous_app();
+      }
+    }
+
+    return true;
+  } @catch (NSException *exception) {
+    NSLog(@"[screenie] quick tooltip keyboard mode exception: %@ %@",
+          [exception name], [exception reason]);
+    return false;
+  }
+  } // @autoreleasepool
+}
+
 /// Local OCR via Apple's Vision framework. Takes raw PNG bytes, runs
 /// `VNRecognizeTextRequest` synchronously on the calling thread, and
 /// returns the recognized text as a UTF-8 C string allocated with
@@ -2502,11 +2825,14 @@ typedef struct {
 } ScreenieOverlayVibrancyRegion;
 
 static NSMutableArray<NSVisualEffectView *> *screenieOverlayVibrancyViews = nil;
+static NSMutableArray<NSVisualEffectView *> *screenieQuickTooltipVibrancyViews = nil;
 
-bool screenie_set_overlay_vibrancy_regions(
+static bool screenie_set_vibrancy_regions(
     void *window_ptr,
     const ScreenieOverlayVibrancyRegion *regions,
-    size_t count) {
+    size_t count,
+    NSMutableArray<NSVisualEffectView *> **viewsRef,
+    NSString *logLabel) {
   @autoreleasepool {
   @try {
     if (window_ptr == NULL) {
@@ -2517,7 +2843,7 @@ bool screenie_set_overlay_vibrancy_regions(
     if (contentView == nil) {
       return false;
     }
-    if (screenieOverlayVibrancyViews == nil) {
+    if (*viewsRef == nil) {
       // MRC: `[NSMutableArray array]` is autoreleased and would be freed
       // at the next runloop iteration, leaving the static pointer
       // dangling — a future call would crash or, worse, send a setFrame:
@@ -2525,14 +2851,15 @@ bool screenie_set_overlay_vibrancy_regions(
       // `_CFPasteboardEntry setFrame:` exception with `array` here).
       // `[[NSMutableArray alloc] init]` keeps the +1 retain forever,
       // which is what we want for an app-lifetime singleton.
-      screenieOverlayVibrancyViews = [[NSMutableArray alloc] init];
+      *viewsRef = [[NSMutableArray alloc] init];
     }
+    NSMutableArray<NSVisualEffectView *> *views = *viewsRef;
 
     // Pool: ensure exactly `count` views exist. NSVisualEffectViews
     // added directly to contentView (no wrapper layer between them
     // and the host window — `wantsLayer = YES` on a wrapper breaks
     // the system's `behindWindow` vibrancy composition).
-    while (screenieOverlayVibrancyViews.count < count) {
+    while (views.count < count) {
       NSVisualEffectView *v =
           [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
       // Real vibrancy materials (the ones that actually blur the
@@ -2560,15 +2887,15 @@ bool screenie_set_overlay_vibrancy_regions(
       // bottom of the contentView's subview stack — behind the
       // WKWebView Tauri added earlier. WebView stays on top.
       [contentView addSubview:v positioned:NSWindowBelow relativeTo:nil];
-      [screenieOverlayVibrancyViews addObject:v];
+      [views addObject:v];
       // MRC: balance the +1 from `alloc`. Array + contentView each
       // retain.
       [v release];
     }
-    while (screenieOverlayVibrancyViews.count > count) {
-      NSView *v = [screenieOverlayVibrancyViews lastObject];
+    while (views.count > count) {
+      NSView *v = [views lastObject];
       [v removeFromSuperview];
-      [screenieOverlayVibrancyViews removeLastObject];
+      [views removeLastObject];
     }
 
     // Update geometry. JS rects use top-left origin in CSS pixels; the
@@ -2579,7 +2906,7 @@ bool screenie_set_overlay_vibrancy_regions(
 
     for (size_t i = 0; i < count; i++) {
       ScreenieOverlayVibrancyRegion r = regions[i];
-      NSView *v = screenieOverlayVibrancyViews[i];
+      NSView *v = views[i];
       if (!isfinite(r.x) || !isfinite(r.y) || !isfinite(r.w) ||
           !isfinite(r.h) || r.w <= 0.0 || r.h <= 0.0) {
         // Park off-screen instead of removing from the pool, so we
@@ -2598,24 +2925,63 @@ bool screenie_set_overlay_vibrancy_regions(
     }
     return true;
   } @catch (NSException *exception) {
-    NSLog(@"[screenie] set vibrancy regions exception: %@ %@",
-          [exception name], [exception reason]);
+    NSLog(@"[screenie] %@ exception: %@ %@",
+          logLabel, [exception name], [exception reason]);
     return false;
   }
   } // @autoreleasepool
 }
 
-void screenie_clear_overlay_vibrancy_regions(void) {
+static void screenie_clear_vibrancy_regions(
+    NSMutableArray<NSVisualEffectView *> **viewsRef,
+    NSString *logLabel) {
   @autoreleasepool {
   @try {
-    if (screenieOverlayVibrancyViews == nil) return;
-    for (NSVisualEffectView *v in screenieOverlayVibrancyViews) {
+    if (*viewsRef == nil) return;
+    NSMutableArray<NSVisualEffectView *> *views = *viewsRef;
+    for (NSVisualEffectView *v in views) {
       [v removeFromSuperview];
     }
-    [screenieOverlayVibrancyViews removeAllObjects];
+    [views removeAllObjects];
   } @catch (NSException *exception) {
-    NSLog(@"[screenie] clear vibrancy exception: %@ %@",
-          [exception name], [exception reason]);
+    NSLog(@"[screenie] %@ exception: %@ %@",
+          logLabel, [exception name], [exception reason]);
   }
   } // @autoreleasepool
+}
+
+bool screenie_set_overlay_vibrancy_regions(
+    void *window_ptr,
+    const ScreenieOverlayVibrancyRegion *regions,
+    size_t count) {
+  return screenie_set_vibrancy_regions(
+      window_ptr,
+      regions,
+      count,
+      &screenieOverlayVibrancyViews,
+      @"set overlay vibrancy regions");
+}
+
+void screenie_clear_overlay_vibrancy_regions(void) {
+  screenie_clear_vibrancy_regions(
+      &screenieOverlayVibrancyViews,
+      @"clear overlay vibrancy regions");
+}
+
+bool screenie_set_quick_tooltip_vibrancy_regions(
+    void *window_ptr,
+    const ScreenieOverlayVibrancyRegion *regions,
+    size_t count) {
+  return screenie_set_vibrancy_regions(
+      window_ptr,
+      regions,
+      count,
+      &screenieQuickTooltipVibrancyViews,
+      @"set quick tooltip vibrancy regions");
+}
+
+void screenie_clear_quick_tooltip_vibrancy_regions(void) {
+  screenie_clear_vibrancy_regions(
+      &screenieQuickTooltipVibrancyViews,
+      @"clear quick tooltip vibrancy regions");
 }

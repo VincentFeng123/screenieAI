@@ -26,8 +26,8 @@ fn main() {
         // from the Mach-O section, which matches what bundled .app installs
         // expose, so the dev binary and the bundled release behave the same.
         println!("cargo:rerun-if-changed=Info.plist");
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR is always set by cargo");
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set by cargo");
         let plist_path = format!("{manifest_dir}/Info.plist");
         if std::path::Path::new(&plist_path).exists() {
             println!("cargo:rustc-link-arg=-Wl,-sectcreate,__TEXT,__info_plist,{plist_path}");

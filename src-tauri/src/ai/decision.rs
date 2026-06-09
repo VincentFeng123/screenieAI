@@ -1,0 +1,1184 @@
+use super::AiError;
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+const OLLAMA_API_URL: &str = "http://localhost:11434/api/chat";
+const MAX_DECISION_TOKENS: u32 = 512;
+const GEMINI_MIN_THINKING_BUDGET: i32 = 128;
+const DECISION_REQUEST_MAX_ATTEMPTS: u8 = 3;
+const DECISION_RETRY_BASE_DELAY_MS: u64 = 350;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DecisionPrompt {
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub schema: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecisionClientConfig {
+    pub provider: String,
+    pub model: String,
+    pub api_key: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DecisionClient {
+    config: DecisionClientConfig,
+}
+
+impl DecisionClient {
+    pub(crate) fn new(config: DecisionClientConfig) -> Self {
+        Self { config }
+    }
+
+    pub(crate) async fn complete(&self, prompt: DecisionPrompt) -> Result<String, AiError> {
+        match self.config.provider.as_str() {
+            "anthropic" => {
+                if self.config.api_key.is_empty() {
+                    return Err(AiError::NoKey);
+                }
+                complete_anthropic(&self.config, &prompt).await
+            }
+            "openai" => {
+                if self.config.api_key.is_empty() {
+                    return Err(AiError::NoKey);
+                }
+                complete_openai(&self.config, &prompt).await
+            }
+            "gemini" => {
+                if self.config.api_key.is_empty() {
+                    return Err(AiError::NoKey);
+                }
+                complete_gemini(&self.config, &prompt).await
+            }
+            "ollama" => complete_ollama(&self.config, &prompt).await,
+            other => Err(AiError::InvalidProvider(other.to_string())),
+        }
+    }
+
+    pub(crate) async fn complete_vision(
+        &self,
+        prompt: DecisionPrompt,
+        image_png_b64: &str,
+    ) -> Result<String, AiError> {
+        match self.config.provider.as_str() {
+            "anthropic" => {
+                if self.config.api_key.is_empty() {
+                    return Err(AiError::NoKey);
+                }
+                complete_anthropic_vision(&self.config, &prompt, image_png_b64).await
+            }
+            "openai" => {
+                if self.config.api_key.is_empty() {
+                    return Err(AiError::NoKey);
+                }
+                complete_openai_vision(&self.config, &prompt, image_png_b64).await
+            }
+            "gemini" => {
+                if self.config.api_key.is_empty() {
+                    return Err(AiError::NoKey);
+                }
+                complete_gemini_vision(&self.config, &prompt, image_png_b64).await
+            }
+            "ollama" => complete_ollama_vision(&self.config, &prompt, image_png_b64).await,
+            other => Err(AiError::InvalidProvider(other.to_string())),
+        }
+    }
+}
+
+async fn complete_anthropic(
+    config: &DecisionClientConfig,
+    prompt: &DecisionPrompt,
+) -> Result<String, AiError> {
+    let body = anthropic_decision_body(prompt, &config.model);
+    let client = super::cloud_client()?;
+    let request = client
+        .post(ANTHROPIC_API_URL)
+        .header("x-api-key", &config.api_key)
+        .header("anthropic-version", ANTHROPIC_API_VERSION)
+        .header("content-type", "application/json")
+        .json(&body);
+    let value = post_json(request, "anthropic").await?;
+
+    extract_anthropic_text(&value).ok_or_else(|| AiError::EmptyResponse {
+        provider: "anthropic".into(),
+    })
+}
+
+async fn complete_openai(
+    config: &DecisionClientConfig,
+    prompt: &DecisionPrompt,
+) -> Result<String, AiError> {
+    let body = openai_decision_body(prompt, &config.model);
+    let client = super::cloud_client()?;
+    let request = client
+        .post(OPENAI_API_URL)
+        .bearer_auth(&config.api_key)
+        .header("content-type", "application/json")
+        .json(&body);
+    let value = post_json(request, "openai").await?;
+
+    extract_openai_text(&value).ok_or_else(|| AiError::EmptyResponse {
+        provider: "openai".into(),
+    })
+}
+
+async fn complete_gemini(
+    config: &DecisionClientConfig,
+    prompt: &DecisionPrompt,
+) -> Result<String, AiError> {
+    validate_gemini_model_id(&config.model)?;
+    let body = gemini_decision_body(prompt, &config.model);
+    let url = format!("{GEMINI_API_BASE}/{}:generateContent", config.model);
+    let client = super::cloud_client()?;
+    let request = client
+        .post(url)
+        .header("x-goog-api-key", &config.api_key)
+        .header("content-type", "application/json")
+        .json(&body);
+    let value = post_json(request, "gemini").await?;
+
+    extract_gemini_text(&value).ok_or_else(|| AiError::EmptyResponse {
+        provider: "gemini".into(),
+    })
+}
+
+async fn complete_ollama(
+    config: &DecisionClientConfig,
+    prompt: &DecisionPrompt,
+) -> Result<String, AiError> {
+    let body = ollama_decision_body(prompt, &config.model);
+    let client = super::local_client()?;
+    let request = client
+        .post(OLLAMA_API_URL)
+        .header("content-type", "application/json")
+        .json(&body);
+    let value = post_json(request, "ollama").await?;
+
+    extract_ollama_text(&value).ok_or_else(|| AiError::EmptyResponse {
+        provider: "ollama".into(),
+    })
+}
+
+async fn complete_anthropic_vision(
+    config: &DecisionClientConfig,
+    prompt: &DecisionPrompt,
+    image_png_b64: &str,
+) -> Result<String, AiError> {
+    let body = anthropic_vision_decision_body(prompt, &config.model, image_png_b64);
+    let client = super::cloud_client()?;
+    let request = client
+        .post(ANTHROPIC_API_URL)
+        .header("x-api-key", &config.api_key)
+        .header("anthropic-version", ANTHROPIC_API_VERSION)
+        .header("content-type", "application/json")
+        .json(&body);
+    let value = post_json(request, "anthropic").await?;
+
+    extract_anthropic_text(&value).ok_or_else(|| AiError::EmptyResponse {
+        provider: "anthropic".into(),
+    })
+}
+
+async fn complete_openai_vision(
+    config: &DecisionClientConfig,
+    prompt: &DecisionPrompt,
+    image_png_b64: &str,
+) -> Result<String, AiError> {
+    let body = openai_vision_decision_body(prompt, &config.model, image_png_b64);
+    let client = super::cloud_client()?;
+    let request = client
+        .post(OPENAI_API_URL)
+        .bearer_auth(&config.api_key)
+        .header("content-type", "application/json")
+        .json(&body);
+    let value = post_json(request, "openai").await?;
+
+    extract_openai_text(&value).ok_or_else(|| AiError::EmptyResponse {
+        provider: "openai".into(),
+    })
+}
+
+async fn complete_gemini_vision(
+    config: &DecisionClientConfig,
+    prompt: &DecisionPrompt,
+    image_png_b64: &str,
+) -> Result<String, AiError> {
+    validate_gemini_model_id(&config.model)?;
+    let body = gemini_vision_decision_body(prompt, &config.model, image_png_b64);
+    let url = format!("{GEMINI_API_BASE}/{}:generateContent", config.model);
+    let client = super::cloud_client()?;
+    let request = client
+        .post(url)
+        .header("x-goog-api-key", &config.api_key)
+        .header("content-type", "application/json")
+        .json(&body);
+    let value = post_json(request, "gemini").await?;
+
+    extract_gemini_text(&value).ok_or_else(|| AiError::EmptyResponse {
+        provider: "gemini".into(),
+    })
+}
+
+async fn complete_ollama_vision(
+    config: &DecisionClientConfig,
+    prompt: &DecisionPrompt,
+    image_png_b64: &str,
+) -> Result<String, AiError> {
+    let body = ollama_vision_decision_body(prompt, &config.model, image_png_b64);
+    let client = super::local_client()?;
+    let request = client
+        .post(OLLAMA_API_URL)
+        .header("content-type", "application/json")
+        .json(&body);
+    let value = post_json(request, "ollama").await?;
+
+    extract_ollama_text(&value).ok_or_else(|| AiError::EmptyResponse {
+        provider: "ollama".into(),
+    })
+}
+
+async fn post_json(
+    request: reqwest::RequestBuilder,
+    provider: &'static str,
+) -> Result<Value, AiError> {
+    let mut request = request;
+    for attempt in 1..=DECISION_REQUEST_MAX_ATTEMPTS {
+        let retry_request = request.try_clone();
+        let result = post_json_once(request, provider).await;
+        let should_retry = retry_request.is_some()
+            && attempt < DECISION_REQUEST_MAX_ATTEMPTS
+            && decision_error_is_retryable(result.as_ref().err());
+
+        if should_retry {
+            eprintln!(
+                "[screenie] {provider} planner request failed on attempt {attempt}; retrying"
+            );
+            tokio::time::sleep(Duration::from_millis(
+                DECISION_RETRY_BASE_DELAY_MS * u64::from(attempt),
+            ))
+            .await;
+            request = retry_request.expect("retry request checked above");
+            continue;
+        }
+
+        return result;
+    }
+
+    unreachable!("decision request retry loop always returns")
+}
+
+async fn post_json_once(
+    request: reqwest::RequestBuilder,
+    provider: &'static str,
+) -> Result<Value, AiError> {
+    let resp = request.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(AiError::Api {
+            status: status.as_u16(),
+            body: super::sanitize_provider_error(&text, provider),
+        });
+    }
+
+    serde_json::from_str::<Value>(&text).map_err(|err| AiError::Decode(err.to_string()))
+}
+
+fn decision_error_is_retryable(err: Option<&AiError>) -> bool {
+    match err {
+        Some(AiError::Api { status, .. }) => *status == 429 || *status >= 500,
+        Some(AiError::Http(_)) => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn anthropic_decision_body(prompt: &DecisionPrompt, model: &str) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": MAX_DECISION_TOKENS,
+        "stream": false,
+        "temperature": 0,
+        "system": prompt.system_prompt,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt.user_prompt
+            }
+        ],
+        "output_config": {
+            "type": "json_schema",
+            "schema": prompt.schema
+        }
+    })
+}
+
+pub(crate) fn anthropic_vision_decision_body(
+    prompt: &DecisionPrompt,
+    model: &str,
+    image_png_b64: &str,
+) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": MAX_DECISION_TOKENS,
+        "stream": false,
+        "temperature": 0,
+        "system": prompt.system_prompt,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_png_b64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt.user_prompt
+                    }
+                ]
+            }
+        ],
+        "output_config": {
+            "type": "json_schema",
+            "schema": prompt.schema
+        }
+    })
+}
+
+pub(crate) fn openai_decision_body(prompt: &DecisionPrompt, model: &str) -> Value {
+    let reasoning = is_reasoning_model(model);
+    let messages = if reasoning {
+        json!([
+            {
+                "role": "user",
+                "content": format!("{}\n\n{}", prompt.system_prompt, prompt.user_prompt)
+            }
+        ])
+    } else {
+        json!([
+            {
+                "role": "system",
+                "content": prompt.system_prompt
+            },
+            {
+                "role": "user",
+                "content": prompt.user_prompt
+            }
+        ])
+    };
+
+    let mut body = Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("stream".into(), json!(false));
+    body.insert("messages".into(), messages);
+    body.insert(
+        "response_format".into(),
+        json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "computer_action",
+                "strict": true,
+                "schema": openai_schema_for_prompt(prompt)
+            }
+        }),
+    );
+
+    if reasoning {
+        body.insert("max_completion_tokens".into(), json!(MAX_DECISION_TOKENS));
+    } else {
+        body.insert("temperature".into(), json!(0));
+        body.insert("max_tokens".into(), json!(MAX_DECISION_TOKENS));
+    }
+
+    Value::Object(body)
+}
+
+pub(crate) fn openai_vision_decision_body(
+    prompt: &DecisionPrompt,
+    model: &str,
+    image_png_b64: &str,
+) -> Value {
+    let reasoning = is_reasoning_model(model);
+    let text = if reasoning {
+        format!("{}\n\n{}", prompt.system_prompt, prompt.user_prompt)
+    } else {
+        prompt.user_prompt.clone()
+    };
+    let user_content = json!([
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:image/png;base64,{}", image_png_b64)
+            }
+        },
+        {
+            "type": "text",
+            "text": text
+        }
+    ]);
+    let messages = if reasoning {
+        json!([
+            {
+                "role": "user",
+                "content": user_content
+            }
+        ])
+    } else {
+        json!([
+            {
+                "role": "system",
+                "content": prompt.system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_content
+            }
+        ])
+    };
+
+    let mut body = Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("stream".into(), json!(false));
+    body.insert("messages".into(), messages);
+    body.insert(
+        "response_format".into(),
+        json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "computer_action",
+                "strict": true,
+                "schema": openai_schema_for_prompt(prompt)
+            }
+        }),
+    );
+
+    if reasoning {
+        body.insert("max_completion_tokens".into(), json!(MAX_DECISION_TOKENS));
+    } else {
+        body.insert("temperature".into(), json!(0));
+        body.insert("max_tokens".into(), json!(MAX_DECISION_TOKENS));
+    }
+
+    Value::Object(body)
+}
+
+fn openai_schema_for_prompt(prompt: &DecisionPrompt) -> Value {
+    if prompt_uses_vision_control_schema(prompt) {
+        openai_strict_vision_control_schema()
+    } else if prompt
+        .schema
+        .get("properties")
+        .and_then(|properties| properties.get("milestones"))
+        .is_some()
+    {
+        openai_strict_milestones_schema()
+    } else if prompt
+        .schema
+        .get("properties")
+        .and_then(|properties| properties.get("x"))
+        .is_some()
+    {
+        openai_strict_coordinate_schema()
+    } else {
+        openai_strict_decision_schema()
+    }
+}
+
+fn prompt_uses_vision_control_schema(prompt: &DecisionPrompt) -> bool {
+    let Some(properties) = prompt.schema.get("properties") else {
+        return false;
+    };
+    properties.get("observation").is_some()
+        && properties
+            .get("action")
+            .and_then(|action| action.get("type"))
+            .and_then(Value::as_str)
+            == Some("object")
+}
+
+pub(crate) fn openai_strict_decision_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "reason",
+            "action",
+            "app",
+            "id",
+            "text",
+            "combo",
+            "dx",
+            "dy",
+            "ms",
+            "url",
+            "query",
+            "reason_detail",
+            "note",
+            "expect",
+            "milestone_done"
+        ],
+        "properties": {
+            "reason": { "type": "string" },
+            "action": {
+                "type": "string",
+                "enum": ["activateApp", "click", "doubleClick", "type", "key", "scroll", "wait", "openUrl", "webSearch", "readPage", "done", "fail"]
+            },
+            "app": { "type": ["string", "null"] },
+            "id": { "type": ["integer", "null"], "minimum": 0 },
+            "text": { "type": ["string", "null"] },
+            "combo": { "type": ["string", "null"] },
+            "dx": { "type": ["integer", "null"] },
+            "dy": { "type": ["integer", "null"] },
+            "ms": { "type": ["integer", "null"], "minimum": 0 },
+            "url": { "type": ["string", "null"] },
+            "query": { "type": ["string", "null"] },
+            "reason_detail": { "type": ["string", "null"] },
+            "note": { "type": ["string", "null"] },
+            "expect": { "type": ["string", "null"] },
+            "milestone_done": { "type": ["boolean", "null"] }
+        }
+    })
+}
+
+pub(crate) fn openai_strict_milestones_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["milestones"],
+        "properties": {
+            "milestones": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        }
+    })
+}
+
+pub(crate) fn openai_strict_coordinate_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "reason",
+            "action",
+            "x",
+            "y",
+            "ms",
+            "reason_detail"
+        ],
+        "properties": {
+            "reason": { "type": "string" },
+            "action": {
+                "type": "string",
+                "enum": ["click", "doubleClick", "wait", "done", "fail"]
+            },
+            "x": { "type": ["integer", "null"], "minimum": 0 },
+            "y": { "type": ["integer", "null"], "minimum": 0 },
+            "ms": { "type": ["integer", "null"], "minimum": 0 },
+            "reason_detail": { "type": ["string", "null"] }
+        }
+    })
+}
+
+pub(crate) fn openai_strict_vision_control_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["observation", "target", "reasoning", "action"],
+        "properties": {
+            "observation": { "type": "string" },
+            "target": { "type": "string" },
+            "reasoning": { "type": "string" },
+            "action": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "type",
+                    "x",
+                    "y",
+                    "from",
+                    "to",
+                    "text",
+                    "keys",
+                    "dx",
+                    "dy",
+                    "ms",
+                    "result",
+                    "reason"
+                ],
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": [
+                            "click",
+                            "double_click",
+                            "right_click",
+                            "move",
+                            "drag",
+                            "type",
+                            "key",
+                            "scroll",
+                            "wait",
+                            "done",
+                            "fail"
+                        ]
+                    },
+                    "x": { "type": ["integer", "null"], "minimum": 0 },
+                    "y": { "type": ["integer", "null"], "minimum": 0 },
+                    "from": {
+                        "type": ["array", "null"],
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": { "type": "integer", "minimum": 0 }
+                    },
+                    "to": {
+                        "type": ["array", "null"],
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": { "type": "integer", "minimum": 0 }
+                    },
+                    "text": { "type": ["string", "null"] },
+                    "keys": { "type": ["string", "null"] },
+                    "dx": { "type": ["integer", "null"] },
+                    "dy": { "type": ["integer", "null"] },
+                    "ms": { "type": ["integer", "null"], "minimum": 0 },
+                    "result": { "type": ["string", "null"] },
+                    "reason": { "type": ["string", "null"] }
+                }
+            }
+        }
+    })
+}
+
+pub(crate) fn gemini_decision_body(prompt: &DecisionPrompt, model: &str) -> Value {
+    let response_schema = gemini_schema_for_prompt(prompt);
+    let generation_config = gemini_generation_config(response_schema);
+    let generation_config = with_gemini_thinking_config(generation_config, model);
+
+    json!({
+        "systemInstruction": {
+            "parts": [
+                { "text": prompt.system_prompt }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    { "text": prompt.user_prompt }
+                ]
+            }
+        ],
+        "generationConfig": generation_config
+    })
+}
+
+pub(crate) fn gemini_vision_decision_body(
+    prompt: &DecisionPrompt,
+    model: &str,
+    image_png_b64: &str,
+) -> Value {
+    let response_schema = gemini_schema_for_prompt(prompt);
+    let generation_config = gemini_generation_config(response_schema);
+    let generation_config = with_gemini_thinking_config(generation_config, model);
+
+    json!({
+        "systemInstruction": {
+            "parts": [
+                { "text": prompt.system_prompt }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": image_png_b64
+                        }
+                    },
+                    { "text": prompt.user_prompt }
+                ]
+            }
+        ],
+        "generationConfig": generation_config
+    })
+}
+
+fn gemini_generation_config(response_schema: Value) -> Map<String, Value> {
+    let mut generation_config = Map::new();
+    generation_config.insert("maxOutputTokens".into(), json!(MAX_DECISION_TOKENS));
+    generation_config.insert("responseMimeType".into(), json!("application/json"));
+    generation_config.insert("responseSchema".into(), response_schema);
+    generation_config.insert("temperature".into(), json!(0));
+    generation_config
+}
+
+fn with_gemini_thinking_config(
+    mut generation_config: Map<String, Value>,
+    model: &str,
+) -> Map<String, Value> {
+    if let Some(thinking_config) = gemini_thinking_config(model) {
+        generation_config.insert("thinkingConfig".into(), thinking_config);
+    }
+    generation_config
+}
+
+fn gemini_thinking_config(model: &str) -> Option<Value> {
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gemini-3") {
+        return Some(json!({ "thinkingLevel": "low" }));
+    }
+
+    if model.contains("gemini-2.5-pro") {
+        return Some(json!({ "thinkingBudget": GEMINI_MIN_THINKING_BUDGET }));
+    }
+
+    if gemini_supports_thinking_budget_zero(&model) {
+        return Some(json!({ "thinkingBudget": 0 }));
+    }
+
+    None
+}
+
+fn gemini_supports_thinking_budget_zero(model: &str) -> bool {
+    model.contains("gemini-2.5-flash")
+        || model.contains("robotics-er")
+        || model.contains("native-audio")
+}
+
+fn gemini_schema_for_prompt(prompt: &DecisionPrompt) -> Value {
+    strip_json_schema_keyword(&prompt.schema, "additionalProperties")
+}
+
+fn strip_json_schema_keyword(value: &Value, keyword: &str) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter_map(|(key, value)| {
+                    if key == keyword {
+                        None
+                    } else {
+                        Some((key.clone(), strip_json_schema_keyword(value, keyword)))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| strip_json_schema_keyword(item, keyword))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+pub(crate) fn ollama_decision_body(prompt: &DecisionPrompt, model: &str) -> Value {
+    json!({
+        "model": model,
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": prompt.system_prompt
+            },
+            {
+                "role": "user",
+                "content": prompt.user_prompt
+            }
+        ],
+        "format": prompt.schema,
+        "options": {
+            "temperature": 0
+        }
+    })
+}
+
+pub(crate) fn ollama_vision_decision_body(
+    prompt: &DecisionPrompt,
+    model: &str,
+    image_png_b64: &str,
+) -> Value {
+    json!({
+        "model": model,
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": prompt.system_prompt
+            },
+            {
+                "role": "user",
+                "content": prompt.user_prompt,
+                "images": [image_png_b64]
+            }
+        ],
+        "format": prompt.schema,
+        "options": {
+            "temperature": 0
+        }
+    })
+}
+
+fn extract_anthropic_text(value: &Value) -> Option<String> {
+    value
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string()
+        .into_non_empty()
+}
+
+fn extract_openai_text(value: &Value) -> Option<String> {
+    value
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn extract_gemini_text(value: &Value) -> Option<String> {
+    value
+        .get("candidates")?
+        .as_array()?
+        .first()?
+        .get("content")?
+        .get("parts")?
+        .as_array()?
+        .iter()
+        .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string()
+        .into_non_empty()
+}
+
+fn extract_ollama_text(value: &Value) -> Option<String> {
+    value
+        .get("message")?
+        .get("content")?
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn validate_gemini_model_id(model: &str) -> Result<(), AiError> {
+    if model.is_empty()
+        || !model
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return Err(AiError::InvalidProvider(format!(
+            "invalid gemini model id: {model}"
+        )));
+    }
+    Ok(())
+}
+
+fn is_reasoning_model(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    if id.starts_with("gpt-5") {
+        return true;
+    }
+    matches!(id.chars().next(), Some('o'))
+        && id
+            .chars()
+            .nth(1)
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+}
+
+trait NonEmptyString {
+    fn into_non_empty(self) -> Option<String>;
+}
+
+impl NonEmptyString for String {
+    fn into_non_empty(self) -> Option<String> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_decision_body_uses_strict_json_schema() {
+        let prompt = prompt();
+        let body = openai_decision_body(&prompt, "gpt-4o");
+
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"],
+            openai_strict_decision_schema()
+        );
+        assert!(body["response_format"]["json_schema"]["schema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("reason_detail")));
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["max_tokens"], MAX_DECISION_TOKENS);
+    }
+
+    #[test]
+    fn openai_decision_body_folds_system_for_reasoning_models() {
+        let body = openai_decision_body(&prompt(), "o3-mini");
+
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], MAX_DECISION_TOKENS);
+    }
+
+    #[test]
+    fn anthropic_decision_body_requests_json_schema_output() {
+        let prompt = prompt();
+        let body = anthropic_decision_body(&prompt, "claude-sonnet-4-6");
+
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["output_config"]["type"], "json_schema");
+        assert_eq!(body["output_config"]["schema"], prompt.schema);
+    }
+
+    #[test]
+    fn gemini_decision_body_requests_json_response_schema() {
+        let prompt = prompt();
+        let body = gemini_decision_body(&prompt, "gemini-2.5-flash");
+
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(body["generationConfig"]["responseSchema"], prompt.schema);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
+    }
+
+    #[test]
+    fn gemini_decision_body_uses_model_compatible_thinking_config() {
+        let prompt = prompt();
+
+        let pro = gemini_decision_body(&prompt, "gemini-2.5-pro");
+        assert_eq!(
+            pro["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            GEMINI_MIN_THINKING_BUDGET
+        );
+
+        let gemini3 = gemini_decision_body(&prompt, "gemini-3.5-flash");
+        assert_eq!(
+            gemini3["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
+
+        let legacy = gemini_decision_body(&prompt, "gemini-1.5-flash");
+        assert!(legacy["generationConfig"]
+            .as_object()
+            .unwrap()
+            .get("thinkingConfig")
+            .is_none());
+    }
+
+    #[test]
+    fn gemini_decision_body_strips_unsupported_additional_properties() {
+        let prompt = DecisionPrompt {
+            schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "kind": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["action"]
+            }),
+            ..prompt()
+        };
+        let body = gemini_decision_body(&prompt, "gemini-2.5-flash");
+        let schema = &body["generationConfig"]["responseSchema"];
+
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(schema["properties"]["action"]
+            .get("additionalProperties")
+            .is_none());
+        assert_eq!(
+            schema["properties"]["action"]["properties"]["kind"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn ollama_decision_body_uses_schema_format() {
+        let prompt = prompt();
+        let body = ollama_decision_body(&prompt, "llama3.2-vision");
+
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["format"], prompt.schema);
+        assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn vision_decision_bodies_attach_png_and_schema_controls() {
+        let prompt = prompt();
+
+        let anthropic = anthropic_vision_decision_body(&prompt, "claude-sonnet-4-6", "png123");
+        assert_eq!(
+            anthropic["messages"][0]["content"][0]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(
+            anthropic["messages"][0]["content"][0]["source"]["data"],
+            "png123"
+        );
+        assert_eq!(anthropic["output_config"]["schema"], prompt.schema);
+
+        let openai = openai_vision_decision_body(&prompt, "gpt-4o", "png123");
+        assert_eq!(
+            openai["messages"][1]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,png123"
+        );
+        assert_eq!(openai["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            openai["response_format"]["json_schema"]["schema"],
+            openai_strict_decision_schema()
+        );
+
+        let gemini = gemini_vision_decision_body(&prompt, "gemini-2.5-flash", "png123");
+        assert_eq!(
+            gemini["contents"][0]["parts"][0]["inline_data"]["mime_type"],
+            "image/png"
+        );
+        assert_eq!(gemini["generationConfig"]["responseSchema"], prompt.schema);
+
+        let ollama = ollama_vision_decision_body(&prompt, "llama3.2-vision", "png123");
+        assert_eq!(ollama["messages"][1]["images"][0], "png123");
+        assert_eq!(ollama["format"], prompt.schema);
+    }
+
+    #[test]
+    fn openai_vision_coordinate_prompt_uses_coordinate_schema() {
+        let prompt = DecisionPrompt {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": { "type": "string" },
+                    "action": { "type": "string" },
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" }
+                },
+                "required": ["reason", "action"]
+            }),
+            ..prompt()
+        };
+        let body = openai_vision_decision_body(&prompt, "gpt-4o", "png123");
+
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"],
+            openai_strict_coordinate_schema()
+        );
+    }
+
+    #[test]
+    fn openai_vision_control_prompt_uses_nested_action_schema() {
+        let prompt = DecisionPrompt {
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "observation": { "type": "string" },
+                    "target": { "type": "string" },
+                    "reasoning": { "type": "string" },
+                    "action": {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["observation", "target", "reasoning", "action"]
+            }),
+            ..prompt()
+        };
+        let body = openai_vision_decision_body(&prompt, "gpt-4o", "png123");
+
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"],
+            openai_strict_vision_control_schema()
+        );
+    }
+
+    #[test]
+    fn extract_text_from_provider_shapes() {
+        assert_eq!(
+            extract_openai_text(&json!({
+                "choices": [{"message": {"content": "{\"action\":\"done\"}"}}]
+            })),
+            Some("{\"action\":\"done\"}".into())
+        );
+        assert_eq!(
+            extract_anthropic_text(&json!({
+                "content": [{"type": "text", "text": "{\"action\":\"done\"}"}]
+            })),
+            Some("{\"action\":\"done\"}".into())
+        );
+        assert_eq!(
+            extract_gemini_text(&json!({
+                "candidates": [{"content": {"parts": [{"text": "{\"action\":\"done\"}"}]}}]
+            })),
+            Some("{\"action\":\"done\"}".into())
+        );
+        assert_eq!(
+            extract_ollama_text(&json!({
+                "message": {"content": "{\"action\":\"done\"}"}
+            })),
+            Some("{\"action\":\"done\"}".into())
+        );
+    }
+
+    fn prompt() -> DecisionPrompt {
+        DecisionPrompt {
+            system_prompt: "system".into(),
+            user_prompt: "user".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" }
+                },
+                "required": ["action"]
+            }),
+        }
+    }
+}

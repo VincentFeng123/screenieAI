@@ -1,0 +1,618 @@
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+  overflow: hidden;
+}
+
+.quick-tooltip-root {
+  /* Transparent gutter so rounded edges are never tangent to the window
+     boundary (tangent antialiasing renders as flat clipped segments).
+     Must match QUICK_TOOLTIP_EDGE_PAD in src-tauri/src/lib.rs. */
+  --quick-tooltip-edge-pad: 2px;
+  --quick-tooltip-pill-w: 238px;
+  --quick-tooltip-pill-h: 54px;
+  --quick-tooltip-gap: 12px;
+  --quick-tooltip-agent-card-w: 400px;
+  --quick-tooltip-agent-card-h: 88px;
+  --quick-tooltip-status-h: 178px;
+  --quick-tooltip-stack-top: calc(var(--quick-tooltip-pill-h) + var(--quick-tooltip-gap));
+  width: calc(100vw - 2 * var(--quick-tooltip-edge-pad));
+  height: calc(100vh - 2 * var(--quick-tooltip-edge-pad));
+  margin: var(--quick-tooltip-edge-pad);
+  position: relative;
+  box-sizing: border-box;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  color: rgba(255, 255, 255, 0.94);
+  overflow: hidden;
+}
+
+.quick-tooltip-root[data-status-open="true"] {
+  --quick-tooltip-stack-top: calc(
+    var(--quick-tooltip-pill-h) + var(--quick-tooltip-gap) +
+      var(--quick-tooltip-status-h) + var(--quick-tooltip-gap)
+  );
+}
+
+.quick-tooltip-shell {
+  position: relative;
+  width: var(--quick-tooltip-pill-w);
+  height: var(--quick-tooltip-pill-h);
+  border-radius: 999px;
+  overflow: hidden;
+  box-sizing: border-box;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  background: rgba(42, 45, 44, 0.46);
+  cursor: grab;
+  isolation: isolate;
+}
+
+.quick-tooltip-root[data-expanded="true"] .quick-tooltip-shell,
+.quick-tooltip-root[data-agent-input-open="true"] .quick-tooltip-shell,
+.quick-tooltip-root[data-status-open="true"] .quick-tooltip-shell {
+  margin-left: calc(
+    (var(--quick-tooltip-agent-card-w) - var(--quick-tooltip-pill-w)) / 2
+  );
+}
+
+.quick-tooltip-shell > * {
+  position: relative;
+  z-index: 1;
+}
+
+.quick-tooltip-bar {
+  height: var(--quick-tooltip-pill-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 8px 0 10px;
+  box-sizing: border-box;
+}
+
+.quick-tooltip-brand {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.96;
+}
+
+.quick-tooltip-logo {
+  width: 18px;
+  height: 18px;
+  display: block;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+
+.quick-tooltip-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.quick-tooltip-icon-btn,
+.quick-tooltip-mini-btn,
+.quick-tooltip-send {
+  border: none;
+  appearance: none;
+  -webkit-appearance: none;
+  font-family: inherit;
+  padding: 0;
+}
+
+.quick-tooltip-icon-btn {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.84);
+  background: transparent;
+  transition:
+    color 120ms ease,
+    transform 120ms ease,
+    opacity 120ms ease;
+}
+
+.quick-tooltip-icon-btn:hover,
+.quick-tooltip-icon-btn[data-active="true"] {
+  color: rgba(255, 255, 255, 0.98);
+}
+
+.quick-tooltip-icon-btn[data-running="true"]::after {
+  content: "";
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #c8f26a;
+  box-shadow: 0 0 0 3px rgba(200, 242, 106, 0.14);
+  animation: quick-tooltip-agent-pulse 920ms ease-in-out infinite;
+}
+
+@keyframes quick-tooltip-agent-pulse {
+  0%,
+  100% {
+    transform: scale(0.82);
+    opacity: 0.62;
+  }
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.quick-tooltip-icon-btn:disabled {
+  opacity: 0.32;
+  cursor: not-allowed;
+}
+
+.quick-tooltip-icon-btn:active,
+.quick-tooltip-send:active:not(:disabled),
+.quick-tooltip-mini-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.quick-tooltip-chat-panel {
+  position: absolute;
+  top: var(--quick-tooltip-stack-top);
+  left: 0;
+  width: 100%;
+  height: calc(100% - var(--quick-tooltip-stack-top));
+  border-radius: 24px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: rgba(34, 37, 37, 0.42);
+  border: none;
+  outline: none;
+  box-shadow: none;
+}
+
+.quick-tooltip-status-card {
+  position: absolute;
+  top: calc(var(--quick-tooltip-pill-h) + var(--quick-tooltip-gap));
+  left: 0;
+  width: 100%;
+  height: var(--quick-tooltip-status-h);
+  border-radius: 18px;
+  overflow: hidden;
+  box-sizing: border-box;
+  background: rgba(34, 37, 37, 0.48);
+  border: none;
+  outline: none;
+  box-shadow: none;
+  isolation: isolate;
+}
+
+.quick-tooltip-agent-card {
+  position: absolute;
+  top: calc(var(--quick-tooltip-pill-h) + 4px);
+  left: 0;
+  width: min(var(--quick-tooltip-agent-card-w), 100%);
+  height: var(--quick-tooltip-agent-card-h);
+  border-radius: 18px;
+  overflow: hidden;
+  box-sizing: border-box;
+  background: transparent;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  isolation: isolate;
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="tooltip"]
+  .quick-tooltip-shell,
+:root[data-screenie-platform="windows"][data-screenie-mode="tooltip"]
+  .quick-tooltip-status-card,
+:root[data-screenie-platform="windows"][data-screenie-mode="tooltip"]
+  .quick-tooltip-chat-panel {
+  background:
+    linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.20) 0%,
+      rgba(255, 255, 255, 0.08) 34%,
+      rgba(7, 9, 9, 0.24) 100%
+    ),
+    rgba(42, 45, 44, 0.64);
+  -webkit-backdrop-filter: blur(30px) saturate(145%) brightness(0.88);
+  backdrop-filter: blur(30px) saturate(145%) brightness(0.88);
+}
+
+.quick-tooltip-agent-form {
+  height: var(--quick-tooltip-agent-card-h);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 10px 8px;
+  box-sizing: border-box;
+}
+
+.quick-tooltip-agent-row {
+  position: relative;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px 5px 14px;
+  border-radius: 999px;
+  background: rgba(42, 45, 44, 0.46);
+  box-shadow: none;
+  box-sizing: border-box;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+:root[data-screenie-platform="windows"][data-screenie-mode="tooltip"]
+  .quick-tooltip-agent-row {
+  background:
+    linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.20) 0%,
+      rgba(255, 255, 255, 0.08) 34%,
+      rgba(7, 9, 9, 0.24) 100%
+    ),
+    rgba(42, 45, 44, 0.64);
+  -webkit-backdrop-filter: blur(30px) saturate(145%) brightness(0.88);
+  backdrop-filter: blur(30px) saturate(145%) brightness(0.88);
+}
+
+.quick-tooltip-agent-row > :not(.screenie-inset-border) {
+  position: relative;
+  z-index: 1;
+}
+
+.quick-tooltip-agent-row input {
+  min-width: 0;
+  flex: 1;
+  height: 30px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.95);
+  caret-color: rgba(255, 255, 255, 0.95);
+  font: inherit;
+  font-size: 14px;
+  line-height: 20px;
+  padding: 0;
+}
+
+.quick-tooltip-agent-row input::placeholder {
+  color: rgba(255, 255, 255, 0.42);
+}
+
+.quick-tooltip-agent-model-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 22px;
+  padding-left: 6px;
+  margin-top: -1px;
+  transform: translateY(-6px);
+}
+
+.quick-tooltip-agent-model-select {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.quick-tooltip-agent-model-label {
+  min-width: 0;
+  max-width: 338px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.quick-tooltip-agent-model-provider {
+  flex: 0 0 auto;
+}
+
+.quick-tooltip-agent-model-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgba(255, 255, 255, 0.56);
+}
+
+.quick-tooltip-agent-submit {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+  min-height: 30px;
+}
+
+.quick-tooltip-chat {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  box-sizing: border-box;
+}
+
+.quick-tooltip-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 14px 8px;
+  box-sizing: border-box;
+}
+
+.quick-tooltip-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.quick-tooltip-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.quick-tooltip-empty {
+  margin: auto;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.42);
+}
+
+.quick-tooltip-user-message {
+  align-self: flex-end;
+  max-width: 85%;
+  padding: 10px 16px;
+  border-radius: 18px;
+  background: rgba(253, 252, 248, 0.97);
+  color: rgba(18, 18, 16, 0.96);
+  font-size: 13.5px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.quick-tooltip-assistant-message {
+  align-self: flex-start;
+  width: 100%;
+  min-width: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.92);
+  overflow-wrap: anywhere;
+}
+
+.quick-tooltip-error,
+.quick-tooltip-confirmation,
+.quick-tooltip-agent-progress {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  max-height: 100%;
+  padding: 16px;
+  box-sizing: border-box;
+  overflow: auto;
+  scrollbar-width: none;
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.quick-tooltip-error::-webkit-scrollbar,
+.quick-tooltip-confirmation::-webkit-scrollbar,
+.quick-tooltip-agent-progress::-webkit-scrollbar {
+  display: none;
+}
+
+.quick-tooltip-error {
+  color: #ffaaa4;
+  background:
+    linear-gradient(90deg, rgba(255, 83, 77, 0.16), rgba(255, 83, 77, 0.04)),
+    rgba(34, 37, 37, 0.2);
+}
+
+.quick-tooltip-confirmation {
+  color: rgba(255, 255, 255, 0.92);
+  background:
+    linear-gradient(90deg, rgba(200, 242, 106, 0.14), rgba(200, 242, 106, 0.03)),
+    rgba(34, 37, 37, 0.18);
+}
+
+.quick-tooltip-status-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 650;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.quick-tooltip-status-heading span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quick-tooltip-status-close {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 999px;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.74);
+  cursor: pointer;
+}
+
+.quick-tooltip-status-close:hover {
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.quick-tooltip-confirmation-action {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.quick-tooltip-confirmation-target,
+.quick-tooltip-confirmation-reason {
+  overflow-wrap: anywhere;
+}
+
+.quick-tooltip-confirmation-target {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.quick-tooltip-confirmation-reason {
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.quick-tooltip-error-text {
+  color: #ffaaa4;
+}
+
+.quick-tooltip-agent-progress {
+  color: rgba(255, 255, 255, 0.92);
+  background:
+    linear-gradient(90deg, rgba(200, 242, 106, 0.1), rgba(200, 242, 106, 0.02)),
+    rgba(34, 37, 37, 0.18);
+}
+
+.quick-tooltip-agent-progress-text {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.quick-tooltip-confirmation-actions {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  min-height: 36px;
+  padding-top: 6px;
+}
+
+.quick-tooltip-confirm-btn {
+  border: none;
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 0 0 auto;
+  min-width: 86px;
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.9);
+  font: inherit;
+  font-size: 13px;
+  line-height: 34px;
+  cursor: pointer;
+}
+
+.quick-tooltip-confirm-btn.primary {
+  background: rgba(253, 252, 248, 0.96);
+  color: rgba(18, 18, 16, 0.95);
+}
+
+.quick-tooltip-confirm-btn:active {
+  transform: scale(0.97);
+}
+
+.quick-tooltip-prompt {
+  flex: 0 0 auto;
+  margin: 8px 12px 12px;
+}
+
+.quick-tooltip-prompt textarea {
+  width: 100%;
+  min-height: 22px;
+  max-height: 140px;
+  display: block;
+  box-sizing: border-box;
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.95);
+  caret-color: rgba(255, 255, 255, 0.95);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+  padding: 10px 14px 4px;
+}
+
+.quick-tooltip-prompt textarea::placeholder {
+  color: rgba(255, 255, 255, 0.42);
+}
+
+.quick-tooltip-prompt-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px 8px 14px;
+  box-sizing: border-box;
+}
+
+.quick-tooltip-prompt-left {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.quick-tooltip-provider-label {
+  min-width: 0;
+  overflow: hidden;
+  transform: translateY(2px);
+}
+
+.quick-tooltip-mini-btn {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  background: transparent;
+}
+
+.quick-tooltip-mini-btn:disabled {
+  opacity: 0.32;
+  cursor: not-allowed;
+}
+
+.quick-tooltip-send {
+  flex: 0 0 auto;
+}

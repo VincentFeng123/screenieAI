@@ -23,21 +23,20 @@ async fn verify_ollama_banner(client: &reqwest::Client) -> Result<(), AiError> {
     if OLLAMA_BANNER_VERIFIED.get().copied().unwrap_or(false) {
         return Ok(());
     }
-    let resp = client.get(TAGS_URL).send().await.map_err(|e| {
-        AiError::Http(format!(
-            "ollama not reachable at localhost:11434 ({})",
-            e
-        ))
-    })?;
+    let resp =
+        client.get(TAGS_URL).send().await.map_err(|e| {
+            AiError::Http(format!("ollama not reachable at localhost:11434 ({})", e))
+        })?;
     if !resp.status().is_success() {
         return Err(AiError::Http(format!(
             "localhost:11434 is not Ollama (unexpected banner: HTTP {})",
             resp.status().as_u16()
         )));
     }
-    let v: Value = resp.json().await.map_err(|_| {
-        AiError::Http("localhost:11434 is not Ollama (unexpected banner)".into())
-    })?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|_| AiError::Http("localhost:11434 is not Ollama (unexpected banner)".into()))?;
     let looks_like_ollama = v.get("models").and_then(|m| m.as_array()).is_some();
     if !looks_like_ollama {
         return Err(AiError::Http(
@@ -130,10 +129,7 @@ where
                         .get("prompt_eval_count")
                         .and_then(|n| n.as_u64())
                         .unwrap_or(0);
-                    let output_tokens = v
-                        .get("eval_count")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
+                    let output_tokens = v.get("eval_count").and_then(|n| n.as_u64()).unwrap_or(0);
                     if input_tokens > 0 || output_tokens > 0 {
                         on_event(AskEvent::Usage {
                             input_tokens,
@@ -150,6 +146,7 @@ where
 }
 
 fn build_messages(history: &[UiMessage], image_b64: &str, response_profile: &str) -> Vec<Value> {
+    let has_image = !image_b64.trim().is_empty();
     let last_user_idx = history
         .iter()
         .rposition(|m| m.role != "assistant")
@@ -161,18 +158,33 @@ fn build_messages(history: &[UiMessage], image_b64: &str, response_profile: &str
         "content": system,
     }));
     for (i, m) in history.iter().enumerate() {
-        let role = if m.role == "assistant" { "assistant" } else { "user" };
+        let role = if m.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
         if i == last_user_idx {
             let text = if m.content.trim().is_empty() {
-                "Describe what's shown in this image clearly and concisely."
+                if has_image {
+                    "Describe what's shown in this image clearly and concisely."
+                } else {
+                    "How can I help?"
+                }
             } else {
                 m.content.as_str()
             };
-            out.push(json!({
-                "role": "user",
-                "content": text,
-                "images": [image_b64],
-            }));
+            if has_image {
+                out.push(json!({
+                    "role": "user",
+                    "content": text,
+                    "images": [image_b64],
+                }));
+            } else {
+                out.push(json!({
+                    "role": "user",
+                    "content": text,
+                }));
+            }
         } else {
             out.push(json!({
                 "role": role,
@@ -181,11 +193,18 @@ fn build_messages(history: &[UiMessage], image_b64: &str, response_profile: &str
         }
     }
     if last_user_idx == usize::MAX {
-        out.push(json!({
-            "role": "user",
-            "content": "Describe what's shown in this image clearly and concisely.",
-            "images": [image_b64],
-        }));
+        if has_image {
+            out.push(json!({
+                "role": "user",
+                "content": "Describe what's shown in this image clearly and concisely.",
+                "images": [image_b64],
+            }));
+        } else {
+            out.push(json!({
+                "role": "user",
+                "content": "How can I help?",
+            }));
+        }
     }
     out
 }
@@ -236,5 +255,33 @@ pub async fn check_status() -> OllamaStatus {
     OllamaStatus {
         running: true,
         models,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> UiMessage {
+        UiMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn text_only_payload_omits_images_field() {
+        let payload = build_messages(&[msg("user", "hello")], "", "concise");
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("\"images\""));
+        assert!(json.contains("hello"));
+    }
+
+    #[test]
+    fn image_payload_includes_images_field() {
+        let payload = build_messages(&[msg("user", "what is this?")], "abc123", "concise");
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"images\""));
+        assert!(json.contains("abc123"));
     }
 }

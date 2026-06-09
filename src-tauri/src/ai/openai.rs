@@ -57,10 +57,7 @@ where
     body.insert("stream".into(), json!(true));
     // Ask for usage in the final stream chunk so we can surface token
     // counts + cost in the chat panel.
-    body.insert(
-        "stream_options".into(),
-        json!({ "include_usage": true }),
-    );
+    body.insert("stream_options".into(), json!({ "include_usage": true }));
     body.insert("messages".into(), json!(messages));
     if reasoning {
         // o-series rejects `max_tokens`; the field is `max_completion_tokens`.
@@ -128,10 +125,7 @@ where
                     // model overload, content filter). Surface it instead of
                     // letting the stream silently end.
                     if let Some(err) = v.get("error") {
-                        let msg = err
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or(&data);
+                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or(&data);
                         return Err(AiError::Api {
                             status: 200,
                             body: super::sanitize_provider_error(msg, "openai"),
@@ -141,8 +135,7 @@ where
                         if let Some(t) = usage.get("prompt_tokens").and_then(|n| n.as_u64()) {
                             input_tokens = t;
                         }
-                        if let Some(t) = usage.get("completion_tokens").and_then(|n| n.as_u64())
-                        {
+                        if let Some(t) = usage.get("completion_tokens").and_then(|n| n.as_u64()) {
                             output_tokens = t;
                         }
                     }
@@ -165,17 +158,30 @@ where
     Ok(())
 }
 
-fn build_messages(history: &[UiMessage], image_b64: &str, prefix_system: Option<&str>) -> Vec<Value> {
+fn build_messages(
+    history: &[UiMessage],
+    image_b64: &str,
+    prefix_system: Option<&str>,
+) -> Vec<Value> {
+    let has_image = !image_b64.trim().is_empty();
     let last_user_idx = history
         .iter()
         .rposition(|m| m.role != "assistant")
         .unwrap_or(usize::MAX);
     let mut out = Vec::with_capacity(history.len().max(1));
     for (i, m) in history.iter().enumerate() {
-        let role = if m.role == "assistant" { "assistant" } else { "user" };
+        let role = if m.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
         if i == last_user_idx {
             let text = if m.content.trim().is_empty() {
-                "Describe what's shown in this image clearly and concisely."
+                if has_image {
+                    "Describe what's shown in this image clearly and concisely."
+                } else {
+                    "How can I help?"
+                }
             } else {
                 m.content.as_str()
             };
@@ -185,6 +191,43 @@ fn build_messages(history: &[UiMessage], image_b64: &str, prefix_system: Option<
                 Some(sys) => format!("{}\n\n---\n\n{}", sys, text),
                 None => text.to_string(),
             };
+            if has_image {
+                out.push(json!({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:image/png;base64,{}", image_b64)
+                            }
+                        },
+                        {"type": "text", "text": text}
+                    ]
+                }));
+            } else {
+                out.push(json!({
+                    "role": "user",
+                    "content": text,
+                }));
+            }
+        } else {
+            out.push(json!({
+                "role": role,
+                "content": m.content,
+            }));
+        }
+    }
+    if last_user_idx == usize::MAX {
+        let fallback = if has_image {
+            "Describe what's shown in this image clearly and concisely."
+        } else {
+            "How can I help?"
+        };
+        let text = match prefix_system {
+            Some(sys) => format!("{}\n\n---\n\n{}", sys, fallback),
+            None => fallback.to_string(),
+        };
+        if has_image {
             out.push(json!({
                 "role": "user",
                 "content": [
@@ -199,29 +242,10 @@ fn build_messages(history: &[UiMessage], image_b64: &str, prefix_system: Option<
             }));
         } else {
             out.push(json!({
-                "role": role,
-                "content": m.content,
+                "role": "user",
+                "content": text,
             }));
         }
-    }
-    if last_user_idx == usize::MAX {
-        let fallback = "Describe what's shown in this image clearly and concisely.";
-        let text = match prefix_system {
-            Some(sys) => format!("{}\n\n---\n\n{}", sys, fallback),
-            None => fallback.to_string(),
-        };
-        out.push(json!({
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": format!("data:image/png;base64,{}", image_b64)
-                    }
-                },
-                {"type": "text", "text": text}
-            ]
-        }));
     }
     out
 }
@@ -236,4 +260,32 @@ fn extract_content_delta(data: &str) -> Option<String> {
         .get("content")?
         .as_str()?;
     Some(content.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> UiMessage {
+        UiMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn text_only_payload_omits_image_url() {
+        let payload = build_messages(&[msg("user", "hello")], "", None);
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("image_url"));
+        assert!(json.contains("hello"));
+    }
+
+    #[test]
+    fn image_payload_includes_image_url() {
+        let payload = build_messages(&[msg("user", "what is this?")], "abc123", None);
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("image_url"));
+        assert!(json.contains("data:image/png;base64,abc123"));
+    }
 }

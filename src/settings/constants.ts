@@ -57,11 +57,6 @@ export const GEMINI_MODELS = [
   { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite — cheapest" },
   { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
   { id: "gemini-2.0-flash-lite", label: "Gemini 2.0 Flash Lite" },
-  { id: "gemini-1.5-pro", label: "Gemini 1.5 Pro" },
-  { id: "gemini-1.5-pro-002", label: "Gemini 1.5 Pro 002" },
-  { id: "gemini-1.5-flash", label: "Gemini 1.5 Flash" },
-  { id: "gemini-1.5-flash-002", label: "Gemini 1.5 Flash 002" },
-  { id: "gemini-1.5-flash-8b", label: "Gemini 1.5 Flash 8B" },
 ];
 
 export function looksLikeVisionModel(name: string): boolean {

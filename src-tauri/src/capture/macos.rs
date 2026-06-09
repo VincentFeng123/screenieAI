@@ -85,20 +85,5 @@ fn is_blank(bytes: &[u8]) -> bool {
         Ok(i) => i,
         Err(_) => return false,
     };
-    let rgba = img.to_rgba8();
-    let pixels = rgba.as_raw();
-    let total = pixels.len() / 4;
-    if total == 0 {
-        return false;
-    }
-    let stride = (total / 200).max(1);
-    for i in (0..total).step_by(stride) {
-        let r = pixels[i * 4];
-        let g = pixels[i * 4 + 1];
-        let b = pixels[i * 4 + 2];
-        if r != 0 || g != 0 || b != 0 {
-            return false;
-        }
-    }
-    true
+    super::rgba_is_blank(&img.to_rgba8())
 }

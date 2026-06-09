@@ -1486,6 +1486,7 @@ type HotkeyConfigDto = {
   capture: string;
   repeat: string;
   settings: string;
+  tooltip: string;
 };
 
 function HotkeyEditor() {
@@ -1537,6 +1538,13 @@ function HotkeyEditor() {
           value={cfg.settings}
           busy={savingKey === "settings"}
           onChange={(v) => update("settings", { ...cfg, settings: v })}
+        />
+      </PreferenceRow>
+      <PreferenceRow title="Show or hide tooltip" help="Toggle the floating Screenie AI tooltip.">
+        <HotkeyRecorder
+          value={cfg.tooltip}
+          busy={savingKey === "tooltip"}
+          onChange={(v) => update("tooltip", { ...cfg, tooltip: v })}
         />
       </PreferenceRow>
       {error && (

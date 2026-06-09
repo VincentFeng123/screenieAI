@@ -151,6 +151,7 @@ where
 }
 
 fn build_messages(history: &[UiMessage], image_b64: &str) -> Vec<Value> {
+    let has_image = !image_b64.trim().is_empty();
     // Attach the image to the LAST user message — that way, when the user
     // resizes the captured region between turns, the model sees the new image
     // alongside its newest question rather than answering about a stale crop.
@@ -160,13 +161,51 @@ fn build_messages(history: &[UiMessage], image_b64: &str) -> Vec<Value> {
         .unwrap_or(usize::MAX);
     let mut out = Vec::with_capacity(history.len().max(1));
     for (i, m) in history.iter().enumerate() {
-        let role = if m.role == "assistant" { "assistant" } else { "user" };
+        let role = if m.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
         if i == last_user_idx {
             let text = if m.content.trim().is_empty() {
-                "Describe what's shown in this image clearly and concisely."
+                if has_image {
+                    "Describe what's shown in this image clearly and concisely."
+                } else {
+                    "How can I help?"
+                }
             } else {
                 m.content.as_str()
             };
+            if has_image {
+                out.push(json!({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": image_b64,
+                            }
+                        },
+                        {"type": "text", "text": text}
+                    ]
+                }));
+            } else {
+                out.push(json!({
+                    "role": "user",
+                    "content": text,
+                }));
+            }
+        } else {
+            out.push(json!({
+                "role": role,
+                "content": m.content,
+            }));
+        }
+    }
+    if last_user_idx == usize::MAX {
+        if has_image {
             out.push(json!({
                 "role": "user",
                 "content": [
@@ -178,31 +217,15 @@ fn build_messages(history: &[UiMessage], image_b64: &str) -> Vec<Value> {
                             "data": image_b64,
                         }
                     },
-                    {"type": "text", "text": text}
+                    {"type": "text", "text": "Describe what's shown in this image clearly and concisely."}
                 ]
             }));
         } else {
             out.push(json!({
-                "role": role,
-                "content": m.content,
+                "role": "user",
+                "content": "How can I help?",
             }));
         }
-    }
-    if last_user_idx == usize::MAX {
-        out.push(json!({
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": image_b64,
-                    }
-                },
-                {"type": "text", "text": "Describe what's shown in this image clearly and concisely."}
-            ]
-        }));
     }
     out
 }
@@ -230,4 +253,33 @@ fn extract_text_delta(data: &str) -> Option<String> {
         return None;
     }
     delta.get("text")?.as_str().map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> UiMessage {
+        UiMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn text_only_payload_omits_image_block() {
+        let payload = build_messages(&[msg("user", "hello")], "");
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("\"type\":\"image\""));
+        assert!(!json.contains("\"media_type\":\"image/png\""));
+        assert!(json.contains("hello"));
+    }
+
+    #[test]
+    fn image_payload_includes_image_block() {
+        let payload = build_messages(&[msg("user", "what is this?")], "abc123");
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"type\":\"image\""));
+        assert!(json.contains("\"data\":\"abc123\""));
+    }
 }

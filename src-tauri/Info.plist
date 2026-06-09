@@ -25,7 +25,7 @@
   <key>CFBundleDisplayName</key>
   <string>Screenie AI</string>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>Screenie AI captures the screen region you select and sends it to your chosen vision AI to answer your question.</string>
+  <string>Screenie AI captures screenshots for selected-region questions and for agentic mode to verify visible UI state before and after actions.</string>
   <!--
     Accessibility is requested by macos_window.m's AXIsProcessTrustedWithOptions
     call. The Esc-suppression CGEventTap and the previously-frontmost-app
@@ -33,7 +33,9 @@
     a generic prompt and Apple's notarization review may flag the bundle.
   -->
   <key>NSAccessibilityUsageDescription</key>
-  <string>Screenie AI uses Accessibility to capture Esc while the result overlay is visible (so it dismisses the overlay instead of, e.g., exiting fullscreen in the app behind it) and to return focus to the app you were using before the capture.</string>
+  <string>Screenie AI uses Accessibility to inspect visible app controls, perform approved agent actions, capture Esc while the overlay is visible, and return focus to the app you were using before the capture.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Screenie AI uses Apple Events to inspect Safari page controls for agentic mode when Safari is the active app.</string>
   <key>LSUIElement</key>
   <true/>
 </dict>

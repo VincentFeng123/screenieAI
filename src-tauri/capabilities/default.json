@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main settings/onboarding window and the detached chat window",
-  "windows": ["main", "chat"],
+  "description": "Capability for the main settings/onboarding window, detached chat window, and quick tooltip",
+  "windows": ["main", "chat", "quick_tooltip"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

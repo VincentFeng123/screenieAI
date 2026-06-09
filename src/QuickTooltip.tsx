@@ -1,0 +1,1254 @@
+import {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
+import { Channel, invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  AlertTriangle,
+  ArrowUp,
+  Bot,
+  Camera,
+  MessageCircle,
+  Plus,
+  Settings,
+  ShieldCheck,
+  Square,
+  X,
+} from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
+import "highlight.js/styles/github-dark.css";
+import "./markdown.css";
+import "./overlay.css";
+import "./quick-tooltip.css";
+import screenieLogoUrl from "../src-tauri/icons/tray-icon.svg";
+import {
+  ANTHROPIC_MODELS,
+  GEMINI_MODELS,
+  OPENAI_MODELS,
+  type Provider,
+} from "./settings/constants";
+import { readPreferences } from "./settings/preferences";
+import {
+  formatAiMarkdown,
+  SCREENIE_KATEX_OPTIONS,
+} from "./lib/formatAiMarkdown";
+import {
+  recordUsage,
+  type AskEvent,
+  type ProviderId,
+  usageTokensFromEvent,
+} from "./lib/usage";
+import { SvgInsetBorder } from "./components/Frosted";
+import CustomDropdown, {
+  type CustomDropdownOption,
+} from "./components/CustomDropdown";
+
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+type AgentAction = {
+  action: string;
+  app?: string;
+  id?: number;
+  text?: string;
+  combo?: string;
+  dx?: number;
+  dy?: number;
+  ms?: number;
+  url?: string;
+  query?: string;
+  reason?: string;
+};
+
+type AgentTarget = {
+  id: number;
+  role: string;
+  name: string;
+  value?: string | null;
+};
+
+type AgentConfirmationRequest = {
+  requestId: string;
+  action: AgentAction;
+  target?: AgentTarget | null;
+  reason: string;
+};
+
+type AgentTaskFinished = {
+  status?: string;
+  failureReason?: string | null;
+};
+
+type AgentStepUpdate = {
+  step: number;
+  reason?: string | null;
+  action: AgentAction;
+};
+
+type ProviderInfo = {
+  provider: Provider;
+  label: string;
+  cloud: boolean;
+  model: string;
+};
+
+type TooltipFrostRegion = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  radius: number;
+};
+
+const QUICK_TOOLTIP_FROST_REGION_SELECTOR = [
+  ".quick-tooltip-shell",
+  ".quick-tooltip-status-card",
+  ".quick-tooltip-chat-panel",
+  ".quick-tooltip-agent-row",
+  ".screenie-select-menu-portal",
+].join(", ");
+const QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR =
+  ".quick-tooltip-error, .quick-tooltip-confirmation, .quick-tooltip-agent-progress";
+const QUICK_TOOLTIP_STATUS_MIN_HEIGHT = 82;
+const QUICK_TOOLTIP_STATUS_MAX_HEIGHT = 420;
+
+const QUICK_TOOLTIP_DRAG_BLOCKERS =
+  'button, input, textarea, select, a, [role="button"], [role="listbox"], .screenie-select, .screenie-select-menu-portal, .quick-tooltip-agent-card';
+
+const PROVIDER_LABELS: Record<
+  Provider,
+  { label: string; cloud: boolean; defaultModel: string }
+> = {
+  anthropic: { label: "Claude", cloud: true, defaultModel: "claude-sonnet-4-6" },
+  openai: { label: "OpenAI", cloud: true, defaultModel: "gpt-4o" },
+  gemini: { label: "Gemini", cloud: true, defaultModel: "gemini-2.5-flash" },
+  ollama: { label: "Ollama", cloud: false, defaultModel: "llama3.2-vision" },
+};
+
+function modelOptionsForProvider(
+  provider: Provider,
+  currentModel: string,
+): CustomDropdownOption[] {
+  const withCurrent = (options: CustomDropdownOption[]) => {
+    if (!currentModel || options.some((o) => o.value === currentModel)) return options;
+    return [{ value: currentModel, label: currentModel }, ...options];
+  };
+  if (provider === "anthropic") {
+    return withCurrent(ANTHROPIC_MODELS.map((m) => ({ value: m.id, label: m.label })));
+  }
+  if (provider === "openai") {
+    return withCurrent(OPENAI_MODELS.map((m) => ({ value: m.id, label: m.label })));
+  }
+  if (provider === "gemini") {
+    return withCurrent(GEMINI_MODELS.map((m) => ({ value: m.id, label: m.label })));
+  }
+  return withCurrent([
+    { value: currentModel || "llama3.2-vision", label: currentModel || "llama3.2-vision" },
+  ]);
+}
+
+function modelStorageKey(provider: Provider): string {
+  if (provider === "ollama") return "ollama_model";
+  if (provider === "openai") return "openai_model";
+  if (provider === "gemini") return "gemini_model";
+  return "anthropic_model";
+}
+
+function storedCloudModel(
+  key: string,
+  options: Array<{ id: string }>,
+  fallback: string,
+): string {
+  const saved = localStorage.getItem(key);
+  return saved && options.some((option) => option.id === saved) ? saved : fallback;
+}
+
+function readProviderInfo(): ProviderInfo {
+  const savedProvider = localStorage.getItem("provider");
+  const provider: Provider =
+    savedProvider && savedProvider in PROVIDER_LABELS
+      ? (savedProvider as Provider)
+      : "anthropic";
+  const meta = PROVIDER_LABELS[provider];
+  let model = meta.defaultModel;
+  if (provider === "ollama") {
+    model = localStorage.getItem("ollama_model") || meta.defaultModel;
+  } else if (provider === "openai") {
+    model = storedCloudModel("openai_model", OPENAI_MODELS, meta.defaultModel);
+  } else if (provider === "gemini") {
+    model = storedCloudModel("gemini_model", GEMINI_MODELS, meta.defaultModel);
+  } else {
+    model = storedCloudModel("anthropic_model", ANTHROPIC_MODELS, meta.defaultModel);
+  }
+  return { provider, label: meta.label, cloud: meta.cloud, model };
+}
+
+function errorText(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function formatAgentAction(action: AgentAction): string {
+  if (action.action === "activateApp" && action.app) return `Open ${action.app}`;
+  if (action.action === "key" && action.combo) return `Press ${action.combo}`;
+  if (action.action === "type") return "Type text";
+  if (action.action === "doubleClick") return "Double-click";
+  if (action.action === "click") return "Click";
+  if (action.action === "scroll") return "Scroll";
+  if (action.action === "wait") return "Wait";
+  if (action.action === "openUrl") return action.url ? `Open ${action.url}` : "Open URL";
+  if (action.action === "webSearch")
+    return action.query ? `Search "${action.query}"` : "Search the web";
+  if (action.action === "readPage") return "Read page";
+  if (action.action === "done") return "Finish task";
+  return action.action || "Action";
+}
+
+function formatAgentTarget(target?: AgentTarget | null): string {
+  if (!target) return "Current app";
+  const name = target.name?.trim();
+  if (name) return name;
+  return target.role || `Element ${target.id}`;
+}
+
+function selectedModelLabel(options: CustomDropdownOption[], value: string): string {
+  return options.find((option) => option.value === value)?.label ?? value;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function parseRadius(raw: string, w: number, h: number): number {
+  const trimmed = raw.trim();
+  if (trimmed.endsWith("%")) {
+    const pct = parseFloat(trimmed);
+    if (!Number.isFinite(pct)) return 0;
+    return (pct / 100) * Math.min(w, h);
+  }
+  const n = parseFloat(trimmed);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function collectTooltipFrostRegions(): TooltipFrostRegion[] {
+  const regions: TooltipFrostRegion[] = [];
+  const viewportW = window.innerWidth;
+  const viewportH = window.innerHeight;
+
+  document
+    .querySelectorAll<HTMLElement>(QUICK_TOOLTIP_FROST_REGION_SELECTOR)
+    .forEach((el) => {
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return;
+      if (parseFloat(style.opacity || "1") < 0.05) return;
+
+      const rect = el.getBoundingClientRect();
+      const x1 = clamp(rect.left, 0, viewportW);
+      const y1 = clamp(rect.top, 0, viewportH);
+      const x2 = clamp(rect.right, 0, viewportW);
+      const y2 = clamp(rect.bottom, 0, viewportH);
+      const w = x2 - x1;
+      const h = y2 - y1;
+      if (w < 1 || h < 1) return;
+
+      const radius = parseRadius(style.borderTopLeftRadius, w, h);
+      regions.push({ x: x1, y: y1, w, h, radius });
+    });
+
+  return regions;
+}
+
+function frostSignature(regions: TooltipFrostRegion[]): string {
+  return JSON.stringify(
+    {
+      viewportW: Math.round(window.innerWidth),
+      viewportH: Math.round(window.innerHeight),
+      regions: regions.map((r) => ({
+        x: Math.round(r.x),
+        y: Math.round(r.y),
+        w: Math.round(r.w),
+        h: Math.round(r.h),
+        radius: Math.round(r.radius),
+      })),
+    },
+  );
+}
+
+function useQuickTooltipFrostRegions(enabled: boolean) {
+  const lastSignatureRef = useRef("");
+  const enabledRef = useRef(enabled);
+  const rafRef = useRef<number | null>(null);
+  const frameSyncedRef = useRef(false);
+  enabledRef.current = enabled;
+
+  const cancelScheduledSync = useCallback(() => {
+    if (rafRef.current === null) return;
+    window.cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+  }, []);
+
+  const syncNow = useCallback(() => {
+    const regions = enabledRef.current ? collectTooltipFrostRegions() : [];
+    const signature = frostSignature(regions);
+    if (signature === lastSignatureRef.current) return;
+    lastSignatureRef.current = signature;
+    invoke("set_quick_tooltip_vibrancy_regions", { regions }).catch((e) => {
+      console.error("set_quick_tooltip_vibrancy_regions failed:", e);
+    });
+  }, []);
+
+  const scheduleSync = useCallback(() => {
+    cancelScheduledSync();
+    rafRef.current = window.requestAnimationFrame(() => {
+      rafRef.current = null;
+      syncNow();
+    });
+  }, [cancelScheduledSync, syncNow]);
+
+  useLayoutEffect(() => {
+    if (frameSyncedRef.current) return;
+    frameSyncedRef.current = true;
+    syncNow();
+    window.requestAnimationFrame(() => {
+      frameSyncedRef.current = false;
+    });
+  });
+
+  useEffect(() => {
+    const ro = new ResizeObserver(scheduleSync);
+    document
+      .querySelectorAll(QUICK_TOOLTIP_FROST_REGION_SELECTOR)
+      .forEach((el) => ro.observe(el));
+
+    const observer = new MutationObserver((mutations) => {
+      let meaningful = false;
+      for (const m of mutations) {
+        m.addedNodes.forEach((n) => {
+          if (!(n instanceof HTMLElement)) return;
+          if (n.matches?.(QUICK_TOOLTIP_FROST_REGION_SELECTOR)) ro.observe(n);
+          n.querySelectorAll?.(QUICK_TOOLTIP_FROST_REGION_SELECTOR).forEach((el) =>
+            ro.observe(el),
+          );
+        });
+        if (meaningful) continue;
+        const target = m.target as Element | null;
+        if (!target?.closest?.(".screenie-md")) {
+          meaningful = true;
+        }
+      }
+      if (meaningful) scheduleSync();
+    });
+
+    observer.observe(document.body, {
+      attributes: true,
+      childList: true,
+      subtree: true,
+      attributeFilter: ["class", "style", "data-expanded"],
+    });
+    window.addEventListener("resize", scheduleSync);
+    return () => {
+      cancelScheduledSync();
+      ro.disconnect();
+      observer.disconnect();
+      window.removeEventListener("resize", scheduleSync);
+      invoke("set_quick_tooltip_vibrancy_regions", { regions: [] }).catch(() => {});
+      lastSignatureRef.current = "";
+    };
+  }, [cancelScheduledSync, scheduleSync]);
+}
+
+export default function QuickTooltip() {
+  const [expanded, setExpanded] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [streaming, setStreaming] = useState<string | null>(null);
+  const [prompt, setPrompt] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [agentInputOpen, setAgentInputOpen] = useState(false);
+  const [agentModelMenuOpen, setAgentModelMenuOpen] = useState(false);
+  const [agentGoal, setAgentGoal] = useState("");
+  const [agentRunning, setAgentRunning] = useState(false);
+  const [agentStatus, setAgentStatus] = useState<AgentStepUpdate | null>(null);
+  const [confirmation, setConfirmation] =
+    useState<AgentConfirmationRequest | null>(null);
+  const [providerInfo, setProviderInfo] = useState<ProviderInfo>(() =>
+    readProviderInfo(),
+  );
+  const runSeqRef = useRef(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const agentInputRef = useRef<HTMLInputElement>(null);
+  const statusCardRef = useRef<HTMLElement>(null);
+  const agentInputOpenRef = useRef(false);
+  const [statusHeight, setStatusHeight] = useState(
+    QUICK_TOOLTIP_STATUS_MIN_HEIGHT,
+  );
+  const modelOptions = useMemo(
+    () => modelOptionsForProvider(providerInfo.provider, providerInfo.model),
+    [providerInfo.provider, providerInfo.model],
+  );
+  const activeModelLabel = useMemo(
+    () => selectedModelLabel(modelOptions, providerInfo.model),
+    [modelOptions, providerInfo.model],
+  );
+  const hasStatus = Boolean(error || confirmation || agentRunning);
+  const chatVisible = expanded && !hasStatus;
+  const canStartNewChat =
+    messages.length > 0 || prompt.trim().length > 0 || streaming !== null || error !== null;
+  const rootStyle = useMemo(
+    () =>
+      ({
+        "--quick-tooltip-status-h": `${Math.round(statusHeight)}px`,
+      }) as CSSProperties,
+    [statusHeight],
+  );
+
+  useQuickTooltipFrostRegions(true);
+
+  useEffect(() => {
+    agentInputOpenRef.current = agentInputOpen;
+  }, [agentInputOpen]);
+
+  useEffect(() => {
+    const onStorage = () => setProviderInfo(readProviderInfo());
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    getCurrentWindow()
+      .listen<AgentConfirmationRequest>("agent-confirmation-requested", (event) => {
+        if (cancelled) return;
+        setConfirmation(event.payload);
+        setExpanded(false);
+        agentInputOpenRef.current = false;
+        setAgentInputOpen(false);
+        setAgentModelMenuOpen(false);
+        invoke("set_quick_tooltip_keyboard_mode", { enabled: false }).catch((e) => {
+          console.error("set_quick_tooltip_keyboard_mode(false) failed:", e);
+        });
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      })
+      .catch((e) => {
+        console.error("agent confirmation listener failed:", e);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    getCurrentWindow()
+      .listen<AgentTaskFinished>("agent-task-finished", (event) => {
+        if (cancelled) return;
+        setAgentRunning(false);
+        setAgentStatus(null);
+        const status = event.payload?.status;
+        const failure = event.payload?.failureReason?.trim();
+        if ((status === "failed" || status === "maxStepsReached") && failure) {
+          setError(failure);
+          setExpanded(false);
+        }
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      })
+      .catch((e) => {
+        console.error("agent task finished listener failed:", e);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    getCurrentWindow()
+      .listen<AgentStepUpdate>("agent-step-update", (event) => {
+        if (cancelled || !event.payload) return;
+        setAgentStatus(event.payload);
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      })
+      .catch((e) => {
+        console.error("agent step update listener failed:", e);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const setQuickTooltipKeyboardMode = useCallback(
+    async (enabled: boolean, restorePreviousApp = false) => {
+      try {
+        await invoke("set_quick_tooltip_keyboard_mode", {
+          enabled,
+          restorePreviousApp,
+        });
+      } catch (e) {
+        console.error(
+          `set_quick_tooltip_keyboard_mode(${enabled}) failed:`,
+          e,
+        );
+        throw e;
+      }
+    },
+    [],
+  );
+
+  const restoreQuickTooltipKeyboardMode = useCallback(() => {
+    setQuickTooltipKeyboardMode(false).catch(() => {});
+  }, [setQuickTooltipKeyboardMode]);
+
+  const closeAgentInput = useCallback(() => {
+    if (!agentInputOpenRef.current) return;
+    agentInputOpenRef.current = false;
+    setAgentInputOpen(false);
+    setAgentModelMenuOpen(false);
+    restoreQuickTooltipKeyboardMode();
+  }, [restoreQuickTooltipKeyboardMode]);
+
+  const openAgentInput = useCallback(() => {
+    agentInputOpenRef.current = true;
+    setError(null);
+    setExpanded(false);
+    setAgentModelMenuOpen(false);
+    setAgentInputOpen(true);
+  }, []);
+
+  const measureStatusHeight = useCallback(() => {
+    const card = statusCardRef.current;
+    const content = card?.querySelector<HTMLElement>(
+      QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR,
+    );
+    if (!content) return;
+    const next = clamp(
+      Math.ceil(content.scrollHeight),
+      QUICK_TOOLTIP_STATUS_MIN_HEIGHT,
+      QUICK_TOOLTIP_STATUS_MAX_HEIGHT,
+    );
+    setStatusHeight((current) =>
+      Math.abs(current - next) < 1 ? current : next,
+    );
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!hasStatus) {
+      setStatusHeight(QUICK_TOOLTIP_STATUS_MIN_HEIGHT);
+      return;
+    }
+
+    measureStatusHeight();
+    const card = statusCardRef.current;
+    if (!card) return;
+
+    const ro = new ResizeObserver(measureStatusHeight);
+    ro.observe(card);
+    const content = card.querySelector<HTMLElement>(
+      QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR,
+    );
+    if (content) ro.observe(content);
+
+    const raf = window.requestAnimationFrame(measureStatusHeight);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [agentRunning, agentStatus, confirmation, error, hasStatus, measureStatusHeight]);
+
+  useEffect(() => {
+    if (!confirmation) return;
+    const id = window.setTimeout(() => {
+      setConfirmation((current) =>
+        current?.requestId === confirmation.requestId ? null : current,
+      );
+    }, 30_000);
+    return () => window.clearTimeout(id);
+  }, [confirmation]);
+
+  useEffect(() => {
+    invoke("resize_quick_tooltip", {
+      expanded: chatVisible,
+      agentInputOpen,
+      agentModelMenuOpen,
+      statusOpen: hasStatus,
+      statusHeight: hasStatus ? statusHeight : undefined,
+    }).catch((e) => {
+        console.error("resize_quick_tooltip failed:", e);
+    });
+  }, [agentInputOpen, agentModelMenuOpen, chatVisible, hasStatus, statusHeight]);
+
+  useEffect(() => {
+    if (!chatVisible) return;
+    const id = window.setTimeout(() => taRef.current?.focus(), 80);
+    return () => window.clearTimeout(id);
+  }, [chatVisible]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, streaming, chatVisible]);
+
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(96, Math.max(22, ta.scrollHeight)) + "px";
+  }, [prompt]);
+
+  useEffect(() => {
+    if (!agentInputOpen) return;
+    let cancelled = false;
+    let keyboardModeEnabled = false;
+    let focusTimer: number | null = null;
+    setError(null);
+    setQuickTooltipKeyboardMode(true)
+      .then(() => {
+        keyboardModeEnabled = true;
+      })
+      .catch((e) => {
+        if (!cancelled) setError(errorText(e));
+      })
+      .finally(() => {
+        if (cancelled || !agentInputOpenRef.current) {
+          if (keyboardModeEnabled) {
+            setQuickTooltipKeyboardMode(false).catch(() => {});
+          }
+          return;
+        }
+        focusTimer = window.setTimeout(() => {
+          if (agentInputOpenRef.current) {
+            agentInputRef.current?.focus();
+          }
+        }, 40);
+      });
+    return () => {
+      cancelled = true;
+      if (focusTimer !== null) {
+        window.clearTimeout(focusTimer);
+      }
+    };
+  }, [agentInputOpen, setQuickTooltipKeyboardMode]);
+
+  useEffect(() => {
+    if (!agentInputOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (
+        target.closest(
+          ".quick-tooltip-shell, .quick-tooltip-agent-card, .screenie-select-menu-portal",
+        )
+      ) {
+        return;
+      }
+      closeAgentInput();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [agentInputOpen, closeAgentInput]);
+
+  const cancelStream = () => {
+    if (streaming === null) return;
+    runSeqRef.current += 1;
+    invoke("cancel_ai").catch((e) => {
+      console.error("cancel_ai failed:", e);
+    });
+    setMessages((prev) =>
+      streaming.trim()
+        ? [...prev, { role: "assistant", content: streaming }]
+        : prev,
+    );
+    setStreaming(null);
+  };
+
+  const newChat = () => {
+    if (streaming !== null) {
+      runSeqRef.current += 1;
+      invoke("cancel_ai").catch(() => {});
+    }
+    setMessages([]);
+    setStreaming(null);
+    setError(null);
+    setPrompt("");
+  };
+
+  const toggleAgentInput = () => {
+    if (agentInputOpenRef.current) {
+      closeAgentInput();
+      return;
+    }
+    openAgentInput();
+  };
+
+  const updateModel = (model: string) => {
+    localStorage.setItem(modelStorageKey(providerInfo.provider), model);
+    setProviderInfo(readProviderInfo());
+  };
+
+  const runAi = async (history: ChatMessage[]) => {
+    const info = readProviderInfo();
+    setProviderInfo(info);
+    const runId = ++runSeqRef.current;
+    setError(null);
+    setStreaming("");
+
+    const channel = new Channel<AskEvent>();
+    let acc = "";
+    const usageBox: {
+      value: { inputTokens: number; outputTokens: number } | null;
+    } = { value: null };
+    channel.onmessage = (event) => {
+      if (runSeqRef.current !== runId) return;
+      if (event.type === "chunk") {
+        acc += event.text;
+        setStreaming(acc);
+      } else if (event.type === "usage") {
+        usageBox.value = usageTokensFromEvent(event);
+      }
+    };
+
+    try {
+      await invoke("ask_ai", {
+        provider: info.provider,
+        model: info.model,
+        responseProfile: readPreferences().aiResponseStyle,
+        messages: history,
+        imageB64: "",
+        onChunk: channel,
+      });
+      if (runSeqRef.current !== runId) return;
+      setMessages((prev) => [...prev, { role: "assistant", content: acc }]);
+      setStreaming(null);
+      const usage = usageBox.value;
+      if (usage) {
+        recordUsage({
+          provider: info.provider as ProviderId,
+          model: info.model,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+        });
+      }
+    } catch (e) {
+      if (runSeqRef.current !== runId) return;
+      setError(errorText(e));
+      if (acc.trim()) {
+        setMessages((prev) => [...prev, { role: "assistant", content: acc }]);
+      }
+      setStreaming(null);
+    }
+  };
+
+  const sendUser = (text: string) => {
+    if (streaming !== null) return;
+    const content = text.trim();
+    if (!content) return;
+    const next = [...messages, { role: "user" as const, content }];
+    setMessages(next);
+    setPrompt("");
+    void runAi(next);
+  };
+
+  const startPillDrag = (event: ReactMouseEvent<HTMLElement>) => {
+    if (event.button !== 0) return;
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (target.closest(QUICK_TOOLTIP_DRAG_BLOCKERS)) return;
+    event.preventDefault();
+    getCurrentWindow().startDragging().catch((e) => {
+      console.error("startDragging failed:", e);
+    });
+  };
+
+  const screenshotAndAsk = async () => {
+    if (streaming !== null) cancelStream();
+    closeAgentInput();
+    setExpanded(false);
+    try {
+      await invoke("resize_quick_tooltip", { expanded: false });
+      await invoke("start_capture");
+    } catch (e) {
+      console.error("start_capture failed:", e);
+      setError(errorText(e));
+    }
+  };
+
+  const openSettings = async () => {
+    if (streaming !== null) cancelStream();
+    closeAgentInput();
+    setExpanded(false);
+    try {
+      await invoke("resize_quick_tooltip", { expanded: false });
+      await invoke("show_settings_window");
+    } catch (e) {
+      console.error("show_settings_window failed:", e);
+      setError(errorText(e));
+    }
+  };
+
+  const respondToConfirmation = async (approved: boolean) => {
+    const requestId = confirmation?.requestId;
+    if (!requestId) return;
+    setConfirmation(null);
+    try {
+      await invoke("respond_to_confirmation", { requestId, approved });
+    } catch (e) {
+      console.error("respond_to_confirmation failed:", e);
+      setError(errorText(e));
+    }
+  };
+
+  const stopAgentTask = async () => {
+    try {
+      await invoke("stop_agent_task");
+      setAgentRunning(false);
+      setAgentStatus(null);
+    } catch (e) {
+      console.error("stop_agent_task failed:", e);
+      setError(errorText(e));
+    }
+  };
+
+  const submitAgentGoal = async () => {
+    const goal = agentGoal.trim();
+    if (!goal || agentRunning) return;
+    const info = readProviderInfo();
+    setProviderInfo(info);
+    agentInputOpenRef.current = false;
+    setAgentInputOpen(false);
+    setAgentModelMenuOpen(false);
+    restoreQuickTooltipKeyboardMode();
+    setAgentGoal("");
+    setAgentRunning(true);
+    setAgentStatus(null);
+    setError(null);
+    try {
+      await invoke("start_agent_task", {
+        goal,
+        provider: info.provider,
+        model: info.model,
+        visionProvider: info.provider,
+        visionModel: info.model,
+      });
+    } catch (e) {
+      setAgentRunning(false);
+      setError(errorText(e));
+      setExpanded(false);
+    }
+  };
+
+  return (
+    <div
+      className="quick-tooltip-root"
+      data-expanded={chatVisible}
+      data-agent-input-open={agentInputOpen}
+      data-status-open={hasStatus}
+      style={rootStyle}
+    >
+      <section
+        className="quick-tooltip-shell screenie-toolbar"
+        onMouseDown={startPillDrag}
+        aria-label="Screenie AI quick tooltip"
+      >
+        <div className="quick-tooltip-bar">
+          <div className="quick-tooltip-brand" aria-hidden>
+            <img src={screenieLogoUrl} alt="" className="quick-tooltip-logo" />
+          </div>
+          <div className="quick-tooltip-actions">
+            <button
+              type="button"
+              className="quick-tooltip-icon-btn"
+              onClick={() => {
+                void screenshotAndAsk();
+              }}
+              aria-label="Screenshot and ask"
+              title="Screenshot and ask"
+            >
+              <Camera size={16} strokeWidth={1.9} aria-hidden />
+            </button>
+            <button
+              type="button"
+              className="quick-tooltip-icon-btn"
+              data-active={expanded}
+              onClick={() => {
+                closeAgentInput();
+                setExpanded((v) => !v);
+              }}
+              aria-label={expanded ? "Collapse ask" : "Ask"}
+              title={expanded ? "Collapse ask" : "Ask"}
+            >
+              <MessageCircle size={16} strokeWidth={1.9} aria-hidden />
+            </button>
+            <button
+              type="button"
+              className="quick-tooltip-icon-btn"
+              data-active={agentInputOpen}
+              data-running={agentRunning}
+              onClick={toggleAgentInput}
+              aria-label="Agent task"
+              title="Agent task"
+            >
+              <Bot size={16} strokeWidth={1.9} aria-hidden />
+            </button>
+            <button
+              type="button"
+              className="quick-tooltip-icon-btn"
+              onClick={() => {
+                void openSettings();
+              }}
+              aria-label="Settings"
+              title="Settings"
+            >
+              <Settings size={16} strokeWidth={1.9} aria-hidden />
+            </button>
+          </div>
+        </div>
+        <SvgInsetBorder radius={999} strokeAlpha={0.2} />
+      </section>
+
+      {agentInputOpen && (
+        <section
+          className="quick-tooltip-agent-card screenie-toolbar"
+          aria-label="Agent task command"
+        >
+          <div
+            className="quick-tooltip-agent-form"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="quick-tooltip-agent-row">
+              <input
+                ref={agentInputRef}
+                value={agentGoal}
+                onChange={(e) => setAgentGoal(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    closeAgentInput();
+                  } else if (e.key === "Enter") {
+                    e.preventDefault();
+                    void submitAgentGoal();
+                  }
+                }}
+                placeholder="Tell Screenie what to do"
+                aria-label="Tell Screenie what to do"
+              />
+              <button
+                type="button"
+                className="quick-tooltip-agent-submit screenie-send"
+                onClick={() => {
+                  void submitAgentGoal();
+                }}
+                aria-label="Start agent task"
+                title="Start agent task"
+                disabled={!agentGoal.trim() || agentRunning}
+              >
+                <ArrowUp size={15} strokeWidth={2} aria-hidden />
+              </button>
+              <SvgInsetBorder radius={999} strokeAlpha={0.2} />
+            </div>
+            <div className="quick-tooltip-agent-model-row">
+              <div className="screenie-chat-model-select quick-tooltip-agent-model-select">
+                <CustomDropdown
+                  value={providerInfo.model}
+                  options={modelOptions}
+                  onChange={updateModel}
+                  ariaLabel={`${providerInfo.label} agent model`}
+                  variant="ghost"
+                  disabled={agentRunning}
+                  placement="below"
+                  onOpenChange={setAgentModelMenuOpen}
+                  triggerLabel={
+                    <span className="quick-tooltip-agent-model-label">
+                      <span
+                        className={`screenie-model-dot ${
+                          providerInfo.cloud ? "cloud" : "local"
+                        }`}
+                      />
+                      <span className="quick-tooltip-agent-model-provider">
+                        {providerInfo.label}
+                      </span>
+                      <span className="quick-tooltip-agent-model-name">
+                        {activeModelLabel}
+                      </span>
+                    </span>
+                  }
+                />
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {hasStatus && (
+        <section
+          ref={statusCardRef}
+          className="quick-tooltip-status-card screenie-toolbar"
+          aria-label={
+            confirmation
+              ? "Agent confirmation"
+              : error
+                ? "Screenie status"
+                : "Agent progress"
+          }
+          role={error && !confirmation ? "alert" : undefined}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          {confirmation ? (
+            <div className="quick-tooltip-confirmation">
+              <div className="quick-tooltip-status-heading">
+                <ShieldCheck size={14} strokeWidth={1.9} aria-hidden />
+                <span>Confirm action</span>
+              </div>
+              <div className="quick-tooltip-confirmation-action">
+                {formatAgentAction(confirmation.action)}
+              </div>
+              <div className="quick-tooltip-confirmation-target">
+                {formatAgentTarget(confirmation.target)}
+              </div>
+              <div className="quick-tooltip-confirmation-reason">
+                {confirmation.reason}
+              </div>
+              <div className="quick-tooltip-confirmation-actions">
+                <button
+                  type="button"
+                  className="quick-tooltip-confirm-btn"
+                  onClick={() => {
+                    void respondToConfirmation(false);
+                  }}
+                >
+                  Deny
+                </button>
+                <button
+                  type="button"
+                  className="quick-tooltip-confirm-btn primary"
+                  onClick={() => {
+                    void respondToConfirmation(true);
+                  }}
+                >
+                  Allow
+                </button>
+              </div>
+            </div>
+          ) : error ? (
+            <div className="quick-tooltip-error">
+              <div className="quick-tooltip-status-heading">
+                <AlertTriangle size={14} strokeWidth={1.9} aria-hidden />
+                <span>Error</span>
+                <button
+                  type="button"
+                  className="quick-tooltip-status-close"
+                  onClick={() => setError(null)}
+                  aria-label="Dismiss error"
+                  title="Dismiss error"
+                >
+                  <X size={13} strokeWidth={2} aria-hidden />
+                </button>
+              </div>
+              <div className="quick-tooltip-error-text">{error}</div>
+            </div>
+          ) : (
+            agentRunning && (
+              <div className="quick-tooltip-agent-progress">
+                <div className="quick-tooltip-status-heading">
+                  <Bot size={14} strokeWidth={1.9} aria-hidden />
+                  <span>Agent running</span>
+                  <button
+                    type="button"
+                    className="quick-tooltip-status-close"
+                    onClick={() => {
+                      void stopAgentTask();
+                    }}
+                    aria-label="Stop agent task"
+                    title="Stop agent task"
+                  >
+                    <Square size={12} strokeWidth={2} aria-hidden />
+                  </button>
+                </div>
+                <div className="quick-tooltip-agent-progress-text">
+                  {agentStatus
+                    ? `Step ${agentStatus.step} — ${
+                        agentStatus.reason?.trim() ||
+                        formatAgentAction(agentStatus.action)
+                      }`
+                    : "Starting…"}
+                </div>
+              </div>
+            )
+          )}
+          <SvgInsetBorder radius={18} strokeAlpha={0.18} />
+        </section>
+      )}
+
+      {chatVisible && (
+        <section
+          className="quick-tooltip-chat-panel screenie-chat-panel"
+          aria-label="Quick ask chat"
+        >
+          <div className="quick-tooltip-chat">
+            <div ref={scrollRef} className="quick-tooltip-scroll">
+              {messages.length === 0 && streaming === null && (
+                <div className="quick-tooltip-empty">Ask anything.</div>
+              )}
+              {messages.map((message, index) => (
+                <TooltipMessage key={index} message={message} />
+              ))}
+              {streaming !== null && (
+                <TooltipMessage
+                  message={{ role: "assistant", content: streaming }}
+                  streaming
+                />
+              )}
+            </div>
+
+            <div
+              className="quick-tooltip-prompt screenie-chat-prompt"
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <textarea
+                ref={taRef}
+                rows={1}
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendUser(prompt);
+                  }
+                }}
+                placeholder="Ask anything"
+                aria-label="Ask anything"
+              />
+              <div className="quick-tooltip-prompt-actions">
+                <div className="quick-tooltip-prompt-left">
+                  <button
+                    type="button"
+                    className="quick-tooltip-mini-btn screenie-chat-flat-btn"
+                    onClick={newChat}
+                    aria-label="New chat"
+                    title="New chat"
+                    disabled={!canStartNewChat}
+                  >
+                    <Plus size={13} strokeWidth={1.85} aria-hidden />
+                  </button>
+                  <div className="screenie-chat-model-select quick-tooltip-provider-label">
+                    <CustomDropdown
+                      value={providerInfo.model}
+                      options={modelOptions}
+                      onChange={updateModel}
+                      ariaLabel={`${providerInfo.label} model`}
+                      variant="ghost"
+                      disabled={streaming !== null}
+                      triggerLabel={
+                        <span className="screenie-model-label">
+                          <span
+                            className={`screenie-model-dot ${
+                              providerInfo.cloud ? "cloud" : "local"
+                            }`}
+                          />
+                          <span>{providerInfo.label}</span>
+                        </span>
+                      }
+                    />
+                  </div>
+                </div>
+                {streaming !== null ? (
+                  <button
+                    type="button"
+                    className="quick-tooltip-send screenie-send"
+                    onClick={cancelStream}
+                    aria-label="Cancel response"
+                    title="Cancel response"
+                  >
+                    <Square size={11} strokeWidth={2.1} aria-hidden />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="quick-tooltip-send screenie-send"
+                    onClick={() => sendUser(prompt)}
+                    aria-label="Send"
+                    title="Send"
+                    disabled={!prompt.trim()}
+                  >
+                    <ArrowUp size={15} strokeWidth={2} aria-hidden />
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+          <SvgInsetBorder radius={24} strokeAlpha={0.18} />
+        </section>
+      )}
+    </div>
+  );
+}
+
+function TooltipMessage({
+  message,
+  streaming,
+}: {
+  message: ChatMessage;
+  streaming?: boolean;
+}) {
+  const formatted = formatAiMarkdown(message.content);
+  const deferredFormatted = useDeferredValue(formatted);
+
+  if (message.role === "user") {
+    return <div className="quick-tooltip-user-message">{message.content}</div>;
+  }
+
+  return (
+    <div className="quick-tooltip-assistant-message">
+      <div className="screenie-md" data-density="compact">
+        {message.content ? (
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm, remarkMath]}
+            rehypePlugins={[[rehypeKatex, SCREENIE_KATEX_OPTIONS], rehypeHighlight]}
+          >
+            {deferredFormatted}
+          </ReactMarkdown>
+        ) : (
+          streaming && <span className="screenie-thinking-shimmer">Thinking...</span>
+        )}
+      </div>
+    </div>
+  );
+}

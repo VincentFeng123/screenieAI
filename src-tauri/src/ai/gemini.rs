@@ -107,10 +107,7 @@ where
                     // this branch the stream silently dies after the partial
                     // text already sent.
                     if let Some(err) = v.get("error") {
-                        let msg = err
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or(&data);
+                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or(&data);
                         return Err(AiError::Api {
                             status: 200,
                             body: super::sanitize_provider_error(msg, "gemini"),
@@ -120,8 +117,7 @@ where
                         if let Some(t) = meta.get("promptTokenCount").and_then(|n| n.as_u64()) {
                             input_tokens = t;
                         }
-                        if let Some(t) = meta.get("candidatesTokenCount").and_then(|n| n.as_u64())
-                        {
+                        if let Some(t) = meta.get("candidatesTokenCount").and_then(|n| n.as_u64()) {
                             output_tokens = t;
                         }
                     }
@@ -145,6 +141,7 @@ where
 }
 
 fn build_contents(history: &[UiMessage], image_b64: &str) -> Vec<Value> {
+    let has_image = !image_b64.trim().is_empty();
     // Image attached to the LAST user turn (matches the other providers'
     // behaviour: re-cropping mid-conversation works correctly).
     let last_user_idx = history
@@ -154,13 +151,49 @@ fn build_contents(history: &[UiMessage], image_b64: &str) -> Vec<Value> {
     let mut out = Vec::with_capacity(history.len().max(1));
     for (i, m) in history.iter().enumerate() {
         // Gemini uses "model" for the assistant role (not "assistant").
-        let role = if m.role == "assistant" { "model" } else { "user" };
+        let role = if m.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
         if i == last_user_idx {
             let text = if m.content.trim().is_empty() {
-                "Describe what's shown in this image clearly and concisely."
+                if has_image {
+                    "Describe what's shown in this image clearly and concisely."
+                } else {
+                    "How can I help?"
+                }
             } else {
                 m.content.as_str()
             };
+            if has_image {
+                out.push(json!({
+                    "role": "user",
+                    "parts": [
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": image_b64,
+                            }
+                        },
+                        { "text": text }
+                    ]
+                }));
+            } else {
+                out.push(json!({
+                    "role": "user",
+                    "parts": [{ "text": text }]
+                }));
+            }
+        } else {
+            out.push(json!({
+                "role": role,
+                "parts": [{ "text": m.content }]
+            }));
+        }
+    }
+    if last_user_idx == usize::MAX {
+        if has_image {
             out.push(json!({
                 "role": "user",
                 "parts": [
@@ -170,29 +203,15 @@ fn build_contents(history: &[UiMessage], image_b64: &str) -> Vec<Value> {
                             "data": image_b64,
                         }
                     },
-                    { "text": text }
+                    { "text": "Describe what's shown in this image clearly and concisely." }
                 ]
             }));
         } else {
             out.push(json!({
-                "role": role,
-                "parts": [{ "text": m.content }]
+                "role": "user",
+                "parts": [{ "text": "How can I help?" }]
             }));
         }
-    }
-    if last_user_idx == usize::MAX {
-        out.push(json!({
-            "role": "user",
-            "parts": [
-                {
-                    "inline_data": {
-                        "mime_type": "image/png",
-                        "data": image_b64,
-                    }
-                },
-                { "text": "Describe what's shown in this image clearly and concisely." }
-            ]
-        }));
     }
     out
 }
@@ -212,5 +231,34 @@ fn extract_text(data: &str) -> Option<String> {
         None
     } else {
         Some(combined)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> UiMessage {
+        UiMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn text_only_payload_omits_inline_data() {
+        let payload = build_contents(&[msg("user", "hello")], "");
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("inline_data"));
+        assert!(!json.contains("image/png"));
+        assert!(json.contains("hello"));
+    }
+
+    #[test]
+    fn image_payload_includes_inline_data() {
+        let payload = build_contents(&[msg("user", "what is this?")], "abc123");
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("inline_data"));
+        assert!(json.contains("\"data\":\"abc123\""));
     }
 }

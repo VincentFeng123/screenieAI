@@ -67,12 +67,14 @@ Finder, or whichever app is underneath.
 
 ## Permissions
 
-- **Screen Recording:** required for screenshot capture.
-- **Accessibility:** required for reliable global keyboard event monitoring and
-  suppression. Without it, Esc suppression over another active app is best
-  effort only.
-- **Input Monitoring:** not expected for the current Esc-only event tap path, but
-  macOS privacy prompts can vary by version and signing/notarization state.
+- **Screen Recording:** required for screenshot capture and agentic visual
+  verification.
+- **Accessibility:** required for reliable global keyboard event monitoring,
+  Esc suppression, and agentic AX tree inspection. Without it, Esc suppression
+  over another active app is best effort only and agentic mode cannot inspect
+  app controls.
+- **Input control / PostEvent:** required for agentic mouse, keyboard, and scroll
+  actions. Overlay-only Esc handling does not depend on it.
 
 ## Windows Fallback
 

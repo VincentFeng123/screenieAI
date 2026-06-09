@@ -53,6 +53,29 @@ pub struct CroppedCapture {
     pub height: u32,
 }
 
+/// Sparse-sample an RGBA capture and return true ONLY when every sampled
+/// channel is exactly 0. This matches macOS's TCC "Screen Recording denied"
+/// placeholder (uniform 0x00) without false-positives on real dark-mode
+/// captures — even a dark terminal contains some non-zero pixels. Shared by
+/// the screenshot pipeline and the agent's capture health check.
+pub(crate) fn rgba_is_blank(rgba: &image::RgbaImage) -> bool {
+    let pixels = rgba.as_raw();
+    let total = pixels.len() / 4;
+    if total == 0 {
+        return false;
+    }
+    let stride = (total / 200).max(1);
+    for i in (0..total).step_by(stride) {
+        let r = pixels[i * 4];
+        let g = pixels[i * 4 + 1];
+        let b = pixels[i * 4 + 2];
+        if r != 0 || g != 0 || b != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 pub async fn capture_rect(
     x_logical: i32,
     y_logical: i32,

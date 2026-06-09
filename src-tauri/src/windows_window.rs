@@ -69,11 +69,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CallNextHookEx, EnumChildWindows, EnumWindows, GetForegroundWindow,
-    GetCursorPos, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
-    IsWindowVisible, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GW_CHILD, GW_HWNDNEXT,
-    GWL_EXSTYLE, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    AllowSetForegroundWindow, CallNextHookEx, EnumChildWindows, EnumWindows, GetCursorPos,
+    GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    IsWindow, IsWindowVisible, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GWL_EXSTYLE, GW_CHILD,
+    GW_HWNDNEXT, HHOOK, HTTRANSPARENT, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
     MA_NOACTIVATE, MSLLHOOKSTRUCT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
@@ -338,16 +338,8 @@ pub fn set_overlay_interaction_regions(
         if let Some(s) = g.as_mut() {
             s.regions = regions
                 .into_iter()
-                .filter(|(_, _, w, h, _)| {
-                    w.is_finite() && h.is_finite() && *w > 0.5 && *h > 0.5
-                })
-                .map(|(x, y, w, h, drag)| InteractionRegion {
-                    x,
-                    y,
-                    w,
-                    h,
-                    drag,
-                })
+                .filter(|(_, _, w, h, _)| w.is_finite() && h.is_finite() && *w > 0.5 && *h > 0.5)
+                .map(|(x, y, w, h, drag)| InteractionRegion { x, y, w, h, drag })
                 .collect();
             s.passthrough_enabled = passthrough_enabled;
             Some(s.hwnd_raw)
@@ -946,10 +938,7 @@ fn screen_point_is_inside_drag_region(overlay_hwnd: HWND, screen_point: POINT) -
 }
 
 fn emit_capture_region_drag_event(phase: &'static str, dx: f64, dy: f64) {
-    let app = overlay_app()
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().cloned());
+    let app = overlay_app().lock().ok().and_then(|g| g.as_ref().cloned());
     if let Some(app) = app {
         let _ = app.emit_to(
             "overlay",
@@ -1060,10 +1049,7 @@ fn handle_capture_region_drag_event(overlay_hwnd: HWND, msg: u32, point: POINT) 
     }
 }
 
-fn overlay_should_passthrough_at_screen_point(
-    overlay_hwnd: HWND,
-    screen_point: POINT,
-) -> bool {
+fn overlay_should_passthrough_at_screen_point(overlay_hwnd: HWND, screen_point: POINT) -> bool {
     if !OVERLAY_VISIBLE.load(Ordering::Relaxed) {
         return false;
     }
@@ -1135,10 +1121,7 @@ fn sync_overlay_mouse_passthrough_on_main(hwnd_raw: isize) {
 }
 
 fn force_overlay_mouse_passthrough_on_main(hwnd_raw: isize, active: bool) {
-    let app = overlay_app()
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().cloned());
+    let app = overlay_app().lock().ok().and_then(|g| g.as_ref().cloned());
     if let Some(app) = app {
         if app
             .run_on_main_thread(move || {
@@ -1235,10 +1218,7 @@ fn clear_transparent_styles_on_main(hwnd_raw: isize) {
 }
 
 fn run_overlay_hwnd_update_on_main(hwnd_raw: isize, f: fn(HWND)) {
-    let app = overlay_app()
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().cloned());
+    let app = overlay_app().lock().ok().and_then(|g| g.as_ref().cloned());
     if let Some(app) = app {
         if app
             .run_on_main_thread(move || {

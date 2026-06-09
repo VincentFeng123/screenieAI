@@ -24,6 +24,8 @@ pub struct HistoryEntry {
     pub created_at_ms: u64,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub title: Option<String>,
     pub prompt: String,
     pub response: String,
     pub width: u32,
@@ -90,6 +92,7 @@ pub struct AddArgs {
     pub height: u32,
     pub provider: String,
     pub model: String,
+    pub title: Option<String>,
     pub prompt: String,
     pub response: String,
 }
@@ -116,7 +119,10 @@ pub fn add_entry(app_data: &Path, args: AddArgs) -> Result<HistoryEntry, History
             std::fs::write(entry_thumb_path(app_data, &id), &thumb)?;
         }
         Err(e) => {
-            eprintln!("[screenie] history thumb failed (skipping thumb file): {}", e);
+            eprintln!(
+                "[screenie] history thumb failed (skipping thumb file): {}",
+                e
+            );
         }
     }
 
@@ -128,6 +134,7 @@ pub fn add_entry(app_data: &Path, args: AddArgs) -> Result<HistoryEntry, History
             .unwrap_or(0),
         provider: args.provider,
         model: args.model,
+        title: args.title,
         prompt: args.prompt,
         response: args.response,
         width: args.width,

@@ -1,3 +1,4 @@
+pub mod agent;
 mod ai;
 mod capture;
 mod history;
@@ -11,6 +12,7 @@ use ai::{AiError, AskEvent, AskRequest, CancelFlag, UiMessage};
 use capture::{CaptureError, CroppedCapture, ScreenCapture};
 use history::{HistoryEntry, HistoryError};
 use secrets::SecretError;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{
@@ -40,6 +42,29 @@ const MAX_AI_MESSAGE_CHARS: usize = 24_000;
 const MAX_AI_TOTAL_MESSAGE_CHARS: usize = 120_000;
 pub(crate) const ALLOWED_OLLAMA_PULL_MODELS: &[&str] = &["llama3.2-vision"];
 const HOTKEY_CONFIG_FILE: &str = "hotkeys.json";
+const QUICK_TOOLTIP_CONFIG_FILE: &str = "quick_tooltip.json";
+const AGENT_KILL_SWITCH_SHORTCUT: &str = "CommandOrControl+Alt+Escape";
+// Transparent gutter between the window edge and the rounded content. A
+// rounded silhouette flush against the webview viewport gets its
+// antialiased curve truncated at the window boundary, which renders as
+// flat "clipped" segments at the pill caps and card corners. Must match
+// `--quick-tooltip-edge-pad` in src/quick-tooltip.css.
+const QUICK_TOOLTIP_EDGE_PAD: f64 = 2.0;
+const QUICK_TOOLTIP_COMPACT_W: f64 = 238.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+const QUICK_TOOLTIP_COMPACT_H: f64 = 54.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+const QUICK_TOOLTIP_AGENT_INPUT_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+const QUICK_TOOLTIP_EXPANDED_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+const QUICK_TOOLTIP_EXPANDED_H: f64 = 540.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+const QUICK_TOOLTIP_GAP: f64 = 12.0;
+const QUICK_TOOLTIP_AGENT_CARD_H: f64 = 88.0;
+// COMPACT_H already carries the gutter, so no extra EDGE_PAD term here.
+const QUICK_TOOLTIP_AGENT_INPUT_H: f64 =
+    QUICK_TOOLTIP_COMPACT_H + QUICK_TOOLTIP_GAP + QUICK_TOOLTIP_AGENT_CARD_H;
+const QUICK_TOOLTIP_AGENT_INPUT_WITH_MENU_H: f64 = 380.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+const QUICK_TOOLTIP_STATUS_H: f64 = 178.0;
+const QUICK_TOOLTIP_STATUS_MIN_H: f64 = 82.0;
+const QUICK_TOOLTIP_STATUS_MAX_H: f64 = 420.0;
+const QUICK_TOOLTIP_SCREEN_PAD: f64 = 14.0;
 
 /// Acquire a `Mutex` guard while ignoring lock poisoning.
 ///
@@ -59,6 +84,7 @@ fn lock_poison_safe<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 extern "C" {
     fn screenie_configure_main_window(window: *mut std::ffi::c_void) -> bool;
     fn screenie_configure_overlay_window(window: *mut std::ffi::c_void) -> bool;
+    fn screenie_configure_quick_tooltip_window(window: *mut std::ffi::c_void) -> bool;
     fn screenie_order_overlay_window(window: *mut std::ffi::c_void) -> bool;
     fn screenie_install_overlay_escape_monitor(callback: extern "C" fn() -> bool) -> bool;
     fn screenie_uninstall_overlay_escape_monitor();
@@ -70,10 +96,7 @@ extern "C" {
         count: usize,
         passthrough_enabled: bool,
     ) -> bool;
-    fn screenie_set_overlay_mouse_capture(
-        window: *mut std::ffi::c_void,
-        active: bool,
-    ) -> bool;
+    fn screenie_set_overlay_mouse_capture(window: *mut std::ffi::c_void, active: bool) -> bool;
     fn screenie_relay_overlay_click(
         window: *mut std::ffi::c_void,
         button_number: std::os::raw::c_int,
@@ -105,10 +128,33 @@ extern "C" {
         count: usize,
     ) -> bool;
     fn screenie_clear_overlay_vibrancy_regions();
+    fn screenie_set_quick_tooltip_vibrancy_regions(
+        window: *mut std::ffi::c_void,
+        regions: *const NativeOverlayVibrancyRegion,
+        count: usize,
+    ) -> bool;
+    fn screenie_clear_quick_tooltip_vibrancy_regions();
+    fn screenie_set_quick_tooltip_keyboard_mode(
+        window: *mut std::ffi::c_void,
+        enabled: bool,
+        restore_previous_app: bool,
+    ) -> bool;
     /// Snapshot the user's currently-frontmost app so the overlay can
     /// later forward unhandled keystrokes back to it. Called once at the
     /// start of `trigger_capture_flow`, before our own app gains focus.
     fn screenie_remember_previous_app();
+    /// Ask macOS to prompt for Screen Recording permission when no TCC
+    /// decision has been made yet. Returns the current/updated grant state.
+    fn screenie_request_screen_capture_access() -> bool;
+    /// Check Screen Recording permission without prompting. Used for tray
+    /// status text.
+    fn screenie_has_screen_capture_access() -> bool;
+    /// Ask macOS to prompt for Accessibility permission, used by agentic
+    /// observation and input safety checks.
+    fn screenie_request_accessibility_access() -> bool;
+    /// Ask macOS to prompt for input-control/event-posting permission, used by
+    /// agentic mouse, keyboard, and scroll actions.
+    fn screenie_request_post_event_access() -> bool;
     /// Drop the saved previous-app reference and clear the
     /// text-input-focused flag. Called from `close_overlay_now`.
     fn screenie_forget_previous_app();
@@ -227,8 +273,7 @@ fn tray_icon_for_theme(theme: tauri::Theme) -> Result<tauri::image::Image<'stati
     #[cfg(not(target_os = "windows"))]
     {
         let _ = theme;
-        tauri::image::Image::from_bytes(TRAY_ICON_PNG)
-            .map_err(|e| format!("decode tray icon: {e}"))
+        tauri::image::Image::from_bytes(TRAY_ICON_PNG).map_err(|e| format!("decode tray icon: {e}"))
     }
 }
 
@@ -351,6 +396,39 @@ fn configure_main_window(window: &tauri::WebviewWindow) {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn configure_main_window(_window: &tauri::WebviewWindow) {}
 
+#[cfg(target_os = "macos")]
+fn configure_quick_tooltip_window(window: &tauri::WebviewWindow) {
+    let window_clone = window.clone();
+    if let Err(e) = window.run_on_main_thread(move || {
+        let raw = match window_clone.ns_window() {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!(
+                    "[screenie] configure_quick_tooltip_window: ns_window err: {}",
+                    err
+                );
+                return;
+            }
+        };
+        if raw.is_null() {
+            eprintln!("[screenie] configure_quick_tooltip_window: null pointer");
+            return;
+        }
+        let configured = unsafe { screenie_configure_quick_tooltip_window(raw.cast()) };
+        if !configured {
+            eprintln!("[screenie] configure_quick_tooltip_window: native helper failed");
+        }
+    }) {
+        eprintln!(
+            "[screenie] configure_quick_tooltip_window: dispatch failed: {}",
+            e
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_quick_tooltip_window(_window: &tauri::WebviewWindow) {}
+
 #[derive(Default)]
 struct AppState {
     /// The most recently captured full-screen PNG, awaiting pickup by the overlay window.
@@ -387,6 +465,11 @@ struct AppState {
     /// than the next chat ask_ai or an explicit `cancel_ai` invoke from the
     /// chat window — opening or closing the overlay does not affect it.
     chat_ai_cancel: Mutex<Option<CancelFlag>>,
+    /// Cancellation flag for the persistent quick-tooltip text-only chat.
+    /// It is deliberately separate from overlay/chat so hiding the tooltip
+    /// for capture/settings can stop its stream without touching other
+    /// surfaces.
+    quick_tooltip_ai_cancel: Mutex<Option<CancelFlag>>,
     /// Last shortcut-registration error, persisted so React can query it even
     /// if the startup event fired before the settings/onboarding listener.
     hotkey_error: Mutex<Option<String>>,
@@ -406,6 +489,13 @@ struct AppState {
     /// Seed payload handed to a freshly-opened detached chat window so it
     /// can hydrate the same chat thread the user pinned.
     chat_seed: Mutex<Option<ChatSeed>>,
+    /// Pending destructive-action confirmation requests keyed by UUID.
+    agent_confirmations: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// Global agent kill-switch state shared by the loop and hotkey handler.
+    agent_abort: Arc<agent::AgentAbortState>,
+    /// Shared grounding runtime manager. It warms each configured local
+    /// endpoint once and hands runs cheap configured grounder handles.
+    grounder: agent::GrounderManager,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -452,9 +542,30 @@ struct NativeOverlayVibrancyRegion {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct HotkeyConfig {
+    #[serde(default = "default_capture_shortcut")]
     capture: String,
+    #[serde(default = "default_repeat_shortcut")]
     repeat: String,
+    #[serde(default = "default_settings_shortcut")]
     settings: String,
+    #[serde(default = "default_tooltip_shortcut")]
+    tooltip: String,
+}
+
+fn default_capture_shortcut() -> String {
+    "CommandOrControl+Shift+KeyA".to_string()
+}
+
+fn default_repeat_shortcut() -> String {
+    "CommandOrControl+Alt+KeyA".to_string()
+}
+
+fn default_settings_shortcut() -> String {
+    "CommandOrControl+Shift+Comma".to_string()
+}
+
+fn default_tooltip_shortcut() -> String {
+    "CommandOrControl+Alt+KeyT".to_string()
 }
 
 impl Default for HotkeyConfig {
@@ -463,10 +574,113 @@ impl Default for HotkeyConfig {
         // Repeat uses Alt as the third modifier so it stays a 3-key combo on
         // both platforms (Ctrl+Control on non-Mac would collide).
         Self {
-            capture: "CommandOrControl+Shift+KeyA".to_string(),
-            repeat: "CommandOrControl+Alt+KeyA".to_string(),
-            settings: "CommandOrControl+Shift+Comma".to_string(),
+            capture: default_capture_shortcut(),
+            repeat: default_repeat_shortcut(),
+            settings: default_settings_shortcut(),
+            tooltip: default_tooltip_shortcut(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct QuickTooltipPosition {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct QuickTooltipConfig {
+    visible: bool,
+    position: Option<QuickTooltipPosition>,
+}
+
+impl Default for QuickTooltipConfig {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            position: None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct QuickTooltipConfigFile {
+    visible: Option<bool>,
+    position: Option<QuickTooltipPosition>,
+}
+
+#[derive(Clone, Copy)]
+struct QuickTooltipSize {
+    width: f64,
+    height: f64,
+}
+
+impl QuickTooltipSize {
+    fn compact() -> Self {
+        Self {
+            width: QUICK_TOOLTIP_COMPACT_W,
+            height: QUICK_TOOLTIP_COMPACT_H,
+        }
+    }
+
+    fn agent_input() -> Self {
+        Self {
+            width: QUICK_TOOLTIP_AGENT_INPUT_W,
+            height: QUICK_TOOLTIP_AGENT_INPUT_H,
+        }
+    }
+
+    fn agent_input_with_menu() -> Self {
+        Self {
+            width: QUICK_TOOLTIP_AGENT_INPUT_W,
+            height: QUICK_TOOLTIP_AGENT_INPUT_WITH_MENU_H,
+        }
+    }
+
+    fn expanded() -> Self {
+        Self {
+            width: QUICK_TOOLTIP_EXPANDED_W,
+            height: QUICK_TOOLTIP_EXPANDED_H,
+        }
+    }
+
+    fn status(status_height: Option<f64>) -> Self {
+        let status_height = quick_tooltip_status_height(status_height);
+        Self {
+            width: QUICK_TOOLTIP_EXPANDED_W,
+            height: QUICK_TOOLTIP_COMPACT_H + QUICK_TOOLTIP_GAP + status_height,
+        }
+    }
+
+    fn expanded_with_status(status_height: Option<f64>) -> Self {
+        let status_height = quick_tooltip_status_height(status_height);
+        Self {
+            width: QUICK_TOOLTIP_EXPANDED_W,
+            height: QUICK_TOOLTIP_EXPANDED_H + QUICK_TOOLTIP_GAP + status_height,
+        }
+    }
+}
+
+fn quick_tooltip_status_height(status_height: Option<f64>) -> f64 {
+    status_height
+        .filter(|height| height.is_finite() && *height > 0.0)
+        .map(|height| height.clamp(QUICK_TOOLTIP_STATUS_MIN_H, QUICK_TOOLTIP_STATUS_MAX_H))
+        .unwrap_or(QUICK_TOOLTIP_STATUS_H)
+}
+
+fn constrain_quick_tooltip_size_to_monitor(
+    monitor: Option<&tauri::Monitor>,
+    size: QuickTooltipSize,
+) -> QuickTooltipSize {
+    let Some(monitor) = monitor else {
+        return size;
+    };
+    let (_, _, w, h) = monitor_logical_rect(monitor);
+    let max_w = (w - QUICK_TOOLTIP_SCREEN_PAD * 2.0).max(120.0);
+    let max_h = (h - QUICK_TOOLTIP_SCREEN_PAD * 2.0).max(44.0);
+    QuickTooltipSize {
+        width: size.width.min(max_w).max(1.0),
+        height: size.height.min(max_h).max(1.0),
     }
 }
 
@@ -474,6 +688,7 @@ fn replace_ai_cancel(state: &AppState, label: &str) -> CancelFlag {
     let next = Arc::new(AtomicBool::new(false));
     let slot = match label {
         "chat" => &state.chat_ai_cancel,
+        "quick_tooltip" => &state.quick_tooltip_ai_cancel,
         // Default to the overlay slot for any unknown label so a misrouted
         // call still cancels SOMETHING rather than silently no-op'ing.
         _ => &state.overlay_ai_cancel,
@@ -502,6 +717,14 @@ fn cancel_active_ai(state: &AppState) {
 /// `cancel_ai` IPC command when called from the chat window.
 fn cancel_active_chat_ai(state: &AppState) {
     if let Ok(g) = state.chat_ai_cancel.lock() {
+        if let Some(flag) = g.as_ref() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn cancel_active_quick_tooltip_ai(state: &AppState) {
+    if let Ok(g) = state.quick_tooltip_ai_cancel.lock() {
         if let Some(flag) = g.as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
@@ -557,6 +780,9 @@ fn load_hotkey_config(app: &AppHandle) -> HotkeyConfig {
     if cfg.settings.trim().is_empty() {
         cfg.settings = defaults.settings;
     }
+    if cfg.tooltip.trim().is_empty() {
+        cfg.tooltip = defaults.tooltip;
+    }
     cfg
 }
 
@@ -569,6 +795,61 @@ fn save_hotkey_config(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String>
     std::fs::write(&tmp, json).map_err(|e| format!("write hotkeys: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("save hotkeys: {e}"))?;
     Ok(())
+}
+
+fn quick_tooltip_config_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app_data_dir(app)?.join(QUICK_TOOLTIP_CONFIG_FILE))
+}
+
+fn load_quick_tooltip_config_from_path(path: &std::path::Path) -> QuickTooltipConfig {
+    let defaults = QuickTooltipConfig::default();
+    let Ok(bytes) = std::fs::read(path) else {
+        return defaults;
+    };
+    let Ok(raw) = serde_json::from_slice::<QuickTooltipConfigFile>(&bytes) else {
+        return defaults;
+    };
+    QuickTooltipConfig {
+        visible: raw.visible.unwrap_or(defaults.visible),
+        position: raw.position,
+    }
+}
+
+fn load_quick_tooltip_config(app: &AppHandle) -> QuickTooltipConfig {
+    let Ok(path) = quick_tooltip_config_path(app) else {
+        return QuickTooltipConfig::default();
+    };
+    load_quick_tooltip_config_from_path(&path)
+}
+
+fn save_quick_tooltip_config_to_path(
+    path: &std::path::Path,
+    cfg: &QuickTooltipConfig,
+) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create app data dir: {e}"))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let json =
+        serde_json::to_vec_pretty(cfg).map_err(|e| format!("serialize quick tooltip: {e}"))?;
+    std::fs::write(&tmp, json).map_err(|e| format!("write quick tooltip: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("save quick tooltip: {e}"))?;
+    Ok(())
+}
+
+fn save_quick_tooltip_config(app: &AppHandle, cfg: &QuickTooltipConfig) -> Result<(), String> {
+    let path = quick_tooltip_config_path(app)?;
+    save_quick_tooltip_config_to_path(&path, cfg)
+}
+
+fn update_quick_tooltip_config<F>(app: &AppHandle, update: F) -> Result<QuickTooltipConfig, String>
+where
+    F: FnOnce(&mut QuickTooltipConfig),
+{
+    let mut cfg = load_quick_tooltip_config(app);
+    update(&mut cfg);
+    save_quick_tooltip_config(app, &cfg)?;
+    Ok(cfg)
 }
 
 fn validate_ai_payload(messages: &[UiMessage], image_b64: &str) -> Result<(), AiError> {
@@ -597,10 +878,7 @@ fn validate_ai_payload(messages: &[UiMessage], image_b64: &str) -> Result<(), Ai
 /// cap, same per-message + total-history caps. Without this,
 /// `open_chat_window` stashed unbounded blobs in `AppState.chat_seed`
 /// indefinitely (until the chat window pulled them or the process exited).
-fn validate_chat_seed_payload(
-    png_b64: &str,
-    messages_json: &str,
-) -> Result<(), String> {
+fn validate_chat_seed_payload(png_b64: &str, messages_json: &str) -> Result<(), String> {
     if png_b64.len() > MAX_AI_IMAGE_B64_CHARS {
         return Err("image payload too large".into());
     }
@@ -608,8 +886,8 @@ fn validate_chat_seed_payload(
     if messages_json.len() > max_json {
         return Err("chat history too long".into());
     }
-    let parsed: Vec<UiMessage> = serde_json::from_str(messages_json)
-        .map_err(|e| format!("messages_json invalid: {e}"))?;
+    let parsed: Vec<UiMessage> =
+        serde_json::from_str(messages_json).map_err(|e| format!("messages_json invalid: {e}"))?;
     if parsed.len() > MAX_AI_MESSAGES {
         return Err("too many chat messages".into());
     }
@@ -630,6 +908,434 @@ fn validate_chat_seed_payload(
 #[tauri::command]
 fn take_pending_capture(state: tauri::State<'_, AppState>) -> Option<ScreenCapture> {
     state.pending.lock().ok().and_then(|mut g| g.take())
+}
+
+#[tauri::command]
+fn dump_observation() -> Result<Vec<agent::Element>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use agent::ScreenObserver;
+
+        agent::MacObserver::new()
+            .observe()
+            .map_err(|err| err.to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(agent::ObservationError::UnsupportedPlatform.to_string())
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentConfirmationRequestedPayload {
+    request_id: String,
+    action: agent::Action,
+    target: Option<agent::TargetSummary>,
+    reason: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentStepUpdatePayload {
+    step: u32,
+    reason: Option<String>,
+    action: agent::Action,
+}
+
+struct TauriConfirmationRequester {
+    app: AppHandle,
+    window: WebviewWindow,
+}
+
+#[async_trait::async_trait(?Send)]
+impl agent::ConfirmationRequester for TauriConfirmationRequester {
+    fn notify_step(&self, step: &agent::AgentStepReport) {
+        let payload = AgentStepUpdatePayload {
+            step: step.step,
+            reason: step.planner_reason.clone(),
+            action: step.action.clone(),
+        };
+        if let Err(err) = self.window.emit("agent-step-update", payload) {
+            eprintln!("[screenie] emit agent step update failed: {err}");
+        }
+    }
+
+    async fn request_confirmation(
+        &self,
+        request: agent::AgentConfirmationRequest,
+        timeout: std::time::Duration,
+        abort: &agent::AgentAbortState,
+    ) -> agent::ConfirmationOutcome {
+        if abort.is_aborted() {
+            return agent::ConfirmationOutcome {
+                request_id: None,
+                status: agent::ConfirmationStatus::Aborted,
+            };
+        }
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let Some(state) = self.app.try_state::<AppState>() else {
+            return agent::ConfirmationOutcome {
+                request_id: Some(request_id),
+                status: agent::ConfirmationStatus::Unavailable,
+            };
+        };
+        {
+            let mut pending = lock_poison_safe(&state.agent_confirmations);
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let payload = AgentConfirmationRequestedPayload {
+            request_id: request_id.clone(),
+            action: request.action,
+            target: request.target,
+            reason: request.reason,
+        };
+        if let Err(err) = self.window.emit("agent-confirmation-requested", payload) {
+            if let Some(state) = self.app.try_state::<AppState>() {
+                let _ = lock_poison_safe(&state.agent_confirmations).remove(&request_id);
+            }
+            eprintln!("[screenie] emit agent confirmation failed: {err}");
+            return agent::ConfirmationOutcome {
+                request_id: Some(request_id),
+                status: agent::ConfirmationStatus::Unavailable,
+            };
+        }
+
+        let status = tokio::select! {
+            biased;
+            _ = abort.notified() => agent::ConfirmationStatus::Aborted,
+            result = rx => {
+                if abort.is_aborted() {
+                    agent::ConfirmationStatus::Aborted
+                } else {
+                    match result {
+                        Ok(true) => agent::ConfirmationStatus::Approved,
+                        Ok(false) => agent::ConfirmationStatus::Denied,
+                        Err(_) => agent::ConfirmationStatus::Unavailable,
+                    }
+                }
+            }
+            _ = tokio::time::sleep(timeout) => {
+                if abort.is_aborted() {
+                    agent::ConfirmationStatus::Aborted
+                } else {
+                    agent::ConfirmationStatus::TimedOut
+                }
+            }
+        };
+
+        if let Some(state) = self.app.try_state::<AppState>() {
+            let _ = lock_poison_safe(&state.agent_confirmations).remove(&request_id);
+        }
+
+        agent::ConfirmationOutcome {
+            request_id: Some(request_id),
+            status,
+        }
+    }
+}
+
+fn drain_pending_agent_confirmations(state: &AppState) -> usize {
+    let pending = {
+        let mut guard = lock_poison_safe(&state.agent_confirmations);
+        std::mem::take(&mut *guard)
+    };
+    let count = pending.len();
+    for (_, sender) in pending {
+        let _ = sender.send(false);
+    }
+    count
+}
+
+fn abort_agent_runs(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.agent_abort.abort();
+        let drained = drain_pending_agent_confirmations(&state);
+        eprintln!("[screenie] agent abort requested; drained {drained} pending confirmations");
+    }
+}
+
+#[tauri::command]
+fn stop_agent_task(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    require_window(&window, "quick_tooltip")?;
+    abort_agent_runs(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn respond_to_confirmation(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    require_window(&window, "quick_tooltip")?;
+    let sender = lock_poison_safe(&state.agent_confirmations).remove(&request_id);
+    match sender {
+        Some(sender) => {
+            let _ = sender.send(approved);
+            Ok(())
+        }
+        None => Err("confirmation request not found".into()),
+    }
+}
+
+#[tauri::command]
+fn run_stub_agent(
+    app: AppHandle,
+    window: WebviewWindow,
+    options: Option<agent::StubAgentOptions>,
+) -> Result<agent::AgentRunReport, String> {
+    if window.label() != "main" && window.label() != "quick_tooltip" {
+        return Err("command not allowed from this window".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        request_agent_permissions(&app)?;
+        let mut options = options.unwrap_or_default();
+        let (text_config, vision_config, abort) = prepare_stub_agent_run(&app, &mut options)?;
+        Ok(tauri::async_runtime::block_on(run_prepared_stub_agent(
+            app,
+            window,
+            options,
+            text_config,
+            vision_config,
+            abort,
+        )))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = options;
+        Err(agent::ObservationError::UnsupportedPlatform.to_string())
+    }
+}
+
+fn agent_task_options_from_goal(
+    goal: &str,
+    provider: Option<String>,
+    model: Option<String>,
+    vision_provider: Option<String>,
+    vision_model: Option<String>,
+) -> Option<agent::StubAgentOptions> {
+    let goal = goal.trim();
+    if goal.is_empty() {
+        return None;
+    }
+    Some(agent::StubAgentOptions {
+        goal: Some(goal.to_string()),
+        provider,
+        model,
+        vision_provider,
+        vision_model,
+        ..Default::default()
+    })
+}
+
+#[tauri::command]
+fn start_agent_task(
+    app: AppHandle,
+    window: WebviewWindow,
+    goal: String,
+    provider: Option<String>,
+    model: Option<String>,
+    vision_provider: Option<String>,
+    vision_model: Option<String>,
+) -> Result<(), String> {
+    require_window(&window, "quick_tooltip")?;
+    let Some(mut options) =
+        agent_task_options_from_goal(&goal, provider, model, vision_provider, vision_model)
+    else {
+        return Ok(());
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        request_agent_permissions(&app)?;
+        agent_capture_health()?;
+        set_quick_tooltip_keyboard_mode_on_main(&window, false, false)?;
+        let (text_config, vision_config, abort) = prepare_stub_agent_run(&app, &mut options)?;
+        let panic_report_options = options.clone().resolve();
+        let app_for_task = app.clone();
+        let window_for_task = window.clone();
+        let window_for_event = window.clone();
+        std::thread::Builder::new()
+            .name("screenie-agent-task".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(180));
+                let report = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tauri::async_runtime::block_on(run_prepared_stub_agent(
+                        app_for_task,
+                        window_for_task,
+                        options,
+                        text_config,
+                        vision_config,
+                        abort,
+                    ))
+                })) {
+                    Ok(report) => report,
+                    Err(payload) => {
+                        let reason = format!(
+                            "agent task panicked: {}",
+                            panic_payload_message(payload.as_ref())
+                        );
+                        eprintln!("[screenie] {reason}");
+                        agent::AgentRunReport {
+                            status: agent::AgentRunStatus::Failed,
+                            options: panic_report_options,
+                            steps: Vec::new(),
+                            failure_reason: Some(reason),
+                        }
+                    }
+                };
+                if let Err(err) = window_for_event.emit("agent-task-finished", report.clone()) {
+                    eprintln!("[screenie] emit agent task finished failed: {err}");
+                }
+                eprintln!(
+                    "[screenie] agent task finished status={:?} steps={} failure={:?}",
+                    report.status,
+                    report.steps.len(),
+                    report.failure_reason
+                );
+            })
+            .map_err(|e| format!("start agent task: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, window, options);
+        Err(agent::ObservationError::UnsupportedPlatform.to_string())
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".into()
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_stub_agent_run(
+    app: &AppHandle,
+    options: &mut agent::StubAgentOptions,
+) -> Result<
+    (
+        ai::decision::DecisionClientConfig,
+        ai::decision::DecisionClientConfig,
+        Arc<agent::AgentAbortState>,
+    ),
+    String,
+> {
+    let (text_config, vision_config) = resolve_stub_agent_decision_configs(options)?;
+    let state = app.state::<AppState>();
+    state.agent_abort.reset();
+    let _ = drain_pending_agent_confirmations(&state);
+    Ok((text_config, vision_config, state.agent_abort.clone()))
+}
+
+#[cfg(target_os = "macos")]
+async fn run_prepared_stub_agent(
+    app: AppHandle,
+    window: WebviewWindow,
+    options: agent::StubAgentOptions,
+    text_config: ai::decision::DecisionClientConfig,
+    vision_config: ai::decision::DecisionClientConfig,
+    abort: Arc<agent::AgentAbortState>,
+) -> agent::AgentRunReport {
+    let resolved = options.resolve();
+    let state = app.state::<AppState>();
+    let grounder = state
+        .grounder
+        .local_http_grounder(resolved.grounder_config());
+    let fallback_state = agent::VisionFallbackState::new();
+    let base_observer = agent::MacObserver::new();
+    let observer = agent::VisionFallbackObserver::macos(
+        base_observer.clone(),
+        fallback_state.clone(),
+        agent::VisionFallbackOptions::from(&resolved),
+    );
+    let planner = agent::ContextAwareLlmPlanner::new(text_config, vision_config, fallback_state);
+    let confirmations = TauriConfirmationRequester { app, window };
+    agent::run_stub_agent_loop_with_grounder(
+        &observer,
+        &planner,
+        options,
+        agent::EnigoBackendFactory,
+        &base_observer,
+        &confirmations,
+        &grounder,
+        abort.as_ref(),
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_stub_agent_decision_configs(
+    options: &mut agent::StubAgentOptions,
+) -> Result<
+    (
+        ai::decision::DecisionClientConfig,
+        ai::decision::DecisionClientConfig,
+    ),
+    String,
+> {
+    let provider = option_string(&options.provider).unwrap_or_else(|| "anthropic".into());
+    let default_model = provider_default_model(&provider).map_err(|err| err.to_string())?;
+    let model = option_string(&options.model).unwrap_or_else(|| default_model.to_string());
+    let vision_provider =
+        option_string(&options.vision_provider).unwrap_or_else(|| provider.clone());
+    let vision_default_model =
+        provider_default_model(&vision_provider).map_err(|err| err.to_string())?;
+    let vision_model =
+        option_string(&options.vision_model).unwrap_or_else(|| vision_default_model.to_string());
+
+    options.provider = Some(provider.clone());
+    options.model = Some(model.clone());
+    options.vision_provider = Some(vision_provider.clone());
+    options.vision_model = Some(vision_model.clone());
+
+    Ok((
+        ai::decision::DecisionClientConfig {
+            api_key: api_key_for_provider(&provider)?,
+            provider,
+            model,
+        },
+        ai::decision::DecisionClientConfig {
+            api_key: api_key_for_provider(&vision_provider)?,
+            provider: vision_provider,
+            model: vision_model,
+        },
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn option_string(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+#[cfg(target_os = "macos")]
+fn api_key_for_provider(provider: &str) -> Result<String, String> {
+    match secret_name_for_provider(provider).map_err(|err| err.to_string())? {
+        Some(name) => Ok(secrets::get(name)
+            .map_err(|err| AiError::Keyring(err.to_string()).to_string())?
+            .unwrap_or_default()),
+        None => Ok(String::new()),
+    }
 }
 
 #[tauri::command]
@@ -849,7 +1555,8 @@ async fn ask_ai(
     image_b64: String,
     on_chunk: Channel<AskEvent>,
 ) -> Result<(), AiError> {
-    if window.label() != "overlay" && window.label() != "chat" {
+    if window.label() != "overlay" && window.label() != "chat" && window.label() != "quick_tooltip"
+    {
         return Err(AiError::Http("command not allowed from this window".into()));
     }
     let provider = provider.unwrap_or_else(|| "anthropic".to_string());
@@ -1010,9 +1717,7 @@ fn close_overlay_now(app: &AppHandle) {
         state.overlay_alive.store(false, Ordering::Relaxed);
         // Bump the capture generation so any in-flight capture task sees
         // its snapshot is now stale and bails before re-showing the overlay.
-        state
-            .capture_generation
-            .fetch_add(1, Ordering::SeqCst);
+        state.capture_generation.fetch_add(1, Ordering::SeqCst);
         cancel_active_ai(&state);
     }
     #[cfg(target_os = "macos")]
@@ -1103,10 +1808,49 @@ fn set_overlay_vibrancy_regions(
 }
 
 #[tauri::command]
-fn set_overlay_text_input_focused(
+fn set_quick_tooltip_vibrancy_regions(
     window: WebviewWindow,
-    focused: bool,
+    regions: Vec<OverlayVibrancyRegion>,
 ) -> Result<(), String> {
+    require_window(&window, "quick_tooltip")?;
+    #[cfg(target_os = "macos")]
+    {
+        set_quick_tooltip_vibrancy_regions_on_main(&window, regions);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = regions;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_quick_tooltip_keyboard_mode(
+    window: WebviewWindow,
+    enabled: bool,
+    restore_previous_app: Option<bool>,
+) -> Result<(), String> {
+    require_window(&window, "quick_tooltip")?;
+    #[cfg(target_os = "macos")]
+    {
+        set_quick_tooltip_keyboard_mode_on_main(
+            &window,
+            enabled,
+            restore_previous_app.unwrap_or(false),
+        )?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = restore_previous_app;
+        if enabled {
+            let _ = window.set_focus();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_overlay_text_input_focused(window: WebviewWindow, focused: bool) -> Result<(), String> {
     require_window(&window, "overlay")?;
     #[cfg(target_os = "macos")]
     {
@@ -1203,12 +1947,13 @@ fn relay_overlay_wheel(
 #[tauri::command]
 fn cancel_ai(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
     let label = window.label();
-    if label != "overlay" && label != "chat" {
+    if label != "overlay" && label != "chat" && label != "quick_tooltip" {
         return Err("command not allowed from this window".into());
     }
     if let Some(state) = app.try_state::<AppState>() {
         match label {
             "chat" => cancel_active_chat_ai(&state),
+            "quick_tooltip" => cancel_active_quick_tooltip_ai(&state),
             _ => cancel_active_ai(&state),
         }
     }
@@ -1246,8 +1991,7 @@ fn hide_overlay_window(app: &AppHandle) {
 /// Settings → Privacy → Graphics capture (`ms-settings:privacy-graphicscapture`).
 /// Older platforms / Linux silently no-op. Surfaced from the overlay's
 /// permission banner.
-#[tauri::command]
-async fn open_screen_settings() {
+fn open_screen_settings_now() {
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("/usr/bin/open")
@@ -1258,6 +2002,103 @@ async fn open_screen_settings() {
     {
         windows_window::open_screen_settings();
     }
+}
+
+#[tauri::command]
+async fn open_screen_settings() {
+    open_screen_settings_now();
+}
+
+#[cfg(target_os = "macos")]
+fn request_screen_recording_prompt_if_needed() -> bool {
+    unsafe { screenie_request_screen_capture_access() }
+}
+
+#[cfg(target_os = "macos")]
+fn screen_recording_access_granted() -> bool {
+    unsafe { screenie_has_screen_capture_access() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn screen_recording_access_granted() -> bool {
+    true
+}
+
+/// Probe an actual display capture for the macOS TCC "Screen Recording
+/// denied" all-black placeholder. `CGPreflightScreenCaptureAccess()` can stay
+/// stale-true after the binary moved (e.g. running a copied project folder),
+/// so only a real capture reveals the broken grant.
+#[cfg(target_os = "macos")]
+fn agent_capture_health() -> Result<(), String> {
+    const SCREEN_RECORDING_BROKEN: &str = "Screen Recording is not working for this build. If you run the app from a copied or moved folder, macOS treats it as a new app. Fix: run \"tccutil reset ScreenCapture com.screenieai.app\" in Terminal, restart \"npm run tauri dev\", approve the prompt, then fully quit and reopen the app. Or add the new binary manually in System Settings > Privacy & Security > Screen Recording.";
+
+    let monitors =
+        xcap::Monitor::all().map_err(|err| format!("display lookup failed: {err}"))?;
+    let Some(monitor) = monitors.into_iter().next() else {
+        return Err("no display available for the agent capture health check".into());
+    };
+    let image = monitor
+        .capture_image()
+        .map_err(|err| format!("{SCREEN_RECORDING_BROKEN} (capture failed: {err})"))?;
+    if capture::rgba_is_blank(&image) {
+        return Err(SCREEN_RECORDING_BROKEN.into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn request_agent_permissions(app: &AppHandle) -> Result<(), String> {
+    let screen_recording = request_screen_recording_prompt_if_needed();
+    let _ = refresh_tray_menu(app);
+    let accessibility = unsafe { screenie_request_accessibility_access() };
+    let input_control = unsafe { screenie_request_post_event_access() };
+
+    if screen_recording && accessibility && input_control {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    if !screen_recording {
+        missing.push("Screen Recording");
+    }
+    if !accessibility {
+        missing.push("Accessibility");
+    }
+    if !input_control {
+        missing.push("Input Monitoring / event control");
+    }
+
+    Err(format!(
+        "Agentic mode needs {} before it can run. Approve the macOS permission prompt(s), then try again. If you just enabled Screen Recording, quit and reopen Screenie AI before retrying so macOS applies the new grant.",
+        join_permission_names(&missing)
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn join_permission_names(names: &[&'static str]) -> String {
+    match names {
+        [] => "the required permissions".into(),
+        [one] => (*one).into(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let mut joined = names[..names.len() - 1].join(", ");
+            joined.push_str(", and ");
+            joined.push_str(names[names.len() - 1]);
+            joined
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_screen_recording_prompt_if_needed() -> bool {
+    true
+}
+
+#[tauri::command]
+fn request_screen_recording_permission(app: AppHandle) -> bool {
+    let granted = request_screen_recording_prompt_if_needed();
+    let _ = refresh_tray_menu(&app);
+    granted
 }
 
 /// Fully quit the app from Settings or the tray menu.
@@ -1309,6 +2150,7 @@ fn restore_main_window(app: &AppHandle, emit_tutorial_complete: bool) {
 }
 
 fn finish_overlay_session(app: &AppHandle) {
+    let mut restored_main_surface = false;
     if let Some(state) = app.try_state::<AppState>() {
         let tutorial = state.tutorial_mode.swap(false, Ordering::Relaxed);
         let restore_main = state
@@ -1316,7 +2158,11 @@ fn finish_overlay_session(app: &AppHandle) {
             .swap(false, Ordering::Relaxed);
         if tutorial || restore_main {
             restore_main_window(app, tutorial);
+            restored_main_surface = true;
         }
+    }
+    if !restored_main_surface {
+        restore_quick_tooltip_if_enabled(app);
     }
 }
 
@@ -1337,9 +2183,7 @@ async fn show_settings_window(app: AppHandle) -> Result<(), String> {
                 // Same race fix as `close_overlay_now`: invalidate any
                 // in-flight capture so it doesn't re-show the overlay
                 // after Settings has taken focus.
-                state
-                    .capture_generation
-                    .fetch_add(1, Ordering::SeqCst);
+                state.capture_generation.fetch_add(1, Ordering::SeqCst);
                 cancel_active_ai(&state);
             }
             #[cfg(target_os = "macos")]
@@ -1375,6 +2219,7 @@ async fn hide_settings_window(app: AppHandle) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(ActivationPolicy::Accessory);
+    restore_quick_tooltip_if_enabled(&app);
     Ok(())
 }
 
@@ -1424,7 +2269,9 @@ async fn launch_ollama(window: WebviewWindow) -> Result<(), String> {
                 continue;
             };
             let dir = if env_key == "LOCALAPPDATA" {
-                std::path::PathBuf::from(&base).join("Programs").join("Ollama")
+                std::path::PathBuf::from(&base)
+                    .join("Programs")
+                    .join("Ollama")
             } else {
                 std::path::PathBuf::from(&base).join("Ollama")
             };
@@ -1469,7 +2316,10 @@ fn configure_overlay_window_on_main(window: &tauri::WebviewWindow) {
     let raw = match window.ns_window() {
         Ok(p) => p,
         Err(err) => {
-            eprintln!("[screenie] configure_overlay_window: ns_window err: {}", err);
+            eprintln!(
+                "[screenie] configure_overlay_window: ns_window err: {}",
+                err
+            );
             return;
         }
     };
@@ -1523,7 +2373,10 @@ fn set_overlay_interaction_regions_on_main(
         let raw = match window_clone.ns_window() {
             Ok(p) => p,
             Err(err) => {
-                eprintln!("[screenie] set_overlay_interaction_regions: ns_window err: {}", err);
+                eprintln!(
+                    "[screenie] set_overlay_interaction_regions: ns_window err: {}",
+                    err
+                );
                 return;
             }
         };
@@ -1606,13 +2459,111 @@ fn set_overlay_vibrancy_regions_on_main(
 }
 
 #[cfg(target_os = "macos")]
+fn set_quick_tooltip_vibrancy_regions_on_main(
+    window: &tauri::WebviewWindow,
+    regions: Vec<OverlayVibrancyRegion>,
+) {
+    let window_clone = window.clone();
+    let native_regions: Vec<NativeOverlayVibrancyRegion> = regions
+        .into_iter()
+        .filter(|r| {
+            r.x.is_finite()
+                && r.y.is_finite()
+                && r.w.is_finite()
+                && r.h.is_finite()
+                && r.w > 0.5
+                && r.h > 0.5
+        })
+        .map(|r| NativeOverlayVibrancyRegion {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+            radius: r.radius,
+        })
+        .collect();
+
+    if let Err(e) = window.run_on_main_thread(move || {
+        let raw = match window_clone.ns_window() {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!(
+                    "[screenie] set_quick_tooltip_vibrancy_regions: ns_window err: {}",
+                    err
+                );
+                return;
+            }
+        };
+        let ok = unsafe {
+            screenie_set_quick_tooltip_vibrancy_regions(
+                raw.cast(),
+                native_regions.as_ptr(),
+                native_regions.len(),
+            )
+        };
+        if !ok {
+            eprintln!("[screenie] set_quick_tooltip_vibrancy_regions: native helper failed");
+        }
+    }) {
+        eprintln!(
+            "[screenie] set_quick_tooltip_vibrancy_regions: dispatch failed: {}",
+            e
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_quick_tooltip_keyboard_mode_on_main(
+    window: &tauri::WebviewWindow,
+    enabled: bool,
+    restore_previous_app: bool,
+) -> Result<(), String> {
+    let window_clone = window.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    window
+        .run_on_main_thread(move || {
+            let ok = match window_clone.ns_window() {
+                Ok(raw) if !raw.is_null() => unsafe {
+                    screenie_set_quick_tooltip_keyboard_mode(
+                        raw.cast(),
+                        enabled,
+                        restore_previous_app,
+                    )
+                },
+                Ok(_) => {
+                    eprintln!("[screenie] set_quick_tooltip_keyboard_mode: null pointer");
+                    false
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[screenie] set_quick_tooltip_keyboard_mode: ns_window err: {}",
+                        err
+                    );
+                    false
+                }
+            };
+            let _ = tx.send(ok);
+        })
+        .map_err(|e| format!("set quick tooltip keyboard mode dispatch: {e}"))?;
+
+    match rx.recv_timeout(std::time::Duration::from_millis(800)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("set quick tooltip keyboard mode failed".into()),
+        Err(e) => Err(format!("set quick tooltip keyboard mode response: {e}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn set_overlay_mouse_capture_on_main(window: &tauri::WebviewWindow, active: bool) {
     let window_clone = window.clone();
     if let Err(e) = window.run_on_main_thread(move || {
         let raw = match window_clone.ns_window() {
             Ok(p) => p,
             Err(err) => {
-                eprintln!("[screenie] set_overlay_mouse_capture: ns_window err: {}", err);
+                eprintln!(
+                    "[screenie] set_overlay_mouse_capture: ns_window err: {}",
+                    err
+                );
                 return;
             }
         };
@@ -1621,7 +2572,10 @@ fn set_overlay_mouse_capture_on_main(window: &tauri::WebviewWindow, active: bool
             eprintln!("[screenie] set_overlay_mouse_capture: native helper failed");
         }
     }) {
-        eprintln!("[screenie] set_overlay_mouse_capture: dispatch failed: {}", e);
+        eprintln!(
+            "[screenie] set_overlay_mouse_capture: dispatch failed: {}",
+            e
+        );
     }
 }
 
@@ -1632,7 +2586,10 @@ fn relay_overlay_pointer_click_on_main(window: &tauri::WebviewWindow, button: i3
         let raw = match window_clone.ns_window() {
             Ok(p) => p,
             Err(err) => {
-                eprintln!("[screenie] relay_overlay_pointer_click: ns_window err: {}", err);
+                eprintln!(
+                    "[screenie] relay_overlay_pointer_click: ns_window err: {}",
+                    err
+                );
                 return;
             }
         };
@@ -1665,12 +2622,7 @@ fn relay_overlay_wheel_on_main(
             }
         };
         let ok = unsafe {
-            screenie_relay_overlay_wheel(
-                raw.cast(),
-                delta_x,
-                delta_y,
-                phase as std::os::raw::c_int,
-            )
+            screenie_relay_overlay_wheel(raw.cast(), delta_x, delta_y, phase as std::os::raw::c_int)
         };
         if !ok {
             eprintln!("[screenie] relay_overlay_wheel: native helper failed");
@@ -1694,12 +2646,7 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
         configure_overlay_window_on_main(&window_clone);
         if let Ok(raw) = window_clone.ns_window() {
             let _ = unsafe {
-                screenie_set_overlay_interaction_regions(
-                    raw.cast(),
-                    std::ptr::null(),
-                    0,
-                    false,
-                )
+                screenie_set_overlay_interaction_regions(raw.cast(), std::ptr::null(), 0, false)
             };
         }
         let _ = window_clone.show();
@@ -1751,9 +2698,7 @@ fn show_overlay_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     if let Err(e) = app.run_on_main_thread(|| {
         let _ = windows_window::install_overlay_escape_monitor();
     }) {
-        eprintln!(
-            "[screenie] show_overlay_window: main-thread dispatch failed: {e}"
-        );
+        eprintln!("[screenie] show_overlay_window: main-thread dispatch failed: {e}");
         // Fall back to in-place install — hooks won't fire, but the
         // overlay at least appears so the user can dismiss it.
         let _ = windows_window::install_overlay_escape_monitor();
@@ -1790,6 +2735,9 @@ impl Drop for CaptureInProgressGuard {
 /// same label — that race was the source of "Rust cannot catch foreign
 /// exceptions" aborts when the second WebviewWindowBuilder hit Cocoa.
 async fn trigger_capture_flow(app: AppHandle) {
+    let _ = request_screen_recording_prompt_if_needed();
+    let _ = refresh_tray_menu(&app);
+
     // Acquire-and-arm: only build the guard once we win the
     // compare-exchange. If another capture is already in flight, return
     // without arming so we don't accidentally clear someone else's flag.
@@ -1832,7 +2780,11 @@ async fn capture_and_show_overlay(app: AppHandle) {
     // and we must not resurrect the overlay afterward.
     let session_generation = app
         .try_state::<AppState>()
-        .map(|s| s.capture_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1))
+        .map(|s| {
+            s.capture_generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1)
+        })
         .unwrap_or(0);
     let session_cancelled = |app: &AppHandle| -> bool {
         app.try_state::<AppState>()
@@ -1846,6 +2798,19 @@ async fn capture_and_show_overlay(app: AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         cancel_active_ai(&state);
     }
+
+    let quick_tooltip_hidden = hide_quick_tooltip_temporarily(&app);
+    #[cfg(target_os = "macos")]
+    if quick_tooltip_hidden {
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        if session_cancelled(&app) {
+            eprintln!("[screenie] capture cancelled during tooltip-hide settle");
+            finish_overlay_session(&app);
+            return;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = quick_tooltip_hidden;
 
     // Tutorial mode: briefly hide the onboarding window so the screenshot
     // doesn't include it. The overlay's close handler restores the window
@@ -2024,10 +2989,7 @@ async fn capture_and_show_overlay(app: AppHandle) {
             logical_x as f64,
             logical_y as f64,
         ));
-        let _ = existing.set_size(LogicalSize::<f64>::new(
-            logical_w as f64,
-            logical_h as f64,
-        ));
+        let _ = existing.set_size(LogicalSize::<f64>::new(logical_w as f64, logical_h as f64));
         show_overlay_window(&app, &existing);
         let _ = existing.emit("overlay-refresh", ());
         let existing_for_retry = existing.clone();
@@ -2059,10 +3021,7 @@ async fn capture_and_show_overlay(app: AppHandle) {
                 logical_x as f64,
                 logical_y as f64,
             ));
-            let _ = w.set_size(LogicalSize::<f64>::new(
-                logical_w as f64,
-                logical_h as f64,
-            ));
+            let _ = w.set_size(LogicalSize::<f64>::new(logical_w as f64, logical_h as f64));
             let app_for_event = app.clone();
             w.on_window_event(move |event| match event {
                 WindowEvent::Destroyed => {
@@ -2088,17 +3047,310 @@ async fn capture_and_show_overlay(app: AppHandle) {
         Err(e) => {
             eprintln!("[screenie] overlay window creation failed: {}", e);
             let _ = app.emit("capture-error", format!("overlay window: {e}"));
+            finish_overlay_session(&app);
         }
     }
+}
+
+fn monitor_logical_rect(monitor: &tauri::Monitor) -> (f64, f64, f64, f64) {
+    let scale = monitor.scale_factor();
+    let pos = monitor.position();
+    let size = monitor.size();
+    (
+        pos.x as f64 / scale,
+        pos.y as f64 / scale,
+        size.width as f64 / scale,
+        size.height as f64 / scale,
+    )
+}
+
+fn clamp_axis(value: f64, min: f64, max: f64) -> f64 {
+    if max <= min {
+        min
+    } else {
+        value.clamp(min, max)
+    }
+}
+
+fn clamp_quick_tooltip_to_monitor(
+    monitor: Option<tauri::Monitor>,
+    position: QuickTooltipPosition,
+    size: QuickTooltipSize,
+) -> QuickTooltipPosition {
+    let Some(monitor) = monitor else {
+        return position;
+    };
+    let (x, y, w, h) = monitor_logical_rect(&monitor);
+    let min_x = x + QUICK_TOOLTIP_SCREEN_PAD;
+    let min_y = y + QUICK_TOOLTIP_SCREEN_PAD;
+    let max_x = x + w - size.width - QUICK_TOOLTIP_SCREEN_PAD;
+    let max_y = y + h - size.height - QUICK_TOOLTIP_SCREEN_PAD;
+    QuickTooltipPosition {
+        x: clamp_axis(position.x as f64, min_x, max_x).round() as i32,
+        y: clamp_axis(position.y as f64, min_y, max_y).round() as i32,
+    }
+}
+
+fn default_quick_tooltip_position(app: &AppHandle, size: QuickTooltipSize) -> QuickTooltipPosition {
+    let monitor = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| app.available_monitors().ok().and_then(|mut v| v.pop()));
+    let Some(monitor) = monitor else {
+        return QuickTooltipPosition { x: 24, y: 24 };
+    };
+    let (x, y, w, h) = monitor_logical_rect(&monitor);
+    let _ = h;
+    #[cfg(target_os = "macos")]
+    let position = QuickTooltipPosition {
+        x: (x + w - size.width - 18.0).round() as i32,
+        y: (y + 18.0).round() as i32,
+    };
+    #[cfg(target_os = "windows")]
+    let position = QuickTooltipPosition {
+        x: (x + w - size.width - 18.0).round() as i32,
+        y: (y + h - size.height - 18.0).round() as i32,
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let position = QuickTooltipPosition {
+        x: (x + w - size.width - 18.0).round() as i32,
+        y: (y + h - size.height - 18.0).round() as i32,
+    };
+    clamp_quick_tooltip_to_monitor(Some(monitor), position, size)
+}
+
+fn quick_tooltip_current_logical_position(window: &WebviewWindow) -> Option<QuickTooltipPosition> {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    window
+        .outer_position()
+        .ok()
+        .map(|pos| QuickTooltipPosition {
+            x: (pos.x as f64 / scale).round() as i32,
+            y: (pos.y as f64 / scale).round() as i32,
+        })
+}
+
+fn quick_tooltip_current_logical_size(window: &WebviewWindow) -> Option<QuickTooltipSize> {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    window.outer_size().ok().map(|size| QuickTooltipSize {
+        width: size.width as f64 / scale,
+        height: size.height as f64 / scale,
+    })
+}
+
+fn clamp_quick_tooltip_window_to_monitor(window: &WebviewWindow) -> Option<QuickTooltipPosition> {
+    let position = quick_tooltip_current_logical_position(window)?;
+    let requested_size =
+        quick_tooltip_current_logical_size(window).unwrap_or_else(QuickTooltipSize::compact);
+    let monitor = window.current_monitor().ok().flatten();
+    let size = constrain_quick_tooltip_size_to_monitor(monitor.as_ref(), requested_size);
+    let position = clamp_quick_tooltip_to_monitor(monitor, position, size);
+    let _ = window.set_size(LogicalSize::<f64>::new(size.width, size.height));
+    let _ = window.set_position(LogicalPosition::<f64>::new(
+        position.x as f64,
+        position.y as f64,
+    ));
+    Some(position)
+}
+
+fn save_quick_tooltip_moved_position(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    physical_position: tauri::PhysicalPosition<i32>,
+) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let position = QuickTooltipPosition {
+        x: (physical_position.x as f64 / scale).round() as i32,
+        y: (physical_position.y as f64 / scale).round() as i32,
+    };
+    let monitor = window.current_monitor().ok().flatten();
+    let size = quick_tooltip_current_logical_size(window).unwrap_or_else(QuickTooltipSize::compact);
+    let size = constrain_quick_tooltip_size_to_monitor(monitor.as_ref(), size);
+    let position = clamp_quick_tooltip_to_monitor(monitor, position, size);
+    if let Err(e) = update_quick_tooltip_config(app, |cfg| {
+        cfg.position = Some(position);
+    }) {
+        eprintln!("[screenie] save quick tooltip position failed: {e}");
+    }
+}
+
+fn quick_tooltip_blocked_by_visible_surface(app: &AppHandle) -> bool {
+    let overlay_visible = app
+        .get_webview_window("overlay")
+        .map(|w| w.is_visible().unwrap_or(false))
+        .unwrap_or(false);
+    overlay_visible
+}
+
+fn ensure_quick_tooltip_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    if let Some(existing) = app.get_webview_window("quick_tooltip") {
+        configure_quick_tooltip_window(&existing);
+        let _ = clamp_quick_tooltip_window_to_monitor(&existing);
+        return Ok(existing);
+    }
+
+    let cfg = load_quick_tooltip_config(app);
+    let monitor = app.primary_monitor().ok().flatten();
+    let size =
+        constrain_quick_tooltip_size_to_monitor(monitor.as_ref(), QuickTooltipSize::compact());
+    let position = cfg
+        .position
+        .map(|p| clamp_quick_tooltip_to_monitor(monitor.clone(), p, size))
+        .unwrap_or_else(|| default_quick_tooltip_position(app, size));
+
+    let win = WebviewWindowBuilder::new(
+        app,
+        "quick_tooltip",
+        WebviewUrl::App("index.html?mode=tooltip".into()),
+    )
+    .title("Screenie AI")
+    .inner_size(size.width, size.height)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .shadow(false)
+    .focused(false)
+    .visible(false)
+    .build()
+    .map_err(|e| format!("quick tooltip window: {e}"))?;
+
+    let _ = win.set_position(LogicalPosition::<f64>::new(
+        position.x as f64,
+        position.y as f64,
+    ));
+
+    configure_quick_tooltip_window(&win);
+
+    #[cfg(target_os = "windows")]
+    {
+        configure_main_window(&win);
+    }
+
+    let app_for_event = app.clone();
+    let win_for_event = win.clone();
+    win.on_window_event(move |event| match event {
+        WindowEvent::Moved(pos) => {
+            save_quick_tooltip_moved_position(&app_for_event, &win_for_event, *pos);
+        }
+        WindowEvent::Destroyed => {
+            if let Some(state) = app_for_event.try_state::<AppState>() {
+                cancel_active_quick_tooltip_ai(&state);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = app_for_event.run_on_main_thread(|| unsafe {
+                    screenie_clear_quick_tooltip_vibrancy_regions()
+                });
+            }
+        }
+        _ => {}
+    });
+
+    Ok(win)
+}
+
+fn restore_quick_tooltip_if_enabled(app: &AppHandle) {
+    let cfg = load_quick_tooltip_config(app);
+    if !cfg.visible || quick_tooltip_blocked_by_visible_surface(app) {
+        return;
+    }
+    match ensure_quick_tooltip_window(app) {
+        Ok(w) => {
+            let _ = clamp_quick_tooltip_window_to_monitor(&w);
+            let _ = w.show();
+        }
+        Err(e) => eprintln!("[screenie] restore quick tooltip failed: {e}"),
+    }
+}
+
+fn hide_quick_tooltip_temporarily(app: &AppHandle) -> bool {
+    if let Some(state) = app.try_state::<AppState>() {
+        cancel_active_quick_tooltip_ai(&state);
+    }
+    let Some(w) = app.get_webview_window("quick_tooltip") else {
+        return false;
+    };
+    let was_visible = w.is_visible().unwrap_or(false);
+    let _ = w.hide();
+    was_visible
+}
+
+fn set_quick_tooltip_visibility(app: &AppHandle, visible: bool) -> Result<(), String> {
+    let _ = update_quick_tooltip_config(app, |cfg| {
+        cfg.visible = visible;
+    })?;
+    if visible {
+        restore_quick_tooltip_if_enabled(app);
+    } else if let Some(w) = app.get_webview_window("quick_tooltip") {
+        let _ = w.hide();
+        if let Some(state) = app.try_state::<AppState>() {
+            cancel_active_quick_tooltip_ai(&state);
+        }
+    }
+    refresh_tray_menu(app).map_err(|e| format!("refresh tray menu: {e}"))?;
+    Ok(())
+}
+
+fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let tooltip_visible = load_quick_tooltip_config(app).visible;
+    let tooltip_label = if tooltip_visible {
+        "Hide Tooltip"
+    } else {
+        "Show Tooltip"
+    };
+    let tooltip_item = MenuItem::with_id(app, "toggle_tooltip", tooltip_label, true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit Screenie AI", true, Some("Cmd+Q"))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let screen_recording_label = if screen_recording_access_granted() {
+            "Screen Recording: Allowed"
+        } else {
+            "Screen Recording: Open Settings…"
+        };
+        let screen_recording_item = MenuItem::with_id(
+            app,
+            "screen_recording_settings",
+            screen_recording_label,
+            true,
+            None::<&str>,
+        )?;
+        return Menu::with_items(
+            app,
+            &[
+                &tooltip_item,
+                &screen_recording_item,
+                &settings_item,
+                &separator,
+                &quit_item,
+            ],
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Menu::with_items(
+        app,
+        &[&tooltip_item, &settings_item, &separator, &quit_item],
+    )
+}
+
+fn refresh_tray_menu(app: &AppHandle) -> tauri::Result<()> {
+    let Some(tray) = app.tray_by_id("main") else {
+        return Ok(());
+    };
+    let menu = build_tray_menu(app)?;
+    tray.set_menu(Some(menu))
 }
 
 /// Build the menu-bar tray icon. Left-click triggers the capture flow;
 /// right-click pops the Settings/Quit menu via Tauri's default handling.
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit Screenie AI", true, Some("Cmd+Q"))?;
-    let menu = Menu::with_items(app, &[&settings_item, &separator, &quit_item])?;
+    let menu = build_tray_menu(app)?;
 
     let mut tray_builder = TrayIconBuilder::with_id("main");
     // Snapshot the system theme so we ship the right glyph from the very
@@ -2136,11 +3388,21 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         // (or click-and-hold) pops the menu via Tauri's default behaviour.
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
+            "toggle_tooltip" => {
+                let visible = load_quick_tooltip_config(app).visible;
+                if let Err(e) = set_quick_tooltip_visibility(app, !visible) {
+                    eprintln!("[screenie] tooltip visibility toggle failed: {e}");
+                }
+            }
             "settings" => {
                 let h = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = show_settings_window(h).await;
                 });
+            }
+            "screen_recording_settings" => {
+                open_screen_settings_now();
+                let _ = refresh_tray_menu(app);
             }
             "quit" => {
                 exit_app(app.clone());
@@ -2196,6 +3458,62 @@ async fn repeat_last_capture(app: AppHandle) {
     trigger_repeat_capture(app).await;
 }
 
+#[tauri::command]
+async fn start_capture(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    require_window(&window, "quick_tooltip")?;
+    hide_quick_tooltip_temporarily(&app);
+    trigger_capture_flow(app).await;
+    Ok(())
+}
+
+#[tauri::command]
+fn resize_quick_tooltip(
+    window: WebviewWindow,
+    expanded: bool,
+    agent_input_open: Option<bool>,
+    agent_model_menu_open: Option<bool>,
+    status_open: Option<bool>,
+    status_height: Option<f64>,
+) -> Result<(), String> {
+    require_window(&window, "quick_tooltip")?;
+    let status_open = status_open.unwrap_or(false);
+    let agent_input_open = agent_input_open.unwrap_or(false);
+    let agent_model_menu_open = agent_model_menu_open.unwrap_or(false);
+    let requested_size = if expanded && status_open {
+        QuickTooltipSize::expanded_with_status(status_height)
+    } else if expanded {
+        QuickTooltipSize::expanded()
+    } else if agent_input_open && agent_model_menu_open {
+        QuickTooltipSize::agent_input_with_menu()
+    } else if agent_input_open {
+        QuickTooltipSize::agent_input()
+    } else if status_open {
+        QuickTooltipSize::status(status_height)
+    } else {
+        QuickTooltipSize::compact()
+    };
+    let position = quick_tooltip_current_logical_position(&window)
+        .unwrap_or(QuickTooltipPosition { x: 24, y: 24 });
+    let current_size = quick_tooltip_current_logical_size(&window).unwrap_or(requested_size);
+    let monitor = window.current_monitor().ok().flatten();
+    let size = constrain_quick_tooltip_size_to_monitor(monitor.as_ref(), requested_size);
+    let anchored_position = QuickTooltipPosition {
+        x: (position.x as f64 + ((current_size.width - size.width) / 2.0)).round() as i32,
+        y: position.y,
+    };
+    let clamped = clamp_quick_tooltip_to_monitor(monitor, anchored_position, size);
+    window
+        .set_size(LogicalSize::<f64>::new(size.width, size.height))
+        .map_err(|e| format!("resize quick tooltip: {e}"))?;
+    window
+        .set_position(LogicalPosition::<f64>::new(
+            clamped.x as f64,
+            clamped.y as f64,
+        ))
+        .map_err(|e| format!("move quick tooltip: {e}"))?;
+    Ok(())
+}
+
 /// Append a finished capture+chat to history. The frontend calls this once
 /// per turn (or once per capture session, depending on UX preference).
 /// Async + spawn_blocking so the PNG decode + thumb encode + sync I/O don't
@@ -2209,6 +3527,7 @@ async fn add_history_entry(
     height: u32,
     provider: String,
     model: String,
+    title: Option<String>,
     prompt: String,
     response: String,
 ) -> Result<HistoryEntry, HistoryError> {
@@ -2227,6 +3546,7 @@ async fn add_history_entry(
                 height,
                 provider,
                 model,
+                title,
                 prompt,
                 response,
             },
@@ -2365,19 +3685,15 @@ fn windows_ocr_png(bytes: &[u8]) -> Result<String, String> {
     use windows::Globalization::Language;
     use windows::Graphics::Imaging::BitmapDecoder;
     use windows::Media::Ocr::OcrEngine;
-    use windows::Storage::Streams::{
-        DataWriter, IRandomAccessStream, InMemoryRandomAccessStream,
-    };
+    use windows::Storage::Streams::{DataWriter, IRandomAccessStream, InMemoryRandomAccessStream};
 
     fn err<E: std::fmt::Display>(stage: &str) -> impl Fn(E) -> String + '_ {
         move |e| format!("Windows OCR ({stage}): {e}")
     }
 
-    let stream =
-        InMemoryRandomAccessStream::new().map_err(err("stream init"))?;
+    let stream = InMemoryRandomAccessStream::new().map_err(err("stream init"))?;
     {
-        let writer = DataWriter::CreateDataWriter(&stream)
-            .map_err(err("writer init"))?;
+        let writer = DataWriter::CreateDataWriter(&stream).map_err(err("writer init"))?;
         writer.WriteBytes(bytes).map_err(err("write bytes"))?;
         writer
             .StoreAsync()
@@ -2471,6 +3787,7 @@ struct HotkeyConfigDto {
     capture: String,
     repeat: String,
     settings: String,
+    tooltip: String,
 }
 
 impl From<&HotkeyConfig> for HotkeyConfigDto {
@@ -2479,6 +3796,7 @@ impl From<&HotkeyConfig> for HotkeyConfigDto {
             capture: c.capture.clone(),
             repeat: c.repeat.clone(),
             settings: c.settings.clone(),
+            tooltip: c.tooltip.clone(),
         }
     }
 }
@@ -2496,11 +3814,12 @@ fn set_hotkey_config(
     capture: String,
     repeat: String,
     settings: String,
+    tooltip: String,
 ) -> Result<(), String> {
     if window.label() != "main" {
         return Err("command not allowed from this window".into());
     }
-    apply_hotkey_config(&app, capture, repeat, settings)
+    apply_hotkey_config(&app, capture, repeat, settings, tooltip)
 }
 
 #[cfg(desktop)]
@@ -2509,6 +3828,7 @@ fn apply_hotkey_config(
     capture: String,
     repeat: String,
     settings: String,
+    tooltip: String,
 ) -> Result<(), String> {
     use std::str::FromStr;
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
@@ -2519,11 +3839,13 @@ fn apply_hotkey_config(
         Shortcut::from_str(&repeat).map_err(|e| format!("repeat shortcut invalid: {e}"))?;
     let new_settings =
         Shortcut::from_str(&settings).map_err(|e| format!("settings shortcut invalid: {e}"))?;
+    let new_tooltip =
+        Shortcut::from_str(&tooltip).map_err(|e| format!("tooltip shortcut invalid: {e}"))?;
 
     // Unregister the previous accelerators (read from state).
     let state = app.state::<AppState>();
     let prev: HotkeyConfig = lock_poison_safe(&state.hotkeys).clone();
-    for s in [&prev.capture, &prev.repeat, &prev.settings] {
+    for s in [&prev.capture, &prev.repeat, &prev.settings, &prev.tooltip] {
         if let Ok(sc) = Shortcut::from_str(s) {
             let _ = app.global_shortcut().unregister(sc);
         }
@@ -2535,6 +3857,7 @@ fn apply_hotkey_config(
         (&new_capture, "capture"),
         (&new_repeat, "repeat"),
         (&new_settings, "settings"),
+        (&new_tooltip, "tooltip"),
     ] {
         match app.global_shortcut().register(*sc) {
             Ok(()) => registered.push(*sc),
@@ -2547,6 +3870,7 @@ fn apply_hotkey_config(
             capture,
             repeat,
             settings,
+            tooltip,
         };
         {
             let mut cfg = lock_poison_safe(&state.hotkeys);
@@ -2571,7 +3895,13 @@ fn apply_hotkey_config(
 }
 
 #[cfg(not(desktop))]
-fn apply_hotkey_config(_: &AppHandle, _: String, _: String, _: String) -> Result<(), String> {
+fn apply_hotkey_config(
+    _: &AppHandle,
+    _: String,
+    _: String,
+    _: String,
+    _: String,
+) -> Result<(), String> {
     Err("global shortcuts not supported on this platform".into())
 }
 
@@ -2580,7 +3910,7 @@ fn re_register_hotkeys(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
     use std::str::FromStr;
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
     let mut errors = Vec::new();
-    for s in [&cfg.capture, &cfg.repeat, &cfg.settings] {
+    for s in [&cfg.capture, &cfg.repeat, &cfg.settings, &cfg.tooltip] {
         if let Ok(sc) = Shortcut::from_str(s) {
             if let Err(e) = app.global_shortcut().register(sc) {
                 errors.push(format!("{s}: {e}"));
@@ -2636,38 +3966,35 @@ async fn open_chat_window(
         let _ = existing.emit("chat-seed-changed", ());
         return Ok(());
     }
-    let chat_builder = WebviewWindowBuilder::new(
-        &app,
-        "chat",
-        WebviewUrl::App("index.html?mode=chat".into()),
-    )
-    .title("Screenie AI · Chat")
-    .inner_size(420.0, 560.0)
-    .min_inner_size(300.0, 320.0)
-    .resizable(true)
-    // Borderless + transparent so the in-page chat panel is the
-    // entire visible window. `.shadow(false)` matches the overlay's
-    // configuration so macOS doesn't paint its system shadow/border
-    // around the rounded panel — the panel's own frost + rounded
-    // corners are the only chrome.
-    .transparent(true)
-    .decorations(false)
-    .shadow(false)
-    // macOS NSVisualEffectView "hudWindow" vibrancy — heaviest practical
-    // material, matches the overlay's frost panes + the floating-panel
-    // look (ChatGPT / Linear / Notion style: heavy gaussian blur with
-    // colors bleeding through). 24px corner radius matches the chat
-    // panel's CSS border-radius.
-    .effects(WindowEffectsConfig {
-        effects: vec![WindowEffect::HudWindow],
-        state: Some(WindowEffectState::Active),
-        radius: Some(24.0),
-        color: None,
-    })
-    // Match the original overlay's "lives above other apps" feel.
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .visible(true);
+    let chat_builder =
+        WebviewWindowBuilder::new(&app, "chat", WebviewUrl::App("index.html?mode=chat".into()))
+            .title("Screenie AI · Chat")
+            .inner_size(420.0, 560.0)
+            .min_inner_size(300.0, 320.0)
+            .resizable(true)
+            // Borderless + transparent so the in-page chat panel is the
+            // entire visible window. `.shadow(false)` matches the overlay's
+            // configuration so macOS doesn't paint its system shadow/border
+            // around the rounded panel — the panel's own frost + rounded
+            // corners are the only chrome.
+            .transparent(true)
+            .decorations(false)
+            .shadow(false)
+            // macOS NSVisualEffectView "hudWindow" vibrancy — heaviest practical
+            // material, matches the overlay's frost panes + the floating-panel
+            // look (ChatGPT / Linear / Notion style: heavy gaussian blur with
+            // colors bleeding through). 24px corner radius matches the chat
+            // panel's CSS border-radius.
+            .effects(WindowEffectsConfig {
+                effects: vec![WindowEffect::HudWindow],
+                state: Some(WindowEffectState::Active),
+                radius: Some(24.0),
+                color: None,
+            })
+            // Match the original overlay's "lives above other apps" feel.
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .visible(true);
     let chat_win = chat_builder
         .build()
         .map_err(|e| format!("chat window: {e}"))?;
@@ -2697,10 +4024,7 @@ async fn open_chat_window(
 }
 
 #[tauri::command]
-fn take_chat_seed(
-    app: AppHandle,
-    window: WebviewWindow,
-) -> Option<ChatSeed> {
+fn take_chat_seed(app: AppHandle, window: WebviewWindow) -> Option<ChatSeed> {
     if window.label() != "chat" {
         return None;
     }
@@ -2748,7 +4072,10 @@ fn pick_cursor_monitor(
             }
         }
     }
-    app.primary_monitor().ok().flatten().or_else(|| monitors.into_iter().next())
+    app.primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| monitors.into_iter().next())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2757,53 +4084,62 @@ pub fn run() {
         .manage(AppState::default())
         .plugin(tauri_plugin_opener::init());
 
-    builder = builder
-        .invoke_handler(tauri::generate_handler![
-            take_pending_capture,
-            crop_capture,
-            refresh_overlay_backdrop_capture,
-            refresh_overlay_capture,
-            show_overlay_after_refresh,
-            close_overlay,
-            set_overlay_interaction_regions,
-            set_overlay_vibrancy_regions,
-            set_overlay_text_input_focused,
-            set_overlay_mouse_capture,
-            relay_overlay_pointer_click,
-            relay_overlay_wheel,
-            cancel_ai,
-            open_screen_settings,
-            quit_app,
-            restart_app,
-            ask_ai,
-            check_ollama,
-            check_ollama_installed,
-            get_hotkey_registration_error,
-            launch_ollama,
-            install_ollama,
-            pull_ollama_model,
-            set_secret,
-            get_secret,
-            delete_secret,
-            show_settings_window,
-            hide_settings_window,
-            complete_onboarding,
-            set_tutorial_mode,
-            consume_repeat_pending,
-            repeat_last_capture,
-            add_history_entry,
-            list_history,
-            delete_history_entry,
-            clear_history,
-            load_history_image,
-            load_history_thumb,
-            save_annotated_image,
-            ocr_image_local,
-            get_hotkey_config,
-            set_hotkey_config,
-            open_chat_window,
-            take_chat_seed
-        ]);
+    builder = builder.invoke_handler(tauri::generate_handler![
+        take_pending_capture,
+        dump_observation,
+        run_stub_agent,
+        start_agent_task,
+        stop_agent_task,
+        respond_to_confirmation,
+        crop_capture,
+        refresh_overlay_backdrop_capture,
+        refresh_overlay_capture,
+        show_overlay_after_refresh,
+        close_overlay,
+        set_overlay_interaction_regions,
+        set_overlay_vibrancy_regions,
+        set_quick_tooltip_vibrancy_regions,
+        set_quick_tooltip_keyboard_mode,
+        set_overlay_text_input_focused,
+        set_overlay_mouse_capture,
+        relay_overlay_pointer_click,
+        relay_overlay_wheel,
+        cancel_ai,
+        open_screen_settings,
+        request_screen_recording_permission,
+        quit_app,
+        restart_app,
+        ask_ai,
+        check_ollama,
+        check_ollama_installed,
+        get_hotkey_registration_error,
+        launch_ollama,
+        install_ollama,
+        pull_ollama_model,
+        set_secret,
+        get_secret,
+        delete_secret,
+        show_settings_window,
+        hide_settings_window,
+        complete_onboarding,
+        set_tutorial_mode,
+        consume_repeat_pending,
+        repeat_last_capture,
+        start_capture,
+        resize_quick_tooltip,
+        add_history_entry,
+        list_history,
+        delete_history_entry,
+        clear_history,
+        load_history_image,
+        load_history_thumb,
+        save_annotated_image,
+        ocr_image_local,
+        get_hotkey_config,
+        set_hotkey_config,
+        open_chat_window,
+        take_chat_seed
+    ]);
 
     #[cfg(desktop)]
     {
@@ -2827,7 +4163,11 @@ pub fn run() {
                     let cap = Shortcut::from_str(&cfg.capture).ok();
                     let rep = Shortcut::from_str(&cfg.repeat).ok();
                     let settings = Shortcut::from_str(&cfg.settings).ok();
-                    if cap.as_ref() == Some(shortcut) {
+                    let tooltip = Shortcut::from_str(&cfg.tooltip).ok();
+                    let kill_switch = Shortcut::from_str(AGENT_KILL_SWITCH_SHORTCUT).ok();
+                    if kill_switch.as_ref() == Some(shortcut) {
+                        abort_agent_runs(app);
+                    } else if cap.as_ref() == Some(shortcut) {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             trigger_capture_flow(app).await;
@@ -2842,6 +4182,11 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             let _ = show_settings_window(app).await;
                         });
+                    } else if tooltip.as_ref() == Some(shortcut) {
+                        let visible = load_quick_tooltip_config(app).visible;
+                        if let Err(e) = set_quick_tooltip_visibility(app, !visible) {
+                            eprintln!("[screenie] tooltip hotkey toggle failed: {e}");
+                        }
                     }
                 })
                 .build(),
@@ -2883,8 +4228,7 @@ pub fn run() {
                     {
                         let needs_refresh = matches!(
                             event,
-                            WindowEvent::ThemeChanged(_)
-                                | WindowEvent::ScaleFactorChanged { .. }
+                            WindowEvent::ThemeChanged(_) | WindowEvent::ScaleFactorChanged { .. }
                         );
                         if needs_refresh {
                             let theme = match event {
@@ -2900,9 +4244,7 @@ pub fn run() {
                                         let _ = tray.set_icon(Some(icon));
                                     }
                                     Err(e) => {
-                                        eprintln!(
-                                            "[screenie] tray icon refresh failed: {e}"
-                                        );
+                                        eprintln!("[screenie] tray icon refresh failed: {e}");
                                     }
                                 }
                             }
@@ -2910,6 +4252,8 @@ pub fn run() {
                     }
                 });
             }
+
+            restore_quick_tooltip_if_enabled(handle);
 
             // Register the configured hotkeys. A saved user configuration is
             // loaded before registration so custom shortcuts survive relaunch.
@@ -2923,13 +4267,17 @@ pub fn run() {
             let cfg: HotkeyConfig = lock_poison_safe(&state.hotkeys).clone();
             let mut hotkey_failures: Vec<String> = Vec::new();
             for (acc, label) in [
-                (&cfg.capture, "capture"),
-                (&cfg.repeat, "repeat"),
-                (&cfg.settings, "settings"),
+                (cfg.capture.as_str(), "capture"),
+                (cfg.repeat.as_str(), "repeat"),
+                (cfg.settings.as_str(), "settings"),
+                (cfg.tooltip.as_str(), "tooltip"),
+                (AGENT_KILL_SWITCH_SHORTCUT, "agent kill switch"),
             ] {
                 match Shortcut::from_str(acc) {
                     Ok(sc) => match app.global_shortcut().register(sc) {
-                        Ok(()) => eprintln!("[screenie] shortcut {} ({}) registered OK", label, acc),
+                        Ok(()) => {
+                            eprintln!("[screenie] shortcut {} ({}) registered OK", label, acc)
+                        }
                         Err(e) => {
                             eprintln!("[screenie] shortcut {} register FAILED: {}", label, e);
                             hotkey_failures.push(format!("{}: {}", label, e));
@@ -2981,6 +4329,12 @@ mod tests {
     }
 
     #[test]
+    fn validate_ai_payload_accepts_empty_image() {
+        let msgs = vec![msg("user", "hello")];
+        assert!(validate_ai_payload(&msgs, "").is_ok());
+    }
+
+    #[test]
     fn validate_ai_payload_rejects_oversized_image() {
         let huge = "x".repeat(MAX_AI_IMAGE_B64_CHARS + 1);
         let result = validate_ai_payload(&[], &huge);
@@ -2989,8 +4343,7 @@ mod tests {
 
     #[test]
     fn validate_ai_payload_rejects_too_many_messages() {
-        let msgs: Vec<UiMessage> =
-            (0..=MAX_AI_MESSAGES).map(|_| msg("user", "x")).collect();
+        let msgs: Vec<UiMessage> = (0..=MAX_AI_MESSAGES).map(|_| msg("user", "x")).collect();
         let result = validate_ai_payload(&msgs, "");
         assert!(matches!(result, Err(AiError::RequestTooLarge(_))));
     }
@@ -3087,5 +4440,83 @@ mod tests {
             normalize_response_profile(Some("CONCISE".into())),
             "concise"
         );
+    }
+
+    // ---------- agent task entry ----------
+
+    #[test]
+    fn agent_task_options_empty_goal_is_noop() {
+        assert!(agent_task_options_from_goal("", None, None, None, None).is_none());
+        assert!(agent_task_options_from_goal(" \n\t ", None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn agent_task_options_trim_goal() {
+        let options =
+            agent_task_options_from_goal("  open settings  ", None, None, None, None).unwrap();
+        assert_eq!(options.goal.as_deref(), Some("open settings"));
+    }
+
+    #[test]
+    fn agent_task_options_preserve_selected_provider_and_model() {
+        let options = agent_task_options_from_goal(
+            "open settings",
+            Some("gemini".into()),
+            Some("gemini-2.5-flash".into()),
+            Some("gemini".into()),
+            Some("gemini-2.5-flash".into()),
+        )
+        .unwrap();
+        assert_eq!(options.provider.as_deref(), Some("gemini"));
+        assert_eq!(options.model.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(options.vision_provider.as_deref(), Some("gemini"));
+        assert_eq!(options.vision_model.as_deref(), Some("gemini-2.5-flash"));
+    }
+
+    // ---------- quick_tooltip config ----------
+
+    #[test]
+    fn quick_tooltip_config_defaults_when_missing() {
+        let path = std::env::temp_dir().join(format!(
+            "screenie-quick-tooltip-missing-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = load_quick_tooltip_config_from_path(&path);
+        assert_eq!(cfg, QuickTooltipConfig::default());
+    }
+
+    #[test]
+    fn quick_tooltip_config_save_and_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "screenie-quick-tooltip-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = dir.join("quick_tooltip.json");
+        let cfg = QuickTooltipConfig {
+            visible: false,
+            position: Some(QuickTooltipPosition { x: 120, y: 44 }),
+        };
+
+        save_quick_tooltip_config_to_path(&path, &cfg).unwrap();
+        assert_eq!(load_quick_tooltip_config_from_path(&path), cfg);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quick_tooltip_config_partial_file_uses_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "screenie-quick-tooltip-partial-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("quick_tooltip.json");
+        std::fs::write(&path, r#"{"position":{"x":5,"y":9}}"#).unwrap();
+
+        let cfg = load_quick_tooltip_config_from_path(&path);
+        assert!(cfg.visible);
+        assert_eq!(cfg.position, Some(QuickTooltipPosition { x: 5, y: 9 }));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
