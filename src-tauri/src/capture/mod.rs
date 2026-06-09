@@ -101,9 +101,9 @@ pub async fn capture_rect(
 
 /// Crop a base64-encoded PNG to the given bounds (in device pixels).
 ///
-/// Async wrapper around [`crop_png_b64_blocking`] that runs the PNG decode
-/// + crop + re-encode on the blocking pool. Calling commands are async and
-/// often share the runtime worker driving an SSE stream — running this
+/// Async wrapper around [`crop_png_b64_blocking`] that runs the PNG
+/// decode/crop/re-encode on the blocking pool. Calling commands are async
+/// and often share the runtime worker driving an SSE stream — running this
 /// inline pegs that worker for 50-200 ms on a Retina screenshot.
 pub async fn crop_png_b64(
     src_b64: String,

@@ -1745,6 +1745,7 @@ fn show_overlay_after_refresh(app: AppHandle, window: WebviewWindow) -> Result<(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors the IPC payload shape
 async fn ask_ai(
     state: tauri::State<'_, AppState>,
     window: WebviewWindow,
@@ -3716,6 +3717,7 @@ fn resize_quick_tooltip(
 /// Async + spawn_blocking so the PNG decode + thumb encode + sync I/O don't
 /// wedge the IPC dispatcher (one sync command at a time on a single thread).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors the IPC payload shape
 async fn add_history_entry(
     app: AppHandle,
     window: WebviewWindow,
@@ -4128,6 +4130,7 @@ fn re_register_hotkeys(app: &AppHandle, cfg: &HotkeyConfig) -> Result<(), String
 /// big — we keep a copy in app state instead and the new window pulls it
 /// via `take_chat_seed`).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors the IPC payload shape
 async fn open_chat_window(
     app: AppHandle,
     window: WebviewWindow,

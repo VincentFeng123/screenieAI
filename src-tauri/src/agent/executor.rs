@@ -1575,6 +1575,10 @@ where
     .await
 }
 
+// One parameter per collaborating subsystem (observer, planner, input,
+// calibration, confirmations, grounder, abort) — bundling them into a struct
+// would only move the argument list.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_stub_agent_loop_with_grounder<O, P, F, C, Q, G>(
     observer: &O,
     planner: &P,
@@ -2215,6 +2219,10 @@ where
         if ax_set_value_eligible(&prepared) {
             max_attempts = max_attempts.max(2);
         }
+        // Separate from the loop bound: a failed grounding retry lowers it
+        // mid-loop to stop further attempts (every body path continues or
+        // breaks, so the iteration range itself never matters past this).
+        let mut attempts_allowed = max_attempts;
 
         for attempt in 1..=max_attempts {
             if abort.is_aborted() {
@@ -2953,12 +2961,12 @@ where
                                 }
                                 Err(report) => {
                                     step.grounding = Some(report);
-                                    max_attempts = attempt;
+                                    attempts_allowed = attempt;
                                 }
                             }
                         }
                     }
-                    if attempt < max_attempts {
+                    if attempt < attempts_allowed {
                         eprintln!(
                             "[screenie] agent step {} no-op on attempt {}; retrying",
                             step_number, attempt
@@ -6997,7 +7005,7 @@ mod tests {
             id: 6,
             text: "amazon.com".into(),
         };
-        let prepared = prepare_action(&action, &[stale.clone()]).unwrap();
+        let prepared = prepare_action(&action, std::slice::from_ref(&stale)).unwrap();
         let reason =
             planner_action_rejection_reason(&action, &prepared, &[stale], &[], "go to amazon.com")
                 .unwrap();
@@ -7025,7 +7033,7 @@ mod tests {
             id: 16,
             text: "hi".into(),
         };
-        let prepared = prepare_action(&action, &[field.clone()]).unwrap();
+        let prepared = prepare_action(&action, std::slice::from_ref(&field)).unwrap();
         let steps = vec![executed_step(
             5,
             Action::Type {
@@ -8815,17 +8823,17 @@ mod tests {
             id: 7,
             text: "secret".into(),
         };
-        let prepared = prepare_action(&typed, &[field.clone()]).unwrap();
-        assert!(secure_typing_target(&typed, &prepared, &[field.clone()]));
+        let prepared = prepare_action(&typed, std::slice::from_ref(&field)).unwrap();
+        assert!(secure_typing_target(&typed, &prepared, std::slice::from_ref(&field)));
 
         let focused = Action::TypeFocused {
             text: "secret".into(),
         };
-        let prepared_focused = prepare_action(&focused, &[field.clone()]).unwrap();
+        let prepared_focused = prepare_action(&focused, std::slice::from_ref(&field)).unwrap();
         assert!(secure_typing_target(
             &focused,
             &prepared_focused,
-            &[field.clone()]
+            std::slice::from_ref(&field)
         ));
 
         let plain = text_field(3, "Search");
@@ -8833,7 +8841,7 @@ mod tests {
             id: 3,
             text: "secret".into(),
         };
-        let prepared_plain = prepare_action(&typed_plain, &[plain.clone()]).unwrap();
+        let prepared_plain = prepare_action(&typed_plain, std::slice::from_ref(&plain)).unwrap();
         assert!(!secure_typing_target(
             &typed_plain,
             &prepared_plain,

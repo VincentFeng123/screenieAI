@@ -87,6 +87,9 @@ pub struct Element {
 }
 
 impl Element {
+    // The constructor mirrors the element's full observed state; callers all
+    // pass literals, so a params struct would just duplicate this shape.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u32,
         role: String,
