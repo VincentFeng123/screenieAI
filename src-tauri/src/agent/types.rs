@@ -168,6 +168,12 @@ pub fn element_signature(
     ))
 }
 
+/// Secure (password) fields: their values are never read or logged, and
+/// typing into one always requires explicit confirmation.
+pub fn is_secure_text_role(role: &str) -> bool {
+    role == "AXSecureTextField"
+}
+
 pub fn normalize_signature_name(name: &str, source: ElementSource) -> String {
     let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
     match source {

@@ -6,9 +6,9 @@ use super::grounding::{
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
 use super::types::{
-    normalize_signature_name, Action, CoordinateSpace, Element, ElementSource, FocusedApp,
-    FocusedAppProvider, MenuPressOutcome, ObservationError, Planner, PlannerHistoryEntry, Rect,
-    ScreenObserver,
+    is_secure_text_role, normalize_signature_name, Action, CoordinateSpace, Element,
+    ElementSource, FocusedApp, FocusedAppProvider, MenuPressOutcome, ObservationError, Planner,
+    PlannerHistoryEntry, Rect, ScreenObserver,
 };
 use super::vision::{
     click_point_from_rect, coordinate_element, CaptureSize, ObservationMetadata,
@@ -1682,7 +1682,15 @@ where
         } else {
             GroundingMode::OnePass
         };
-        let (action, planner_reason, prepared, grounding_plan, grounding_report, decision_expect) = loop {
+        let (
+            action,
+            planner_reason,
+            prepared,
+            grounding_plan,
+            grounding_report,
+            decision_expect,
+            secure_typing,
+        ) = loop {
             let decision = planner
                 .next_action(&planner_goal, &before, &planning_history)
                 .await;
@@ -1804,8 +1812,18 @@ where
                 }
             };
 
+            // Typing into a secure (password) field: the literal text never
+            // leaves this loop except inside `prepared` for execution — every
+            // report, history entry, prompt, and confirmation sees `•••`.
+            let secure_typing = secure_typing_target(&action, &prepared, &before);
+            let display_action = if secure_typing {
+                redact_action_for_trace(&action)
+            } else {
+                action.clone()
+            };
+
             if let Some(reason) = stuck_recovery
-                .rejection_for(&normalized_progress_action(&action, &prepared))
+                .rejection_for(&normalized_progress_action(&display_action, &prepared))
                 .or_else(|| {
                     planner_action_rejection_reason(
                         &action,
@@ -1820,7 +1838,7 @@ where
                 })
             {
                 if duplicate_rejections >= MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP {
-                    let normalized = normalized_progress_action(&action, &prepared);
+                    let normalized = normalized_progress_action(&display_action, &prepared);
                     let stage = stuck_recovery.escalate_rejection(&normalized, &reason);
                     let exhausted = stage == StuckRecoveryStage::Exhausted;
                     if stage == StuckRecoveryStage::VisionReplan {
@@ -1838,13 +1856,13 @@ where
                         );
                     }
                     history.push(PlannerHistoryEntry::new(
-                        action.clone(),
+                        display_action.clone(),
                         planner_reason.clone(),
                         format!("rejected without execution: {reason}"),
                     ));
                     let step = AgentStepReport {
                         step: step_number,
-                        action,
+                        action: display_action,
                         planner_reason: Some(planner_reason),
                         target: prepared.target.clone(),
                         click_point: prepared.click_point,
@@ -1880,7 +1898,7 @@ where
                     step_number, reason
                 );
                 planning_history.push(PlannerHistoryEntry::new(
-                    action,
+                    display_action,
                     planner_reason,
                     format!(
                         "rejected without execution: {reason}. Do not repeat this action; choose a different action for the next unfinished step."
@@ -1891,12 +1909,13 @@ where
             }
 
             break (
-                action,
+                display_action,
                 planner_reason,
                 prepared,
                 grounding_plan,
                 grounding_report,
                 decision_expect,
+                secure_typing,
             );
         };
 
@@ -2091,6 +2110,7 @@ where
                 &focused_before_execution,
                 &action,
                 prepared.target.as_ref(),
+                secure_typing,
             );
             if options.execution_policy == ExecutionPolicy::Auto
                 && step
@@ -2120,8 +2140,13 @@ where
                     focused_app: Some(focused_before_execution.clone()),
                 };
             }
-            let confirmation_key =
-                confirmation_approval_key(&action, prepared.target.as_ref(), &gate.reason);
+            // Secure-field confirmations are never cached: every keystroke
+            // into a password field gets its own explicit approval.
+            let confirmation_key = if gate.reason == SECURE_FIELD_CONFIRM_REASON {
+                None
+            } else {
+                confirmation_approval_key(&action, prepared.target.as_ref(), &gate.reason)
+            };
             if gate.decision == SafetyDecision::RequireConfirm {
                 if let Some(key) = confirmation_key.as_ref() {
                     if approved_confirmations.contains(key) {
@@ -2782,11 +2807,22 @@ fn safety_gate(
     focused_app: &FocusedApp,
     action: &Action,
     target: Option<&TargetSummary>,
+    secure_typing: bool,
 ) -> SafetyGateReport {
     if let Some(reason) = excluded_app_reason(focused_app, options) {
         return SafetyGateReport {
             decision: SafetyDecision::Block,
             reason,
+            focused_app: Some(focused_app.clone()),
+        };
+    }
+
+    // Secure (password) fields confirm under every policy, including Auto;
+    // dry-run stays Allow because nothing is typed.
+    if secure_typing && !options.execution_policy.is_dry_run() {
+        return SafetyGateReport {
+            decision: SafetyDecision::RequireConfirm,
+            reason: SECURE_FIELD_CONFIRM_REASON.into(),
             focused_app: Some(focused_app.clone()),
         };
     }
@@ -3981,7 +4017,49 @@ fn should_replace_existing_text(target: &Element) -> bool {
 }
 
 fn is_text_entry_role(role: &str) -> bool {
-    matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
+    matches!(
+        role,
+        "AXTextField" | "AXSecureTextField" | "AXTextArea" | "AXComboBox"
+    )
+}
+
+const SECURE_FIELD_CONFIRM_REASON: &str =
+    "typing into a secure (password) field requires explicit confirmation";
+const REDACTED_TEXT: &str = "\u{2022}\u{2022}\u{2022}";
+
+/// True when this action would type into a secure (password) field — either a
+/// resolved secure target, or typing into focus while a secure field holds it.
+fn secure_typing_target(action: &Action, prepared: &PreparedAction, obs: &[Element]) -> bool {
+    match action {
+        Action::Type { .. } | Action::TypeTarget { .. } => prepared
+            .target
+            .as_ref()
+            .is_some_and(|target| is_secure_text_role(&target.role)),
+        Action::TypeFocused { .. } => obs
+            .iter()
+            .any(|element| element.focused && is_secure_text_role(&element.role)),
+        _ => false,
+    }
+}
+
+/// The typed text never reaches reports, history, prompts, confirmation
+/// payloads, or logs when the target is secure; only the executor's
+/// `PreparedAction` keeps the real value for input synthesis.
+fn redact_action_for_trace(action: &Action) -> Action {
+    match action {
+        Action::Type { id, .. } => Action::Type {
+            id: *id,
+            text: REDACTED_TEXT.into(),
+        },
+        Action::TypeTarget { target, .. } => Action::TypeTarget {
+            target: target.clone(),
+            text: REDACTED_TEXT.into(),
+        },
+        Action::TypeFocused { .. } => Action::TypeFocused {
+            text: REDACTED_TEXT.into(),
+        },
+        other => other.clone(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7281,6 +7359,7 @@ mod tests {
             &focused_app("com.example.app", "Example"),
             &Action::Click { id: 1 },
             Some(&target),
+            false,
         );
 
         assert_eq!(gate.decision, SafetyDecision::RequireConfirm);
@@ -7307,6 +7386,7 @@ mod tests {
                 text: "amazon.com".into(),
             },
             Some(&target),
+            false,
         );
 
         assert_eq!(gate.decision, SafetyDecision::Allow);
@@ -7323,7 +7403,7 @@ mod tests {
         }
         .resolve();
         assert_eq!(
-            safety_gate(&auto, &app, &Action::Click { id: 1 }, Some(&target)).decision,
+            safety_gate(&auto, &app, &Action::Click { id: 1 }, Some(&target), false).decision,
             SafetyDecision::Allow
         );
 
@@ -7332,7 +7412,7 @@ mod tests {
             ..Default::default()
         }
         .resolve();
-        let gate = safety_gate(&dry, &app, &Action::Click { id: 1 }, Some(&target));
+        let gate = safety_gate(&dry, &app, &Action::Click { id: 1 }, Some(&target), false);
         assert_eq!(gate.decision, SafetyDecision::Allow);
         assert!(gate.reason.contains("dry-run"));
     }
@@ -7346,6 +7426,7 @@ mod tests {
             &focused_app("com.1password.1password", "1Password"),
             &Action::Done,
             None,
+            false,
         );
         assert_eq!(blocked.decision, SafetyDecision::Block);
 
@@ -7356,6 +7437,7 @@ mod tests {
                 combo: "Command + Delete".into(),
             },
             None,
+            false,
         );
         assert_eq!(combo.decision, SafetyDecision::RequireConfirm);
 
@@ -7366,6 +7448,7 @@ mod tests {
                 combo: "cmd+w".into(),
             },
             None,
+            false,
         );
         assert_eq!(close.decision, SafetyDecision::RequireConfirm);
         assert!(close.reason.contains("closes the active window"));
@@ -7391,6 +7474,7 @@ mod tests {
             &focused_app("com.example.app", "Example"),
             &Action::Click { id: 1 },
             Some(&target),
+            false,
         );
 
         assert_eq!(gate.decision, SafetyDecision::RequireConfirm);
@@ -8110,6 +8194,104 @@ mod tests {
             path: vec!["File".into(), "Save".into()],
         };
         assert!(destructive_action_reason(&save, None, &options).is_none());
+    }
+
+    #[test]
+    fn secure_field_typing_confirms_even_under_auto_and_redacts_text() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let field = secure_field(7, "Password");
+        let observer = FakeObserver::new(vec![
+            Ok(vec![field.clone()]),
+            Ok(vec![element(2, "Done")]),
+        ]);
+        let requester = FakeConfirmationRequester::single(ConfirmationStatus::Approved);
+        let confirmation_calls = requester.calls();
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Type {
+                id: 7,
+                text: "hunter2".into(),
+            }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &requester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(confirmation_calls.get(), 1, "auto policy must still confirm");
+        let step = &report.steps[0];
+        assert_eq!(
+            step.safety_gate.as_ref().unwrap().reason,
+            SECURE_FIELD_CONFIRM_REASON
+        );
+        assert_eq!(
+            step.action,
+            Action::Type {
+                id: 7,
+                text: REDACTED_TEXT.into()
+            },
+            "reports must never carry the secret"
+        );
+        // The real text still reaches the field.
+        assert!(events
+            .borrow()
+            .contains(&RecordedInput::Text("hunter2".into())));
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(
+            !serialized.contains("hunter2"),
+            "no secret anywhere in the run report"
+        );
+    }
+
+    #[test]
+    fn secure_typing_detection_covers_targets_and_focused_fields() {
+        let field = secure_field(7, "Password");
+        let typed = Action::Type {
+            id: 7,
+            text: "secret".into(),
+        };
+        let prepared = prepare_action(&typed, &[field.clone()]).unwrap();
+        assert!(secure_typing_target(&typed, &prepared, &[field.clone()]));
+
+        let focused = Action::TypeFocused {
+            text: "secret".into(),
+        };
+        let prepared_focused = prepare_action(&focused, &[field.clone()]).unwrap();
+        assert!(secure_typing_target(
+            &focused,
+            &prepared_focused,
+            &[field.clone()]
+        ));
+
+        let plain = text_field(3, "Search");
+        let typed_plain = Action::Type {
+            id: 3,
+            text: "secret".into(),
+        };
+        let prepared_plain = prepare_action(&typed_plain, &[plain.clone()]).unwrap();
+        assert!(!secure_typing_target(
+            &typed_plain,
+            &prepared_plain,
+            &[plain]
+        ));
+    }
+
+    fn secure_field(id: u32, name: &str) -> Element {
+        let mut field = text_field(id, name);
+        field.role = "AXSecureTextField".into();
+        field.refresh_signature();
+        field
     }
 
     struct MenuFeedbackPlanner {

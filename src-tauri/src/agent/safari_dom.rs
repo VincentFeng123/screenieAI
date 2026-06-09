@@ -279,6 +279,12 @@ fn clip_dom_rect(rect: DomRect, viewport_width: f64, viewport_height: f64) -> Op
 }
 
 fn normalize_dom_role(item: &SafariDomElement) -> String {
+    // Password inputs unify on the AX secure role so the safety gate guards
+    // them regardless of source (the DOM script already nulls their values).
+    if item.tag == "input" && item.input_type == "password" {
+        return "AXSecureTextField".into();
+    }
+
     match item.role.as_str() {
         "button" | "tab" | "switch" => return "AXButton".into(),
         "link" => return "AXLink".into(),
@@ -378,6 +384,36 @@ mod tests {
                 height: 10.0,
             }
         );
+    }
+
+    #[test]
+    fn password_inputs_map_to_the_secure_text_role() {
+        let secure = SafariDomElement {
+            agent_id: "screenie-pw".into(),
+            tag: "input".into(),
+            input_type: "password".into(),
+            role: "".into(),
+            name: "Password".into(),
+            value: None,
+            rect: DomRect {
+                x: 10.0,
+                y: 10.0,
+                width: 200.0,
+                height: 30.0,
+            },
+            disabled: false,
+            focused: false,
+            content_editable: false,
+            multiline: false,
+        };
+        assert_eq!(normalize_dom_role(&secure), "AXSecureTextField");
+
+        // Even with a generic textbox role attribute, password wins.
+        let with_role = SafariDomElement {
+            role: "textbox".into(),
+            ..secure
+        };
+        assert_eq!(normalize_dom_role(&with_role), "AXSecureTextField");
     }
 
     #[test]

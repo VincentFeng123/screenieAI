@@ -65,6 +65,9 @@ pub(crate) fn is_actionable_role(role: &str) -> bool {
             | "AXMenuButton"
             | "AXPopUpButton"
             | "AXTextField"
+            // Observable so the safety gate can see and guard it; its value is
+            // never read (see the secure-role handling in the tree walkers).
+            | "AXSecureTextField"
             | "AXTextArea"
             | "AXCheckBox"
             | "AXRadioButton"

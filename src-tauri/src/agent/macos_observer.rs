@@ -5,9 +5,9 @@ use super::observer::{
 };
 use super::safari_dom;
 use super::types::{
-    normalize_signature_name, CoordinateSpace, Element, ElementSource, FocusedApp,
-    FocusedAppProvider, MenuPressOutcome, ObservationError, PlatformElementHandle, Rect,
-    ScreenObserver,
+    is_secure_text_role, normalize_signature_name, CoordinateSpace, Element, ElementSource,
+    FocusedApp, FocusedAppProvider, MenuPressOutcome, ObservationError, PlatformElementHandle,
+    Rect, ScreenObserver,
 };
 use super::vision::{ObservationMetadata, ObservationMetadataProvider};
 use core_foundation::base::TCFType;
@@ -582,13 +582,19 @@ impl AxTreeWalker {
         let title = copy_nonempty_string_attribute(element, "AXTitle")?;
         let description = copy_nonempty_string_attribute(element, "AXDescription")?;
         let name = title.or(description).unwrap_or_default();
-        let value = copy_value_string_attribute(element, "AXValue")?;
+        // Secure fields: never read the value, even though macOS usually
+        // masks it — belt and braces against contents reaching logs/prompts.
+        let value = if is_secure_text_role(&role) {
+            None
+        } else {
+            copy_value_string_attribute(element, "AXValue")?
+        };
         let enabled = copy_bool_attribute(element, "AXEnabled")?.unwrap_or(true);
         let focused = copy_bool_attribute(element, "AXFocused")?.unwrap_or(false);
         // Selection only matters (and is only cheap to read) for the focused
         // element; it feeds the semantic state hash so select-all/deselect
         // counts as UI progress.
-        let selected_text = if focused {
+        let selected_text = if focused && !is_secure_text_role(&role) {
             copy_nonempty_string_attribute(element, "AXSelectedText")?
         } else {
             None
@@ -1052,7 +1058,11 @@ fn copy_element_snapshot(
     let title = copy_nonempty_string_attribute(element, "AXTitle")?;
     let description = copy_nonempty_string_attribute(element, "AXDescription")?;
     let name = title.or(description).unwrap_or_default();
-    let value = copy_value_string_attribute(element, "AXValue")?;
+    let value = if is_secure_text_role(&role) {
+        None
+    } else {
+        copy_value_string_attribute(element, "AXValue")?
+    };
     let enabled = copy_bool_attribute(element, "AXEnabled")?.unwrap_or(true);
     let focused = copy_bool_attribute(element, "AXFocused")?.unwrap_or(false);
     let bounds = copy_bounds(element)?;
