@@ -21,6 +21,7 @@ const MAX_QUESTION_CHARS: usize = 200;
 const MAX_QUESTION_OPTIONS: usize = 4;
 const MAX_QUESTION_OPTION_CHARS: usize = 80;
 const MAX_BATCH_FOLLOWUPS: usize = 2;
+const MAX_SCRIPT_CHARS: usize = 2000;
 
 #[derive(Clone, Debug)]
 pub struct StubPlanner {
@@ -46,6 +47,9 @@ pub(crate) struct ContextAwareLlmPlanner<
     text_client: T,
     vision_client: V,
     state: VisionFallbackState,
+    /// Whether the user's scripting gate is on; controls whether the prompt
+    /// advertises applescript/shortcut/moveToTrash.
+    scripting_enabled: bool,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -134,11 +138,13 @@ impl ContextAwareLlmPlanner {
         text_config: ai::decision::DecisionClientConfig,
         vision_config: ai::decision::DecisionClientConfig,
         state: VisionFallbackState,
+        scripting_enabled: bool,
     ) -> Self {
         Self {
             text_client: ai::decision::DecisionClient::new(text_config),
             vision_client: ai::decision::DecisionClient::new(vision_config),
             state,
+            scripting_enabled,
         }
     }
 }
@@ -150,6 +156,7 @@ impl<T, V> ContextAwareLlmPlanner<T, V> {
             text_client,
             vision_client,
             state,
+            scripting_enabled: false,
         }
     }
 }
@@ -220,7 +227,7 @@ where
         obs: &[Element],
         history: &[PlannerHistoryEntry],
     ) -> PlannerDecision {
-        let system_prompt = build_system_prompt();
+        let system_prompt = build_system_prompt(false);
         let schema = planner_response_schema();
 
         let first_prompt = build_user_prompt(goal, history, obs, None::<&str>);
@@ -292,13 +299,27 @@ where
         history: &[PlannerHistoryEntry],
     ) -> PlannerDecision {
         let Some(context) = self.state.context() else {
-            return complete_text_planner_decision(&self.text_client, goal, obs, history).await;
+            return complete_text_planner_decision(
+                &self.text_client,
+                goal,
+                obs,
+                history,
+                self.scripting_enabled,
+            )
+            .await;
         };
 
         match context.mode {
             VisionFallbackMode::Marks => {
-                complete_mark_vision_decision(&self.vision_client, goal, obs, history, &context)
-                    .await
+                complete_mark_vision_decision(
+                    &self.vision_client,
+                    goal,
+                    obs,
+                    history,
+                    &context,
+                    self.scripting_enabled,
+                )
+                .await
             }
             VisionFallbackMode::Grounding => {
                 complete_grounding_vision_decision(
@@ -324,11 +345,12 @@ async fn complete_text_planner_decision<C>(
     goal: &str,
     obs: &[Element],
     history: &[PlannerHistoryEntry],
+    scripting_enabled: bool,
 ) -> PlannerDecision
 where
     C: PlannerLlmClient,
 {
-    let system_prompt = build_system_prompt();
+    let system_prompt = build_system_prompt(scripting_enabled);
     let schema = planner_response_schema();
 
     let first_prompt = build_user_prompt(goal, history, obs, None::<&str>);
@@ -385,11 +407,12 @@ async fn complete_mark_vision_decision<C>(
     obs: &[Element],
     history: &[PlannerHistoryEntry],
     context: &VisionFallbackContext,
+    scripting_enabled: bool,
 ) -> PlannerDecision
 where
     C: PlannerLlmClient,
 {
-    let system_prompt = build_mark_vision_system_prompt();
+    let system_prompt = build_mark_vision_system_prompt(scripting_enabled);
     let schema = planner_response_schema();
 
     let first_prompt = build_mark_vision_user_prompt(goal, history, obs, context, None);
@@ -570,8 +593,8 @@ pub(crate) fn parse_milestones(raw_output: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn build_system_prompt() -> String {
-    [
+pub(crate) fn build_system_prompt(scripting_enabled: bool) -> String {
+    let mut lines: Vec<&str> = [
         "You are a computer-use agent choosing ONE action for this step.",
         "Return exactly one JSON object. Do not include prose or markdown fences.",
         "Keep reason under 200 characters.",
@@ -635,7 +658,39 @@ pub(crate) fn build_system_prompt() -> String {
         r#"Observation: [12] AXLink "Mac mini M2 refurbished - $429.00" = """#,
         r#"Output: {"reason":"record this price and keep comparing","action":"scroll","dx":0,"dy":600,"note":"B&H refurb M2 mini $429","milestone_done":true}"#,
     ]
-    .join("\n")
+    .to_vec();
+
+    if scripting_enabled {
+        // Rung 1 of the action ladder, advertised only when the user enabled
+        // the scripting gate — every script still requires explicit approval.
+        let insert_at = lines
+            .iter()
+            .position(|line| line.starts_with("Allowed objects:"))
+            .unwrap_or(lines.len());
+        lines.splice(
+            insert_at..insert_at,
+            [
+                "applescript runs an AppleScript snippet after the user approves it. PREFER it over GUI driving for scriptable apps (Notes, Mail, Finder, Calendar, Reminders, Music) and for reading system state - one verified script beats many clicks. Its output arrives in the step result, which is your verification. 'do shell script' is not allowed.",
+                "shortcut runs a Shortcuts.app shortcut by name after approval - prefer it for system toggles like Focus or Do Not Disturb when the user has such a shortcut.",
+                "moveToTrash moves a file to the Trash by absolute path after approval; permanent deletion does not exist.",
+            ],
+        );
+        let objects_at = lines
+            .iter()
+            .position(|line| line.starts_with(r#"{"reason":"brief reason","action":"readPage"}"#))
+            .map(|index| index + 1)
+            .unwrap_or(lines.len());
+        lines.splice(
+            objects_at..objects_at,
+            [
+                r#"{"reason":"brief reason","action":"applescript","script":"tell application \"Notes\" to make new note with properties {body:\"hi\"}"}"#,
+                r#"{"reason":"brief reason","action":"shortcut","name":"Set Do Not Disturb"}"#,
+                r#"{"reason":"brief reason","action":"moveToTrash","file":"/Users/me/Desktop/old.dmg"}"#,
+            ],
+        );
+    }
+
+    lines.join("\n")
 }
 
 pub(crate) fn build_user_prompt(
@@ -661,8 +716,8 @@ pub(crate) fn build_user_prompt(
     prompt
 }
 
-fn build_mark_vision_system_prompt() -> String {
-    let mut prompt = build_system_prompt();
+fn build_mark_vision_system_prompt(scripting_enabled: bool) -> String {
+    let mut prompt = build_system_prompt(scripting_enabled);
     prompt.push_str("\n");
     prompt.push_str("The attached PNG is the current screen annotated with red numbered boxes.\n");
     prompt.push_str(
@@ -889,7 +944,7 @@ fn escape_result_field(value: &str) -> String {
 }
 
 pub(crate) fn planner_response_schema() -> Value {
-    json!({
+    let mut schema = json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["reason", "action"],
@@ -897,7 +952,7 @@ pub(crate) fn planner_response_schema() -> Value {
             "reason": { "type": "string", "maxLength": MAX_REASON_CHARS },
             "action": {
                 "type": "string",
-                "enum": ["activateApp", "click", "doubleClick", "type", "key", "menu", "scroll", "wait", "openUrl", "webSearch", "readPage", "ask", "done", "fail"]
+                "enum": ["activateApp", "click", "doubleClick", "type", "key", "menu", "scroll", "wait", "openUrl", "webSearch", "readPage", "ask", "applescript", "shortcut", "moveToTrash", "done", "fail"]
             },
             "app": { "type": "string" },
             "id": { "type": "integer", "minimum": 0 },
@@ -914,6 +969,10 @@ pub(crate) fn planner_response_schema() -> Value {
                 "maxItems": MAX_QUESTION_OPTIONS,
                 "items": { "type": "string", "maxLength": MAX_QUESTION_OPTION_CHARS }
             },
+            "script": { "type": "string", "maxLength": MAX_SCRIPT_CHARS },
+            "name": { "type": "string" },
+            "input": { "type": "string" },
+            "file": { "type": "string" },
             "url": { "type": "string" },
             "query": { "type": "string" },
             "dx": { "type": "integer" },
@@ -922,30 +981,33 @@ pub(crate) fn planner_response_schema() -> Value {
             "reason_detail": { "type": "string" },
             "note": { "type": "string", "maxLength": MAX_NOTE_CHARS },
             "expect": { "type": "string", "maxLength": MAX_EXPECT_CHARS },
-            "milestone_done": { "type": "boolean" },
-            "next": {
-                "type": "array",
-                "maxItems": MAX_BATCH_FOLLOWUPS,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["action"],
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["click", "type", "key", "scroll", "wait"]
-                        },
-                        "id": { "type": "integer", "minimum": 0 },
-                        "text": { "type": "string" },
-                        "combo": { "type": "string" },
-                        "dx": { "type": "integer" },
-                        "dy": { "type": "integer" },
-                        "ms": { "type": "integer", "minimum": 0 }
-                    }
-                }
+            "milestone_done": { "type": "boolean" }
+        }
+    });
+    // Attached separately: inlining the nested batch schema pushes json!
+    // past its macro recursion limit.
+    schema["properties"]["next"] = json!({
+        "type": "array",
+        "maxItems": MAX_BATCH_FOLLOWUPS,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["click", "type", "key", "scroll", "wait"]
+                },
+                "id": { "type": "integer", "minimum": 0 },
+                "text": { "type": "string" },
+                "combo": { "type": "string" },
+                "dx": { "type": "integer" },
+                "dy": { "type": "integer" },
+                "ms": { "type": "integer", "minimum": 0 }
             }
         }
-    })
+    });
+    schema
 }
 
 pub(crate) fn milestones_response_schema() -> Value {
@@ -1153,6 +1215,32 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
                 .take(MAX_QUESTION_OPTIONS)
                 .collect();
             Action::Ask { question, options }
+        }
+        "applescript" | "apple_script" | "osascript" => {
+            reject_fields(&raw, FieldSet::SCRIPT)?;
+            let script = require_string("script", raw.script.as_deref())?.to_string();
+            if script.chars().count() > MAX_SCRIPT_CHARS {
+                return Err(format!(
+                    "script is too long; keep it under {MAX_SCRIPT_CHARS} characters"
+                ));
+            }
+            Action::AppleScript { script }
+        }
+        "shortcut" | "run_shortcut" | "runShortcut" => {
+            reject_fields(&raw, FieldSet::SHORTCUT)?;
+            Action::RunShortcut {
+                name: require_string("name", raw.name.as_deref())?.to_string(),
+                input: raw
+                    .input
+                    .clone()
+                    .filter(|input| !input.trim().is_empty()),
+            }
+        }
+        "moveToTrash" | "move_to_trash" => {
+            reject_fields(&raw, FieldSet::FILE)?;
+            Action::MoveToTrash {
+                path: require_string("file", raw.file.as_deref())?.to_string(),
+            }
         }
         "done" => {
             reject_fields(&raw, FieldSet::NONE)?;
@@ -1674,15 +1762,18 @@ fn coerce_planner_value(mut value: Value) -> Value {
     }
 
     // Weak models often write a menu path as one string: "File > Export".
-    if let Some(Value::String(text)) = map.get("path") {
-        let parts = text
-            .split(['>', '/'])
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(|part| json!(part))
-            .collect::<Vec<_>>();
-        if !parts.is_empty() {
-            map.insert("path".into(), Value::Array(parts));
+    // Only menu paths split this way — file paths legitimately contain '/'.
+    if map.get("action").and_then(Value::as_str) == Some("menu") {
+        if let Some(Value::String(text)) = map.get("path") {
+            let parts = text
+                .split(['>', '/'])
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| json!(part))
+                .collect::<Vec<_>>();
+            if !parts.is_empty() {
+                map.insert("path".into(), Value::Array(parts));
+            }
         }
     }
 
@@ -1703,6 +1794,10 @@ fn coerce_planner_value(mut value: Value) -> Value {
         "dy",
         "ms",
         "reason_detail",
+        "script",
+        "name",
+        "input",
+        "file",
         "note",
         "expect",
         "milestone_done",
@@ -1726,6 +1821,8 @@ fn canonical_action_name(action: &str) -> String {
         "menu_click" | "menuclick" | "click_menu" | "menu_item" | "menuitem" | "select_menu"
         | "menu_select" => "menu".into(),
         "ask_user" | "askuser" | "ask_human" | "question" => "ask".into(),
+        "run_applescript" | "runapplescript" | "run_script" => "applescript".into(),
+        "delete_file" | "trash_file" | "trash" => "moveToTrash".into(),
         "finish" | "complete" | "end" | "stop" | "terminate" => "done".into(),
         "open_url" | "openurl" | "navigate" | "goto" | "go_to_url" => "openUrl".into(),
         "web_search" | "websearch" | "search" => "webSearch".into(),
@@ -1863,6 +1960,18 @@ fn reject_fields(raw: &RawPlannerResponse, allowed: FieldSet) -> Result<(), Stri
     if raw.reason_detail.is_some() && !allowed.reason_detail {
         extras.push("reason_detail");
     }
+    if raw.script.is_some() && !allowed.script {
+        extras.push("script");
+    }
+    if raw.name.is_some() && !allowed.name {
+        extras.push("name");
+    }
+    if raw.input.is_some() && !allowed.input {
+        extras.push("input");
+    }
+    if raw.file.is_some() && !allowed.file {
+        extras.push("file");
+    }
 
     if extras.is_empty() {
         Ok(())
@@ -1887,6 +1996,10 @@ struct FieldSet {
     path: bool,
     question: bool,
     options: bool,
+    script: bool,
+    name: bool,
+    input: bool,
+    file: bool,
     dx: bool,
     dy: bool,
     ms: bool,
@@ -1907,6 +2020,10 @@ impl FieldSet {
         path: false,
         question: false,
         options: false,
+        script: false,
+        name: false,
+        input: false,
+        file: false,
         dx: false,
         dy: false,
         ms: false,
@@ -1921,6 +2038,19 @@ impl FieldSet {
     const QUESTION: Self = Self {
         question: true,
         options: true,
+        ..Self::NONE
+    };
+    const SCRIPT: Self = Self {
+        script: true,
+        ..Self::NONE
+    };
+    const SHORTCUT: Self = Self {
+        name: true,
+        input: true,
+        ..Self::NONE
+    };
+    const FILE: Self = Self {
+        file: true,
         ..Self::NONE
     };
     const URL: Self = Self {
@@ -1993,6 +2123,10 @@ struct RawPlannerResponse {
     url: Option<String>,
     query: Option<String>,
     reason_detail: Option<String>,
+    script: Option<String>,
+    name: Option<String>,
+    input: Option<String>,
+    file: Option<String>,
     // Globally-allowed metadata fields (never checked by reject_fields).
     note: Option<String>,
     expect: Option<String>,
@@ -2164,7 +2298,7 @@ mod tests {
 
     #[test]
     fn system_prompt_documents_scroll_direction_contract() {
-        let prompt = build_system_prompt();
+        let prompt = build_system_prompt(false);
 
         assert!(prompt.contains("do not fail just because an app name is absent"));
         assert!(prompt.contains("Use activateApp"));

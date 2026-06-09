@@ -503,6 +503,22 @@ body,
   color: rgba(255, 255, 255, 0.62);
 }
 
+/* Scripts appear verbatim before approval — never summarized. */
+.quick-tooltip-confirmation-script {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 140px;
+  overflow: auto;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.88);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .quick-tooltip-error-text {
   color: #ffaaa4;
 }

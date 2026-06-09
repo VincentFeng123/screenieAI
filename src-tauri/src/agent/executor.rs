@@ -171,6 +171,10 @@ pub struct StubAgentOptions {
     pub confirmation_timeout_ms: Option<u64>,
     #[serde(default)]
     pub wall_clock_budget_ms: Option<u64>,
+    /// User setting gating the applescript/shortcut/moveToTrash actions.
+    /// Default OFF; even when on, every script requires explicit approval.
+    #[serde(default)]
+    pub scripting_enabled: Option<bool>,
 }
 
 impl StubAgentOptions {
@@ -291,6 +295,7 @@ impl StubAgentOptions {
                 .wall_clock_budget_ms
                 .filter(|value| *value > 0)
                 .unwrap_or(DEFAULT_WALL_CLOCK_BUDGET_MS),
+            scripting_enabled: self.scripting_enabled.unwrap_or(false),
         }
     }
 }
@@ -371,6 +376,7 @@ pub struct ResolvedStubAgentOptions {
     pub excluded_bundle_ids: Vec<String>,
     pub confirmation_timeout_ms: u64,
     pub wall_clock_budget_ms: u64,
+    pub scripting_enabled: bool,
 }
 
 impl ResolvedStubAgentOptions {
@@ -413,6 +419,7 @@ pub enum ActionMechanism {
     SyntheticClick,
     ClipboardPaste,
     SyntheticInput,
+    Script,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1155,6 +1162,13 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
             PreparedKind::Menu { .. } => {
                 return Err(ExecutionError::Input(
                     "menu actions are executed through the accessibility bridge".into(),
+                ));
+            }
+            PreparedKind::AppleScript { .. }
+            | PreparedKind::RunShortcut { .. }
+            | PreparedKind::MoveToTrash { .. } => {
+                return Err(ExecutionError::Input(
+                    "script actions are executed through the script runner".into(),
                 ));
             }
             PreparedKind::Wait { .. }
@@ -2329,10 +2343,11 @@ where
                     focused_app: Some(focused_before_execution.clone()),
                 };
             }
-            // Secure-field confirmations are never cached: every keystroke
-            // into a password field gets its own explicit approval. Same for
-            // ask-everything — caching would silently auto-approve repeats.
+            // Secure-field and script confirmations are never cached: each
+            // one gets its own explicit approval. Same under ask-everything —
+            // caching would silently auto-approve repeats.
             let confirmation_key = if gate.reason == SECURE_FIELD_CONFIRM_REASON
+                || gate.reason == SCRIPT_CONFIRM_REASON
                 || options.execution_policy == ExecutionPolicy::AskEverything
             {
                 None
@@ -2669,6 +2684,7 @@ where
                 prepared.target.as_ref(),
             );
             let mut menu_feedback: Option<String> = None;
+            let mut script_output: Option<String> = None;
             let execution_result = if let PreparedKind::Menu { path } = &prepared.kind {
                 if options.execution_policy.is_dry_run() {
                     Ok(false)
@@ -2689,6 +2705,30 @@ where
                         }
                         Err(err) => {
                             menu_feedback = Some(format!("menu action failed: {err}"));
+                            Ok(false)
+                        }
+                    }
+                }
+            } else if prepared.kind.is_script() {
+                if options.execution_policy.is_dry_run() {
+                    Ok(false)
+                } else if !options.scripting_enabled {
+                    // Graceful rung descent: the planner is told to fall back
+                    // to GUI actions instead of failing the run.
+                    menu_feedback = Some(
+                        "scripting is disabled in Settings \u{2192} Agent; use GUI actions instead"
+                            .into(),
+                    );
+                    Ok(false)
+                } else {
+                    match run_script_action(&prepared.kind) {
+                        Ok(output) => {
+                            ax_semantic_mechanism = Some(ActionMechanism::Script);
+                            script_output = Some(output);
+                            Ok(true)
+                        }
+                        Err(err) => {
+                            menu_feedback = Some(format!("script failed: {err}"));
                             Ok(false)
                         }
                     }
@@ -2763,6 +2803,26 @@ where
                         continue 'steps;
                     }
                 }
+            }
+
+            // A script's return value IS its verification: feed the output
+            // (or its absence) straight into the planner's history.
+            if let Some(output) = script_output {
+                step.verification = VerificationReport::skipped_no_change_expected()
+                    .with_attempts(attempt.min(u8::MAX as u32) as u8);
+                let result = if output.is_empty() {
+                    "script ran successfully with no output".to_string()
+                } else {
+                    format!("script output: {}", compact_script_output(&output))
+                };
+                last_step_clean = true;
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result,
+                ));
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
             }
 
             log_agent_phase(
@@ -2999,6 +3059,20 @@ fn safety_gate(
         };
     }
 
+    // Scripts confirm under every policy too — the confirmation UI shows the
+    // exact script before anything runs.
+    if matches!(
+        action,
+        Action::AppleScript { .. } | Action::RunShortcut { .. } | Action::MoveToTrash { .. }
+    ) && !options.execution_policy.is_dry_run()
+    {
+        return SafetyGateReport {
+            decision: SafetyDecision::RequireConfirm,
+            reason: SCRIPT_CONFIRM_REASON.into(),
+            focused_app: Some(focused_app.clone()),
+        };
+    }
+
     match options.execution_policy {
         ExecutionPolicy::DryRun => SafetyGateReport {
             decision: SafetyDecision::Allow,
@@ -3088,6 +3162,9 @@ fn confirmation_approval_key(
         Action::WebSearch { query } => format!("webSearch:{}", query.trim()),
         Action::ReadPage => "readPage".into(),
         Action::Ask { question, .. } => format!("ask:{}", question.trim()),
+        Action::AppleScript { script } => format!("applescript:{}", compact_history_text(script)),
+        Action::RunShortcut { name, .. } => format!("shortcut:{}", name.trim()),
+        Action::MoveToTrash { path } => format!("moveToTrash:{}", path.trim()),
         Action::Scroll { dx, dy } => format!("scroll:{dx}:{dy}"),
         Action::ScrollAt { dx, dy, .. } => format!("scrollAt:{dx}:{dy}"),
         Action::Wait { ms } => format!("wait:{ms}"),
@@ -3430,6 +3507,37 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
                 options: options.clone(),
             }))
         }
+        Action::AppleScript { script } => {
+            if script.trim().is_empty() {
+                return Err(ExecutionError::Input(
+                    "applescript requires a script".into(),
+                ));
+            }
+            Ok(PreparedAction::without_target(PreparedKind::AppleScript {
+                script: script.clone(),
+            }))
+        }
+        Action::RunShortcut { name, input } => {
+            if name.trim().is_empty() {
+                return Err(ExecutionError::Input(
+                    "shortcut requires a shortcut name".into(),
+                ));
+            }
+            Ok(PreparedAction::without_target(PreparedKind::RunShortcut {
+                name: name.clone(),
+                input: input.clone(),
+            }))
+        }
+        Action::MoveToTrash { path } => {
+            if path.trim().is_empty() {
+                return Err(ExecutionError::Input(
+                    "moveToTrash requires a file path".into(),
+                ));
+            }
+            Ok(PreparedAction::without_target(PreparedKind::MoveToTrash {
+                path: path.clone(),
+            }))
+        }
         Action::Click { id } => {
             let target = target_element_by_id(obs, *id)?;
             Ok(PreparedAction::with_target(
@@ -3592,6 +3700,10 @@ impl PreparedAction {
             | PreparedKind::Key { .. }
             | PreparedKind::Menu { .. } => true,
             PreparedKind::Scroll { dx, dy } => dx != 0 || dy != 0,
+            // Script outcomes are verified by their output, not the screen.
+            PreparedKind::AppleScript { .. }
+            | PreparedKind::RunShortcut { .. }
+            | PreparedKind::MoveToTrash { .. } => false,
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
             | PreparedKind::Ask { .. }
@@ -4238,6 +4350,7 @@ fn is_text_entry_role(role: &str) -> bool {
 
 const SECURE_FIELD_CONFIRM_REASON: &str =
     "typing into a secure (password) field requires explicit confirmation";
+const SCRIPT_CONFIRM_REASON: &str = "running a script always requires explicit approval";
 const REDACTED_TEXT: &str = "\u{2022}\u{2022}\u{2022}";
 
 /// True when this action would type into a secure (password) field — either a
@@ -4536,10 +4649,144 @@ fn synthetic_mechanism(kind: &PreparedKind) -> Option<ActionMechanism> {
         | PreparedKind::Menu { .. }
         | PreparedKind::ReadPage
         | PreparedKind::Ask { .. }
+        | PreparedKind::AppleScript { .. }
+        | PreparedKind::RunShortcut { .. }
+        | PreparedKind::MoveToTrash { .. }
         | PreparedKind::Wait { .. }
         | PreparedKind::Done
         | PreparedKind::Fail { .. } => None,
     }
+}
+
+const SCRIPT_TIMEOUT_SECS: u64 = 15;
+const MAX_SCRIPT_OUTPUT_CHARS: usize = 2000;
+/// `do shell script` is AppleScript's arbitrary-shell escape hatch; rejecting
+/// it (and privilege escalation) keeps the scripting rung scoped to app
+/// automation. Matched on normalized text so spacing/casing tricks fail too.
+const FORBIDDEN_APPLESCRIPT_PATTERNS: &[&str] = &["do shell script", "administrator privileges"];
+
+fn applescript_rejection(script: &str) -> Option<String> {
+    let normalized = normalize_text_for_match(script);
+    FORBIDDEN_APPLESCRIPT_PATTERNS
+        .iter()
+        .find(|pattern| normalized.contains(*pattern))
+        .map(|pattern| format!("'{pattern}' is not allowed in agent scripts"))
+}
+
+fn compact_script_output(output: &str) -> String {
+    let normalized = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_SCRIPT_OUTPUT_CHARS {
+        return normalized;
+    }
+    let mut truncated = normalized
+        .chars()
+        .take(MAX_SCRIPT_OUTPUT_CHARS.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_string_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+#[cfg(target_os = "macos")]
+fn run_command_with_timeout(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|err| format!("spawn failed: {err}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|err| format!("reading output failed: {err}"));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("timed out after {}s", timeout.as_secs()));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(format!("waiting on process failed: {err}")),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_script_action(kind: &PreparedKind) -> Result<String, String> {
+    let timeout = Duration::from_secs(SCRIPT_TIMEOUT_SECS);
+    let output = match kind {
+        PreparedKind::AppleScript { script } => {
+            if let Some(reason) = applescript_rejection(script) {
+                return Err(reason);
+            }
+            let mut command = std::process::Command::new("/usr/bin/osascript");
+            command.arg("-e").arg(script);
+            run_command_with_timeout(command, timeout)?
+        }
+        PreparedKind::RunShortcut { name, input } => {
+            let mut command = std::process::Command::new("/usr/bin/shortcuts");
+            command.arg("run").arg(name);
+            if let Some(input) = input {
+                command.arg("--input-path").arg(input);
+            }
+            run_command_with_timeout(command, timeout)?
+        }
+        PreparedKind::MoveToTrash { path } => {
+            let trimmed = path.trim();
+            if !trimmed.starts_with('/') {
+                return Err("moveToTrash requires an absolute file path".into());
+            }
+            if !std::path::Path::new(trimmed).exists() {
+                return Err(format!("no file exists at '{trimmed}'"));
+            }
+            // Finder's delete IS move-to-trash; there is no permanent delete.
+            let script = format!(
+                "tell application \"Finder\" to delete (POSIX file {} as alias)",
+                applescript_string_literal(trimmed)
+            );
+            let mut command = std::process::Command::new("/usr/bin/osascript");
+            command.arg("-e").arg(&script);
+            run_command_with_timeout(command, timeout)?
+        }
+        _ => return Err("not a script action".into()),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "exited with {}: {}",
+            output.status,
+            compact_script_output(stderr.trim())
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_script_action(_kind: &PreparedKind) -> Result<String, String> {
+    Err("script actions are not supported on this platform".into())
 }
 
 const MAX_MENU_TITLES_IN_NOTE: usize = 12;
@@ -4777,6 +5024,9 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
         Action::WebSearch { query } => format!("webSearch:{}", normalize_text_for_match(query)),
         Action::ReadPage => "readPage".into(),
         Action::Ask { question, .. } => format!("ask:{}", normalize_text_for_match(question)),
+        Action::AppleScript { script } => format!("applescript:{}", compact_history_text(script)),
+        Action::RunShortcut { name, .. } => format!("shortcut:{}", name.trim()),
+        Action::MoveToTrash { path } => format!("moveToTrash:{}", path.trim()),
         Action::Click { .. } | Action::ClickTarget { .. } => format!(
             "click:{}",
             prepared
@@ -4930,10 +5180,33 @@ enum PreparedKind {
         question: String,
         options: Vec<String>,
     },
+    /// Rung-1 scripting actions, executed through the script runner (never
+    /// the input backend) and always behind explicit user approval.
+    AppleScript {
+        script: String,
+    },
+    RunShortcut {
+        name: String,
+        input: Option<String>,
+    },
+    MoveToTrash {
+        path: String,
+    },
     Done,
     Fail {
         reason: String,
     },
+}
+
+impl PreparedKind {
+    fn is_script(&self) -> bool {
+        matches!(
+            self,
+            PreparedKind::AppleScript { .. }
+                | PreparedKind::RunShortcut { .. }
+                | PreparedKind::MoveToTrash { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -7570,6 +7843,7 @@ mod tests {
                 excluded_bundle_ids: None,
                 confirmation_timeout_ms: None,
                 wall_clock_budget_ms: None,
+                scripting_enabled: None,
             },
             CountingFactory {
                 create_calls: create_calls.clone(),
@@ -8862,6 +9136,119 @@ mod tests {
                 .any(|step| matches!(step.action, Action::Key { .. })),
             "the queued Return must not run after a no-op click"
         );
+    }
+
+    #[test]
+    fn applescript_rejection_blocks_shell_escapes() {
+        assert!(applescript_rejection("do shell script \"rm -rf /\"").is_some());
+        assert!(applescript_rejection("DO   Shell\nSCRIPT \"x\"").is_some());
+        assert!(
+            applescript_rejection("with administrator privileges\ntell app \"Finder\"").is_some()
+        );
+        assert!(
+            applescript_rejection("tell application \"Notes\" to make new note").is_none()
+        );
+    }
+
+    #[test]
+    fn scripts_always_require_confirmation_even_under_auto() {
+        let auto = StubAgentOptions {
+            execution_policy: Some(ExecutionPolicy::Auto),
+            scripting_enabled: Some(true),
+            ..Default::default()
+        }
+        .resolve();
+        let app = focused_app("com.example.app", "Example");
+
+        for action in [
+            Action::AppleScript {
+                script: "tell application \"Notes\" to activate".into(),
+            },
+            Action::RunShortcut {
+                name: "Set DND".into(),
+                input: None,
+            },
+            Action::MoveToTrash {
+                path: "/tmp/foo".into(),
+            },
+        ] {
+            let gate = safety_gate(&auto, &app, &action, None, false);
+            assert_eq!(gate.decision, SafetyDecision::RequireConfirm);
+            assert_eq!(gate.reason, SCRIPT_CONFIRM_REASON);
+        }
+    }
+
+    #[test]
+    fn disabled_scripting_redirects_the_planner_without_failing() {
+        let seen_results = Rc::new(RefCell::new(Vec::new()));
+        let planner = ScriptThenDonePlanner {
+            seen_results: seen_results.clone(),
+        };
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask")]),
+        ]);
+        // Confirmation approved, but scripting is OFF: the run must continue
+        // with feedback instead of executing or failing.
+        let requester = FakeConfirmationRequester::single(ConfirmationStatus::Approved);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Confirmed),
+                max_steps: Some(2),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &requester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(report.steps[0].failure_reason.is_none());
+        let results = seen_results.borrow();
+        assert!(
+            results
+                .iter()
+                .any(|result| result.contains("scripting is disabled")),
+            "the planner must learn scripting is off, got {results:?}"
+        );
+    }
+
+    struct ScriptThenDonePlanner {
+        seen_results: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for ScriptThenDonePlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            *self.seen_results.borrow_mut() = history
+                .iter()
+                .map(|entry| entry.result.clone())
+                .collect();
+            if history.is_empty() {
+                PlannerDecision::new(
+                    "make a note",
+                    Action::AppleScript {
+                        script: "tell application \"Notes\" to make new note".into(),
+                    },
+                )
+            } else {
+                PlannerDecision::new("stop", Action::Done)
+            }
+        }
     }
 
     struct BatchingPlanner {

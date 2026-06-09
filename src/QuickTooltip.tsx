@@ -67,6 +67,11 @@ type AgentAction = {
   id?: number;
   text?: string;
   combo?: string;
+  path?: string[];
+  question?: string;
+  script?: string;
+  name?: string;
+  file?: string;
   dx?: number;
   dy?: number;
   ms?: number;
@@ -108,6 +113,10 @@ const AGENT_AUTONOMY_OPTIONS: CustomDropdownOption[] = [
 function readAgentAutonomy(): AgentAutonomy {
   const saved = localStorage.getItem(AGENT_AUTONOMY_STORAGE_KEY);
   return saved === "ask" || saved === "auto" ? saved : "confirm";
+}
+
+function readAgentScriptingEnabled(): boolean {
+  return localStorage.getItem("agent_scripting_enabled") === "true";
 }
 
 type AgentTaskFinished = {
@@ -265,6 +274,13 @@ function formatAgentAction(action: AgentAction): string {
   if (action.action === "webSearch")
     return action.query ? `Search "${action.query}"` : "Search the web";
   if (action.action === "readPage") return "Read page";
+  if (action.action === "menu" && action.path) return `Menu: ${action.path.join(" → ")}`;
+  if (action.action === "ask") return "Ask you a question";
+  if (action.action === "applescript") return "Run AppleScript";
+  if (action.action === "shortcut")
+    return action.name ? `Run shortcut "${action.name}"` : "Run a shortcut";
+  if (action.action === "moveToTrash")
+    return action.file ? `Move to Trash: ${action.file}` : "Move a file to Trash";
   if (action.action === "done") return "Finish task";
   return action.action || "Action";
 }
@@ -990,6 +1006,7 @@ export default function QuickTooltip() {
         visionProvider: info.provider,
         visionModel: info.model,
         autonomy: readAgentAutonomy(),
+        scriptingEnabled: readAgentScriptingEnabled(),
       });
     } catch (e) {
       setAgentRunning(false);
@@ -1192,6 +1209,11 @@ export default function QuickTooltip() {
               <div className="quick-tooltip-confirmation-target">
                 {formatAgentTarget(confirmation.target)}
               </div>
+              {confirmation.action.script && (
+                <pre className="quick-tooltip-confirmation-script">
+                  {confirmation.action.script}
+                </pre>
+              )}
               <div className="quick-tooltip-confirmation-reason">
                 {confirmation.reason}
               </div>

@@ -163,6 +163,13 @@ export default function SettingsPanel({
     localStorage.setItem("agent_autonomy", next);
     setAgentAutonomyState(next);
   };
+  const [agentScripting, setAgentScriptingState] = useState(
+    () => localStorage.getItem("agent_scripting_enabled") === "true",
+  );
+  const saveAgentScripting = (enabled: boolean) => {
+    localStorage.setItem("agent_scripting_enabled", enabled ? "true" : "false");
+    setAgentScriptingState(enabled);
+  };
   // The frosted-glass effect is now provided by the macOS native sidebar
   // window effect + CSS `backdrop-filter` on `.settings-shell` (settings.css).
   // Both update LIVE — the desktop content visible through the window
@@ -867,6 +874,16 @@ export default function SettingsPanel({
                 ]}
                 onChange={saveAgentAutonomy}
                 ariaLabel="Agent autonomy"
+              />
+            </PreferenceRow>
+            <PreferenceRow
+              title="Scripting"
+              help="Lets the agent run AppleScript, Shortcuts, and move files to the Trash. Every script is shown verbatim and waits for your approval — even in Full auto. 'do shell script' is always blocked."
+            >
+              <ToggleControl
+                checked={agentScripting}
+                onChange={saveAgentScripting}
+                ariaLabel="Allow agent scripting"
               />
             </PreferenceRow>
             <PreferenceRow

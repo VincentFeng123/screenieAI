@@ -340,6 +340,14 @@ pub enum Action {
     /// Pause and ask the user one short question; the answer arrives in the
     /// planner's history. Emits no input events.
     Ask { question: String, options: Vec<String> },
+    /// Run an AppleScript snippet. Gated by a user setting (default off) and
+    /// always requires explicit approval; `do shell script` is rejected.
+    AppleScript { script: String },
+    /// Run a Shortcuts.app shortcut by name. Same gating as AppleScript.
+    RunShortcut { name: String, input: Option<String> },
+    /// Move a file to the Trash via Finder. Permanent deletion does not
+    /// exist as a primitive.
+    MoveToTrash { path: String },
     Done,
     Fail { reason: String },
 }
@@ -365,10 +373,13 @@ impl Serialize for Action {
             | Self::Wait { .. }
             | Self::OpenUrl { .. }
             | Self::WebSearch { .. }
+            | Self::AppleScript { .. }
+            | Self::MoveToTrash { .. }
             | Self::Fail { .. } => 2,
             Self::Type { .. } | Self::TypeTarget { .. } => 3,
             Self::Drag { .. } => 3,
             Self::Ask { .. } => 3,
+            Self::RunShortcut { input, .. } => 2 + usize::from(input.is_some()),
             Self::ScrollAt { .. } => 4,
         };
         let mut state = serializer.serialize_struct("Action", field_count)?;
@@ -459,6 +470,21 @@ impl Serialize for Action {
                 state.serialize_field("question", question)?;
                 state.serialize_field("options", options)?;
             }
+            Self::AppleScript { script } => {
+                state.serialize_field("action", "applescript")?;
+                state.serialize_field("script", script)?;
+            }
+            Self::RunShortcut { name, input } => {
+                state.serialize_field("action", "shortcut")?;
+                state.serialize_field("name", name)?;
+                if let Some(input) = input {
+                    state.serialize_field("input", input)?;
+                }
+            }
+            Self::MoveToTrash { path } => {
+                state.serialize_field("action", "moveToTrash")?;
+                state.serialize_field("file", path)?;
+            }
             Self::Done => {
                 state.serialize_field("action", "done")?;
             }
@@ -492,6 +518,10 @@ impl<'de> Deserialize<'de> for Action {
             path: Option<Vec<String>>,
             question: Option<String>,
             options: Option<Vec<String>>,
+            script: Option<String>,
+            name: Option<String>,
+            input: Option<String>,
+            file: Option<String>,
             dx: Option<i32>,
             dy: Option<i32>,
             ms: Option<u64>,
@@ -544,6 +574,10 @@ impl<'de> Deserialize<'de> for Action {
             ("path", raw.path.is_some()),
             ("question", raw.question.is_some()),
             ("options", raw.options.is_some()),
+            ("script", raw.script.is_some()),
+            ("name", raw.name.is_some()),
+            ("input", raw.input.is_some()),
+            ("file", raw.file.is_some()),
             ("dx", raw.dx.is_some()),
             ("dy", raw.dy.is_some()),
             ("ms", raw.ms.is_some()),
@@ -704,6 +738,22 @@ impl<'de> Deserialize<'de> for Action {
                     .collect();
                 Ok(Self::Ask { question, options })
             }
+            "applescript" | "apple_script" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["script"])?;
+                let script = required_string::<D::Error>("script", raw.script)?;
+                Ok(Self::AppleScript { script })
+            }
+            "shortcut" | "run_shortcut" | "runShortcut" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["name", "input"])?;
+                let name = required_string::<D::Error>("name", raw.name)?;
+                let input = raw.input.filter(|input| !input.trim().is_empty());
+                Ok(Self::RunShortcut { name, input })
+            }
+            "moveToTrash" | "move_to_trash" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["file"])?;
+                let path = required_string::<D::Error>("file", raw.file)?;
+                Ok(Self::MoveToTrash { path })
+            }
             "done" => {
                 reject_extra::<D::Error>(&raw.action, &present, &[])?;
                 Ok(Self::Done)
@@ -760,6 +810,9 @@ impl Action {
             | Self::WebSearch { .. }
             | Self::ReadPage
             | Self::Ask { .. }
+            | Self::AppleScript { .. }
+            | Self::RunShortcut { .. }
+            | Self::MoveToTrash { .. }
             | Self::Done
             | Self::Fail { .. } => Vec::new(),
         }
