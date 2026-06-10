@@ -1760,6 +1760,10 @@ where
     let mut current_milestone = 0_usize;
     let mut notes: Vec<String> = Vec::new();
     let mut page_excerpt: Option<String> = None;
+    // One corrective re-ask per run before a planner-emitted fail is
+    // accepted: a stale training prior ("X does not exist") must not kill a
+    // run that has live on-screen evidence in front of it.
+    let mut fail_pushback_used = false;
     let hint_store = HintStore::new(options.hints_dir.clone());
     // Armed by a findUi menu hit (or a webLookup answer); persisted as a
     // hint only if the very next verified progress executes that knowledge
@@ -2034,6 +2038,63 @@ where
                         step_rejection_lines.push(format!("- invalid reply: {reason}"));
                         attempt_goal = compose_attempt_goal(&planner_goal, &step_rejection_lines);
                         duplicate_rejections = duplicate_rejections.saturating_add(1);
+                        continue;
+                    }
+                }
+
+                // A transport-level planner error (HTTP failure that survived
+                // the client's internal retries) is a retry, not a verdict —
+                // re-ask, bounded by the same cap as any rejected attempt.
+                if super::planner::is_transport_failure_reason(&decision.reason)
+                    && duplicate_rejections < MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP
+                {
+                    if let Action::Fail { reason } = &decision.action {
+                        eprintln!(
+                            "[screenie] agent step {} planner transport error; retrying: {reason}",
+                            step_number
+                        );
+                        planning_history.push(PlannerHistoryEntry::new(
+                            decision.action.clone(),
+                            decision.reason.clone(),
+                            format!(
+                                "planner request failed before any reply ({reason}); nothing was executed. Continue working toward the goal."
+                            ),
+                        ));
+                        step_rejection_lines.push(format!("- planner transport error: {reason}"));
+                        attempt_goal = compose_attempt_goal(&planner_goal, &step_rejection_lines);
+                        duplicate_rejections = duplicate_rejections.saturating_add(1);
+                        continue;
+                    }
+                }
+
+                // A model-emitted fail gets ONE pushback per run: terminal
+                // failure must be grounded in the screen, not in training
+                // memory, which may predate products named in the goal. A
+                // second fail (with evidence, per the feedback) is accepted.
+                // Grounding-vision fails are exempt: FAIL CLOSED there is a
+                // safety contract (login/2FA/payment screens), and that
+                // planner has no ask action to fall back on.
+                if let Action::Fail { reason } = &decision.action {
+                    if !fail_pushback_used
+                        && observation_metadata.source != ObservationSource::VisionGrounding
+                        && !super::planner::is_invalid_output_reason(&decision.reason)
+                        && !super::planner::is_transport_failure_reason(&decision.reason)
+                    {
+                        fail_pushback_used = true;
+                        eprintln!(
+                            "[screenie] agent step {} fail pushback; requiring on-screen evidence: {reason}",
+                            step_number
+                        );
+                        planning_history.push(PlannerHistoryEntry::new(
+                            decision.action.clone(),
+                            decision.reason.clone(),
+                            fail_pushback_feedback(),
+                        ));
+                        step_rejection_lines.push(
+                            "- fail deferred, not forbidden: verify on screen, ask, or emit fail again citing on-screen evidence; a justified fail WILL be accepted"
+                                .into(),
+                        );
+                        attempt_goal = compose_attempt_goal(&planner_goal, &step_rejection_lines);
                         continue;
                     }
                 }
@@ -3579,6 +3640,21 @@ where
                         );
                     }
                     last_step_clean = true;
+                    // webSearch exists to bring information back, but its
+                    // history entry is only an element-count diff — capture
+                    // the settled SERP text through the readPage path so the
+                    // results reach the planner's next prompt without an
+                    // extra readPage step. Goal-driven openUrl stays
+                    // diff-only: its destination is the goal's, not a SERP.
+                    if matches!(action, Action::WebSearch { .. }) {
+                        match observer.read_page_text() {
+                            Ok(text) => page_excerpt = Some(compact_page_excerpt(&text)),
+                            Err(err) => eprintln!(
+                                "[screenie] agent step {} webSearch page-text capture failed: {err}",
+                                step_number
+                            ),
+                        }
+                    }
                     let history_result = step_history_result(&step);
                     history.push(history_entry_for_step(
                         click_text_original.as_ref(),
@@ -4039,7 +4115,7 @@ fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
 
     if let Some(excerpt) = context.page_excerpt {
         composed.push_str(
-            "\n\nPage text (from your last readPage; save anything important with \"note\"):\n",
+            "\n\nPage text (from your last readPage/webSearch; save anything important with \"note\"):\n",
         );
         composed.push_str(excerpt);
     }
@@ -4793,6 +4869,15 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
             reason: reason.clone(),
         })),
     }
+}
+
+/// Feedback for the once-per-run fail pushback. Rendered as a history result,
+/// which the planner prompt truncates at 220 chars — keep it under that.
+fn fail_pushback_feedback() -> String {
+    format!(
+        "fail deferred: if a safety rule or on-screen evidence truly blocks the goal, emit fail again and it will be accepted. Today is {}; never deem things nonexistent from memory - verify on screen or ask.",
+        super::planner::current_date_string()
+    )
 }
 
 fn target_element_by_id(obs: &[Element], id: u32) -> Result<Element, ExecutionError> {
@@ -11794,6 +11879,108 @@ mod tests {
     }
 
     #[test]
+    fn web_search_serp_text_feeds_next_goal() {
+        // First observation is the pre-step snapshot; the second (different
+        // hash) is the settled SERP, so the webSearch verifies as Progressed.
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask"), element(2, "Results")]),
+        ])
+        .with_page_texts(vec![Ok(
+            "iPhone 17 Pro - Apple unveils A19 Pro chip".to_string(),
+        )]);
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![
+                Action::WebSearch {
+                    query: "iPhone 17 Pro".into(),
+                },
+                Action::Done,
+            ],
+            goals: goals.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(report.steps[0].executed);
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::Progressed
+        );
+        assert!(
+            goals
+                .borrow()
+                .iter()
+                .any(|goal| goal.contains("Page text") && goal.contains("A19 Pro")),
+            "SERP text should reach the next planner goal; goals: {:?}",
+            goals.borrow()
+        );
+    }
+
+    #[test]
+    fn goal_open_url_does_not_capture_page_text() {
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask"), element(2, "Apple")]),
+        ])
+        .with_page_texts(vec![Ok("UNEXPECTED page text".to_string())]);
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![
+                Action::OpenUrl {
+                    url: "https://apple.com".into(),
+                },
+                Action::Done,
+            ],
+            goals: goals.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(report.steps[0].executed);
+        assert!(
+            !goals
+                .borrow()
+                .iter()
+                .any(|goal| goal.contains("UNEXPECTED")),
+            "goal-driven openUrl must not auto-read page text; goals: {:?}",
+            goals.borrow()
+        );
+    }
+
+    #[test]
     fn consecutive_read_page_is_rejected() {
         let prepared = prepare_action(&Action::ReadPage, &[]).unwrap();
         let prior = vec![executed_step(
@@ -14281,6 +14468,294 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_emitted_fail_gets_one_pushback_before_terminal() {
+        // A stale-prior fail ("X doesn't exist") must get one corrective
+        // re-ask instead of instantly killing the run.
+        let results = Rc::new(RefCell::new(Vec::new()));
+        let planner = HistoryRecordingActionPlanner {
+            actions: vec![
+                Action::Fail {
+                    reason: "iPhone 17 Pro is a hypothetical product".into(),
+                },
+                Action::Done,
+            ],
+            results: results.clone(),
+        };
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(
+            report.status,
+            AgentRunStatus::Done,
+            "first fail must be pushed back, not terminal: {:?}",
+            report.failure_reason
+        );
+        let recorded = results.borrow();
+        assert!(
+            recorded.iter().any(|result| result.contains("fail deferred")),
+            "planner must see the pushback feedback: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn grounding_mode_fail_is_terminal_without_pushback() {
+        // FAIL CLOSED is a safety contract in grounding mode (login/2FA/
+        // payment screens): the pushback must not bounce those fails back.
+        // If the pushback fired, the stub's fallback (Done) would end the
+        // run as Done — Failed proves the first fail was accepted.
+        let planner = StubPlanner::single(Action::Fail {
+            reason: "login screen reached".into(),
+        });
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])])
+            .with_grounding_context(grounding_context());
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        assert_eq!(
+            report.failure_reason.as_deref(),
+            Some("login screen reached")
+        );
+    }
+
+    #[test]
+    fn fail_pushback_rejection_line_keeps_escape_hatch_visible() {
+        // The goal-appended rejection block says "do NOT repeat"; the
+        // pushback's own line must override that for a justified re-fail,
+        // at the same high-recency position.
+        let goals = Rc::new(RefCell::new(Vec::new()));
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![
+                Action::Fail {
+                    reason: "looks impossible".into(),
+                },
+                Action::Done,
+            ],
+            goals: goals.clone(),
+        };
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])]);
+        let _ = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        let recorded = goals.borrow();
+        assert!(
+            recorded
+                .iter()
+                .any(|goal| goal.contains("emit fail again citing on-screen evidence")),
+            "the re-ask goal must carry the escape hatch: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn second_model_fail_is_terminal_with_its_reason() {
+        let planner = StubPlanner::sequence(vec![
+            Action::Fail {
+                reason: "first refusal".into(),
+            },
+            Action::Fail {
+                reason: "second refusal".into(),
+            },
+        ]);
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        assert_eq!(report.failure_reason.as_deref(), Some("second refusal"));
+    }
+
+    #[test]
+    fn transport_failure_is_reasked_then_recovers() {
+        let calls = Rc::new(Cell::new(0));
+        let planner = TransportFailPlanner {
+            failures: 1,
+            calls: calls.clone(),
+        };
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(
+            report.status,
+            AgentRunStatus::Done,
+            "a transport blip must not kill the run: {:?}",
+            report.failure_reason
+        );
+        assert_eq!(calls.get(), 2, "the planner is simply asked again");
+    }
+
+    #[test]
+    fn persistent_transport_failure_stays_bounded() {
+        let calls = Rc::new(Cell::new(0));
+        let planner = TransportFailPlanner {
+            failures: u32::MAX,
+            calls: calls.clone(),
+        };
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        assert!(report
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("planner request failed"));
+        assert_eq!(
+            calls.get(),
+            u32::from(MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP) + 1,
+            "transport retries stay bounded by the rejection cap"
+        );
+    }
+
+    #[test]
+    fn fail_pushback_feedback_fits_history_render_cap() {
+        let feedback = fail_pushback_feedback();
+        assert!(
+            feedback.chars().count() <= 220,
+            "feedback must survive the 220-char history render cap: {} chars",
+            feedback.chars().count()
+        );
+        // The escape hatch leads so tail truncation can never eat it, and
+        // rule-mandated fails (secrets, safety) are explicitly covered.
+        assert!(feedback.starts_with("fail deferred"), "{feedback}");
+        assert!(feedback.contains("safety rule"), "{feedback}");
+        assert!(feedback.contains(&crate::agent::planner::current_date_string()));
+    }
+
+    struct TransportFailPlanner {
+        failures: u32,
+        calls: Rc<Cell<u32>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for TransportFailPlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            _history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() <= self.failures {
+                // Mirrors planner_fail's shape for an HTTP error that
+                // survived the client's internal retries.
+                PlannerDecision::new(
+                    "planner request failed",
+                    Action::Fail {
+                        reason: "planner request failed: connection reset".into(),
+                    },
+                )
+            } else {
+                PlannerDecision::new("stop", Action::Done)
+            }
+        }
+    }
+
     struct InvalidOutputPlanner {
         invalid_replies: u32,
         calls: Rc<Cell<u32>>,
@@ -15017,6 +15492,10 @@ mod tests {
         }
 
         fn activate_app(&mut self, _app: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn open_url(&mut self, _url: &str) -> Result<(), String> {
             Ok(())
         }
     }
