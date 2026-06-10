@@ -3,14 +3,17 @@ use super::grounding::{
     DEFAULT_GROUNDER_CONFIDENCE_THRESHOLD, DEFAULT_GROUNDER_ENDPOINT, DEFAULT_GROUNDER_HEALTH_URL,
     DEFAULT_GROUNDER_MODEL,
 };
+use super::hints::{now_ms, HintStore, UiHint, UiHintKind};
 use super::search::score_match;
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
 use super::types::{
     is_secure_text_role, normalize_signature_name, Action, CoordinateSpace, Element, ElementSource,
-    FocusedApp, FocusedAppProvider, MenuMatch, MenuPressOutcome, MenuScanResult, ObservationError,
-    Planner, PlannerHistoryEntry, Rect, ScreenObserver,
+    FocusedApp, FocusedAppProvider, MenuPressOutcome, MenuScanResult, ObservationError, Planner,
+    PlannerHistoryEntry, Rect, ScreenObserver,
 };
+#[cfg(test)]
+use super::types::MenuMatch;
 use super::vision::{
     click_point_from_rect, coordinate_element, CaptureSize, ObservationMetadata,
     ObservationMetadataProvider, ObservationSource, VisionFallbackContext, VisionFallbackMode,
@@ -176,6 +179,10 @@ pub struct StubAgentOptions {
     /// Default OFF; even when on, every script requires explicit approval.
     #[serde(default)]
     pub scripting_enabled: Option<bool>,
+    /// Where verified per-app navigation hints persist (findUi consults
+    /// them, verified paths write back). `None` disables persistence.
+    #[serde(default)]
+    pub hints_dir: Option<std::path::PathBuf>,
 }
 
 impl StubAgentOptions {
@@ -297,6 +304,7 @@ impl StubAgentOptions {
                 .filter(|value| *value > 0)
                 .unwrap_or(DEFAULT_WALL_CLOCK_BUDGET_MS),
             scripting_enabled: self.scripting_enabled.unwrap_or(false),
+            hints_dir: self.hints_dir.clone(),
         }
     }
 }
@@ -378,6 +386,7 @@ pub struct ResolvedStubAgentOptions {
     pub confirmation_timeout_ms: u64,
     pub wall_clock_budget_ms: u64,
     pub scripting_enabled: bool,
+    pub hints_dir: Option<std::path::PathBuf>,
 }
 
 impl ResolvedStubAgentOptions {
@@ -1632,6 +1641,13 @@ where
     let mut current_milestone = 0_usize;
     let mut notes: Vec<String> = Vec::new();
     let mut page_excerpt: Option<String> = None;
+    let hint_store = HintStore::new(options.hints_dir.clone());
+    // Armed by a findUi menu hit (or a webLookup answer); persisted as a
+    // hint only if the very next verified progress executes that knowledge
+    // (a menu press or key combo) — ground truth, never parsed web text.
+    let mut pending_hint: Option<PendingHint> = None;
+    // webLookup legality: only after a findUi came up short this stuck-point.
+    let mut find_ui_since_progress = false;
     // Post-action snapshot carried into the next step's pre-observation to
     // avoid a duplicate AX walk; settle timeout tracks the previous action's
     // class (fast UI tweaks vs. app/page navigation).
@@ -1788,6 +1804,8 @@ where
             }
         }
 
+        let known_hints =
+            known_hints_line(&hint_store, &focused_before_observation, &options.goal);
         let planner_goal = compose_planner_goal(
             &options.goal,
             &GoalContext {
@@ -1797,6 +1815,7 @@ where
                 notes: &notes,
                 page_excerpt: page_excerpt.as_deref(),
                 recovery_notice: stuck_recovery.notice(),
+                known_hints: known_hints.as_deref(),
             },
         );
         let mut planning_history = history.clone();
@@ -2189,18 +2208,26 @@ where
                 let result_text = if options.execution_policy.is_dry_run() {
                     "dry-run: findUi skipped".to_string()
                 } else {
-                    // Source priority: menu paths beat observation elements —
-                    // a menu press is the more reliable next action.
-                    let mut matches: Vec<FindUiMatch> = Vec::new();
+                    find_ui_since_progress = true;
+                    // Source priority: verified hints, then menu paths, then
+                    // observation elements — most reliable next action first.
+                    let mut matches: Vec<FindUiMatch> = find_ui_hint_matches(
+                        &hint_store,
+                        &focused_before_observation,
+                        query,
+                    );
                     let mut scan_truncated = false;
-                    match observer.search_menu_tree(query, MAX_FIND_UI_MATCHES) {
-                        Ok(scan) => {
-                            scan_truncated = scan.truncated;
-                            matches.extend(find_ui_menu_matches(&scan));
+                    // On scan failure (permission, no menu bar): degrade to
+                    // observation matches instead of failing.
+                    if let Ok(scan) = observer.search_menu_tree(query, MAX_FIND_UI_MATCHES) {
+                        scan_truncated = scan.truncated;
+                        if !scan.matches.is_empty() {
+                            pending_hint = Some(PendingHint {
+                                feature: query.clone(),
+                                source: "menuScan",
+                            });
                         }
-                        // No menu access (permission, no menu bar): degrade
-                        // to observation matches instead of failing.
-                        Err(_) => {}
+                        matches.extend(find_ui_menu_matches(&scan));
                     }
                     matches.extend(find_ui_observation_matches(&before, query));
                     step.executed = true;
@@ -2216,11 +2243,15 @@ where
             }
             PreparedKind::WebLookup { .. } => {
                 // Graceful rung descent, mirroring the disabled-scripting
-                // path: the planner learns the action is unavailable instead
-                // of the run failing.
-                let result_text =
-                    "web lookup is disabled in Settings \u{2192} Agent (or unsupported by this provider); use findUi, scroll, or ask instead"
-                        .to_string();
+                // path: the planner learns why the lookup didn't run instead
+                // of the run failing. Local search is non-negotiable first.
+                let result_text = if !find_ui_since_progress {
+                    "webLookup is allowed only after findUi comes up empty; emit findUi with a short feature query first"
+                        .to_string()
+                } else {
+                    "web lookup is disabled in Settings \u{2192} Agent (or unsupported by this provider); use findUi results, scroll, or ask instead"
+                        .to_string()
+                };
                 history.push(PlannerHistoryEntry::new(
                     action.clone(),
                     planner_reason.clone(),
@@ -2769,6 +2800,9 @@ where
             );
             let mut menu_feedback: Option<String> = None;
             let mut script_output: Option<String> = None;
+            // AX-resolved path of a pressed menu item; the ground truth a
+            // pending hint persists if this step verifies as progress.
+            let mut menu_resolved_path: Option<Vec<String>> = None;
             let execution_result = if let PreparedKind::Menu { path } = &prepared.kind {
                 if options.execution_policy.is_dry_run() {
                     Ok(false)
@@ -2781,9 +2815,13 @@ where
                                 step_number,
                                 resolved_path.join(" > ")
                             );
+                            menu_resolved_path = Some(resolved_path);
                             Ok(true)
                         }
                         Ok(MenuPressOutcome::NotFound { depth, available }) => {
+                            // Self-healing: if this exact path was a stored
+                            // hint, it is stale — delete it now.
+                            hint_store.remove_menu_path(&focused_before_observation, path);
                             menu_feedback = Some(menu_not_found_note(path, depth, &available));
                             Ok(false)
                         }
@@ -2945,6 +2983,19 @@ where
                 VerificationStatus::Progressed => {
                     recent_no_progress.clear();
                     stuck_recovery.on_progress();
+                    find_ui_since_progress = false;
+                    // One-shot: the hint persists only when the progressed
+                    // action executed the searched-for knowledge.
+                    if let Some(pending) = pending_hint.take() {
+                        record_pending_hint(
+                            &hint_store,
+                            &focused_before_observation,
+                            &pending,
+                            &action,
+                            menu_resolved_path.take(),
+                            &options,
+                        );
+                    }
                     last_step_clean = true;
                     let history_result = step_history_result(&step);
                     history.push(PlannerHistoryEntry::new(
@@ -3273,6 +3324,9 @@ struct GoalContext<'a> {
     notes: &'a [String],
     page_excerpt: Option<&'a str>,
     recovery_notice: Option<&'a str>,
+    /// Previously verified navigation paths for this app that match the
+    /// goal; rendered template-driven from the hint cache.
+    known_hints: Option<&'a str>,
 }
 
 fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
@@ -3291,10 +3345,14 @@ fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
     };
 
     let mut composed = format!(
-        "Runtime context:\n{}\nThe focused app is already selected; do not search for the app name as a visible element.\n\nUser goal:\n{}",
-        focused_app_line,
-        goal.trim()
+        "Runtime context:\n{}\nThe focused app is already selected; do not search for the app name as a visible element.",
+        focused_app_line
     );
+    if let Some(known_hints) = context.known_hints {
+        composed.push('\n');
+        composed.push_str(known_hints);
+    }
+    composed.push_str(&format!("\n\nUser goal:\n{}", goal.trim()));
 
     if !context.milestones.is_empty() {
         composed.push_str("\n\nPlan:\n");
@@ -3424,6 +3482,99 @@ fn find_ui_observation_matches(obs: &[Element], query: &str) -> Vec<FindUiMatch>
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
     scored.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn find_ui_hint_matches(store: &HintStore, app: &FocusedApp, query: &str) -> Vec<FindUiMatch> {
+    let now = now_ms();
+    store
+        .lookup(app, query, MAX_FIND_UI_MATCHES, now)
+        .iter()
+        .filter_map(|hint| hint.render(now))
+        .map(|rendered| FindUiMatch {
+            segment: truncate_segment(&format!("hint: {rendered}")),
+        })
+        .collect()
+}
+
+/// Armed by a findUi menu hit or a webLookup answer; consumed by the next
+/// verified progress.
+struct PendingHint {
+    feature: String,
+    source: &'static str,
+}
+
+/// Persist a pending hint when — and only when — the progressed action
+/// executed the searched-for knowledge: a menu press stores its AX-resolved
+/// path (never a claimed one), a key combo after a web lookup stores the
+/// combo the executor actually parsed and ran. Destructive combos are never
+/// cached. Settings locations are deliberately not written: there is no
+/// cheap ground truth for them.
+fn record_pending_hint(
+    store: &HintStore,
+    app: &FocusedApp,
+    pending: &PendingHint,
+    action: &Action,
+    menu_resolved_path: Option<Vec<String>>,
+    options: &ResolvedStubAgentOptions,
+) {
+    let hint = match (action, menu_resolved_path) {
+        (Action::Menu { .. }, Some(resolved_path)) => UiHint {
+            feature: pending.feature.clone(),
+            kind: UiHintKind::Menu,
+            menu_path: Some(resolved_path),
+            combo: None,
+            settings_pane: None,
+            verified_at_ms: now_ms(),
+            source: pending.source.into(),
+        },
+        (Action::Key { combo }, _) if pending.source == "webLookup" => {
+            if validate_key_combo(combo).is_err()
+                || app_window_closing_key_combo_reason(combo).is_some()
+            {
+                return;
+            }
+            let normalized = normalize_key_combo_for_safety(combo);
+            if options
+                .destructive_key_combos
+                .iter()
+                .map(|candidate| normalize_key_combo_for_safety(candidate))
+                .any(|candidate| candidate == normalized)
+            {
+                return;
+            }
+            UiHint {
+                feature: pending.feature.clone(),
+                kind: UiHintKind::Shortcut,
+                menu_path: None,
+                combo: Some(combo.trim().to_string()),
+                settings_pane: None,
+                verified_at_ms: now_ms(),
+                source: pending.source.into(),
+            }
+        }
+        _ => return,
+    };
+    store.record(app, hint);
+}
+
+const MAX_KNOWN_HINTS_IN_GOAL: usize = 3;
+
+/// One line of previously verified paths relevant to this goal, surfaced at
+/// every step so a repeat task skips the whole search ladder.
+fn known_hints_line(store: &HintStore, app: &FocusedApp, goal: &str) -> Option<String> {
+    let now = now_ms();
+    let rendered: Vec<String> = store
+        .lookup(app, goal, MAX_KNOWN_HINTS_IN_GOAL, now)
+        .iter()
+        .filter_map(|hint| Some(format!("{} = {}", hint.feature, hint.render(now)?)))
+        .collect();
+    if rendered.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Known paths in this app (learned earlier; verify on screen): {}",
+        rendered.join("; ")
+    ))
 }
 
 fn find_ui_menu_matches(scan: &MenuScanResult) -> Vec<FindUiMatch> {
@@ -7715,9 +7866,15 @@ mod tests {
                 notes: &notes,
                 page_excerpt: Some("Mac mini M2 $429 at B&H"),
                 recovery_notice: Some("STUCK: stop clicking that"),
+                known_hints: Some(
+                    "Known paths in this app (learned earlier; verify on screen): web inspector = menu Develop > Show Web Inspector (verified today)",
+                ),
             },
         );
 
+        assert!(goal.contains(
+            "Known paths in this app (learned earlier; verify on screen): web inspector"
+        ));
         assert!(goal.contains("1. [done] open a browser"));
         assert!(goal.contains("2. [CURRENT] compare prices"));
         assert!(goal.contains("3. open the buy page"));
@@ -7735,12 +7892,14 @@ mod tests {
                 notes: &[],
                 page_excerpt: None,
                 recovery_notice: None,
+                known_hints: None,
             },
         );
         assert!(!bare.contains("Plan:"));
         assert!(!bare.contains("Notes you saved earlier:"));
         assert!(!bare.contains("Page text"));
         assert!(!bare.contains("Recovery:"));
+        assert!(!bare.contains("Known paths"));
     }
 
     #[test]
@@ -8245,11 +8404,19 @@ mod tests {
     }
 
     #[test]
-    fn web_lookup_descends_gracefully_when_unavailable() {
-        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+    fn web_lookup_requires_find_ui_first_then_descends_gracefully() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 10]);
         let results = Rc::new(RefCell::new(Vec::<String>::new()));
         let planner = HistoryRecordingActionPlanner {
             actions: vec![
+                // Skipping local search: rejected with the findUi-first rule.
+                Action::WebLookup {
+                    query: "develop menu".into(),
+                },
+                Action::FindUi {
+                    query: "develop menu".into(),
+                },
+                // After findUi, the (unavailable) lookup descends gracefully.
                 Action::WebLookup {
                     query: "develop menu".into(),
                 },
@@ -8262,7 +8429,7 @@ mod tests {
             &planner,
             StubAgentOptions {
                 execution_policy: Some(ExecutionPolicy::Auto),
-                max_steps: Some(4),
+                max_steps: Some(6),
                 settle_ms: Some(0),
                 max_action_retries: Some(0),
                 ..Default::default()
@@ -8277,14 +8444,249 @@ mod tests {
 
         assert_eq!(report.status, AgentRunStatus::Done);
         assert!(!report.steps[0].executed);
+        let recorded = results.borrow();
+        assert!(
+            recorded
+                .iter()
+                .any(|result| result.contains("allowed only after findUi")),
+            "lookup before findUi must be rejected, got {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|result| result.contains("web lookup is disabled")),
+            "lookup after findUi must descend gracefully, got {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn verified_menu_press_after_find_ui_writes_hint_and_next_run_reads_it() {
+        let dir =
+            std::env::temp_dir().join(format!("screenie-hint-writeback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let menu_path = vec!["File".to_string(), "Export as PDF…".to_string()];
+
+        // Run 1: findUi finds the menu path, the menu press verifies as
+        // progress, the hint is persisted.
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask"), element(2, "Export sheet")]),
+        ])
+        .with_menu_tree(vec![menu_path.clone()])
+        .with_menu_results(vec![Ok(MenuPressOutcome::Pressed {
+            resolved_path: menu_path.clone(),
+        })]);
+        let planner = HistoryRecordingActionPlanner {
+            actions: vec![
+                Action::FindUi {
+                    query: "export pdf".into(),
+                },
+                Action::Menu {
+                    path: menu_path.clone(),
+                },
+                Action::Done,
+            ],
+            results: Rc::new(RefCell::new(Vec::new())),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(5),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                hints_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+        assert_eq!(report.status, AgentRunStatus::Done);
+
+        let store = HintStore::new(Some(dir.clone()));
+        let app = focused_app("com.example.app", "Example");
+        let hits = store.lookup(&app, "export pdf", 3, now_ms());
+        assert_eq!(hits.len(), 1, "verified menu press must persist a hint");
+        assert_eq!(hits[0].menu_path.as_deref(), Some(&menu_path[..]));
+
+        // Run 2: findUi surfaces the stored hint first, and the goal context
+        // carries the known path from step one.
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+        let results = Rc::new(RefCell::new(Vec::<String>::new()));
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        let planner = GoalAndHistoryRecordingPlanner {
+            actions: vec![
+                Action::FindUi {
+                    query: "export pdf".into(),
+                },
+                Action::Done,
+            ],
+            results: results.clone(),
+            goals: goals.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                goal: Some("export this note as a pdf".into()),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                hints_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+        assert_eq!(report.status, AgentRunStatus::Done);
         assert!(
             results
                 .borrow()
                 .iter()
-                .any(|result| result.contains("web lookup is disabled")),
-            "planner must learn web lookup is unavailable, got {:?}",
+                .any(|result| result.contains("hint: menu File > Export as PDF…")),
+            "second run must surface the stored hint, got {:?}",
             results.borrow()
         );
+        assert!(
+            goals
+                .borrow()
+                .iter()
+                .any(|goal| goal.contains("Known paths in this app")),
+            "goal context must carry the known path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unverified_menu_press_writes_no_hint() {
+        let dir =
+            std::env::temp_dir().join(format!("screenie-hint-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let menu_path = vec!["File".to_string(), "Export as PDF…".to_string()];
+
+        // Same flow, but the observation never changes → NoOp, not Progressed.
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 10])
+            .with_menu_tree(vec![menu_path.clone()])
+            .with_menu_results(vec![Ok(MenuPressOutcome::Pressed {
+                resolved_path: menu_path.clone(),
+            })]);
+        let planner = HistoryRecordingActionPlanner {
+            actions: vec![
+                Action::FindUi {
+                    query: "export pdf".into(),
+                },
+                Action::Menu {
+                    path: menu_path.clone(),
+                },
+                Action::Fail {
+                    reason: "test stop".into(),
+                },
+            ],
+            results: Rc::new(RefCell::new(Vec::new())),
+        };
+        let _ = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(5),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                hints_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        let store = HintStore::new(Some(dir.clone()));
+        let app = focused_app("com.example.app", "Example");
+        assert!(
+            store.lookup(&app, "export pdf", 3, now_ms()).is_empty(),
+            "a no-op press must not persist a hint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn destructive_combo_is_never_cached_as_hint() {
+        let dir = std::env::temp_dir().join(format!("screenie-hint-combo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = HintStore::new(Some(dir.clone()));
+        let app = focused_app("com.example.app", "Example");
+        let options = StubAgentOptions::default().resolve();
+
+        record_pending_hint(
+            &store,
+            &app,
+            &PendingHint {
+                feature: "close everything".into(),
+                source: "webLookup",
+            },
+            &Action::Key {
+                combo: "cmd+q".into(),
+            },
+            None,
+            &options,
+        );
+        assert!(store.lookup(&app, "close everything", 3, now_ms()).is_empty());
+
+        record_pending_hint(
+            &store,
+            &app,
+            &PendingHint {
+                feature: "responsive design mode".into(),
+                source: "webLookup",
+            },
+            &Action::Key {
+                combo: "cmd+option+r".into(),
+            },
+            None,
+            &options,
+        );
+        let hits = store.lookup(&app, "responsive design mode", 3, now_ms());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].combo.as_deref(), Some("cmd+option+r"));
+
+        // A menu-scan pending hint never records a combo — the combo did not
+        // come from the scan.
+        record_pending_hint(
+            &store,
+            &app,
+            &PendingHint {
+                feature: "from menu scan".into(),
+                source: "menuScan",
+            },
+            &Action::Key {
+                combo: "cmd+option+i".into(),
+            },
+            None,
+            &options,
+        );
+        assert!(store.lookup(&app, "from menu scan", 3, now_ms()).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8366,6 +8768,7 @@ mod tests {
                 confirmation_timeout_ms: None,
                 wall_clock_budget_ms: None,
                 scripting_enabled: None,
+                hints_dir: None,
             },
             CountingFactory {
                 create_calls: create_calls.clone(),
@@ -10232,6 +10635,36 @@ mod tests {
             history: &[PlannerHistoryEntry],
         ) -> PlannerDecision {
             self.goals.borrow_mut().push(goal.to_string());
+            let action = self
+                .actions
+                .get(history.len())
+                .or_else(|| self.actions.last())
+                .cloned()
+                .expect("planner needs at least one action");
+            PlannerDecision::new("recording stub", action)
+        }
+    }
+
+    /// HistoryRecordingActionPlanner that additionally captures every goal
+    /// string, for asserting goal-context content alongside history results.
+    struct GoalAndHistoryRecordingPlanner {
+        actions: Vec<Action>,
+        results: Rc<RefCell<Vec<String>>>,
+        goals: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for GoalAndHistoryRecordingPlanner {
+        async fn next_action(
+            &self,
+            goal: &str,
+            _obs: &[Element],
+            history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            self.goals.borrow_mut().push(goal.to_string());
+            let mut results = self.results.borrow_mut();
+            results.clear();
+            results.extend(history.iter().map(|entry| entry.result.clone()));
             let action = self
                 .actions
                 .get(history.len())

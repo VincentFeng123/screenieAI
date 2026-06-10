@@ -1,5 +1,6 @@
 mod executor;
 mod grounding;
+mod hints;
 #[cfg(target_os = "macos")]
 mod macos_observer;
 mod observer;

@@ -1432,6 +1432,11 @@ fn prepare_stub_agent_run(
     String,
 > {
     let (text_config, vision_config) = resolve_stub_agent_decision_configs(options)?;
+    // Verified per-app navigation hints (findUi reads, verified paths write
+    // back). Missing app-data dir just disables persistence for the run.
+    options.hints_dir = app_data_dir(app)
+        .ok()
+        .map(|dir| dir.join("agent").join("hints"));
     let state = app.state::<AppState>();
     state.agent_abort.reset();
     let _ = drain_pending_agent_confirmations(&state);
