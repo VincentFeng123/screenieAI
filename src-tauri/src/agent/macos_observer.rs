@@ -4,10 +4,11 @@ use super::observer::{
     ObservedCandidate, MAX_OBSERVED_ELEMENTS,
 };
 use super::safari_dom;
+use super::search::score_match;
 use super::types::{
     is_secure_text_role, normalize_signature_name, CoordinateSpace, Element, ElementSource,
-    FocusedApp, FocusedAppProvider, MenuPressOutcome, ObservationError, PlatformElementHandle,
-    Rect, ScreenObserver,
+    FocusedApp, FocusedAppProvider, MenuMatch, MenuPressOutcome, MenuScanResult, ObservationError,
+    PlatformElementHandle, Rect, ScreenObserver,
 };
 use super::vision::{ObservationMetadata, ObservationMetadataProvider};
 use core_foundation::base::TCFType;
@@ -30,6 +31,7 @@ use std::fmt;
 use std::mem;
 use std::ptr;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 const MAX_AX_DEPTH: usize = 8;
 const MAX_AX_WEB_DEPTH: usize = 24;
@@ -469,6 +471,28 @@ impl ScreenObserver for MacObserver {
         Ok(MenuPressOutcome::Pressed { resolved_path })
     }
 
+    fn search_menu_tree(&self, query: &str, max_results: usize) -> Result<MenuScanResult, String> {
+        ensure_accessibility_permission_with(system_accessibility_trusted, prompt_accessibility)
+            .map_err(|err| err.to_string())?;
+
+        let focused_app = frontmost_application_info()
+            .map_err(|err| err.to_string())?
+            .ok_or("no frontmost application")?;
+        let pid = focused_app.pid.ok_or("no frontmost application pid")?;
+        let app = unsafe { AXUIElementCreateApplication(pid) };
+        if app.is_null() {
+            return Err("no frontmost application".into());
+        }
+        let _app_ref = OwnedCf::new(app);
+
+        let Some(menu_bar) = copy_attribute(app, "AXMenuBar").map_err(|err| err.to_string())?
+        else {
+            return Ok(MenuScanResult::default());
+        };
+
+        Ok(scan_menu_tree(menu_bar.as_type_ref(), query, max_results))
+    }
+
     fn refresh_element(&self, el: &Element) -> Option<Element> {
         match el.source {
             ElementSource::Ax => {
@@ -782,6 +806,85 @@ fn collect_menu_children(
         items.push((OwnedCf::new(retained), title));
     }
     Ok(())
+}
+
+const MAX_MENU_SCAN_DEPTH: usize = 4;
+const MAX_MENU_SCAN_NODES: usize = 1500;
+const MENU_SCAN_BUDGET_MS: u64 = 350;
+
+/// Read-only fuzzy search over the whole menu tree. The tree is fully
+/// readable while menus stay closed (same property press_menu_path relies
+/// on), so this never changes anything on screen. Bounded by depth, node
+/// count, and wall clock so apps with huge menus (Xcode) stay cheap;
+/// exceeding a budget sets `truncated` instead of failing.
+fn scan_menu_tree(menu_bar: AXUIElementRef, query: &str, max_results: usize) -> MenuScanResult {
+    let started = Instant::now();
+    let budget = Duration::from_millis(MENU_SCAN_BUDGET_MS);
+    let mut scored: Vec<(u32, MenuMatch)> = Vec::new();
+    let mut truncated = false;
+    let mut visited = 0usize;
+
+    let mut stack: Vec<(OwnedCf, Vec<String>, usize)> = menu_level_items(menu_bar)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, title)| !title.trim().is_empty())
+        .map(|(element, title)| (element, vec![title], 1))
+        .collect();
+    // Reverse so the leftmost menu (File before Help) is scanned first when
+    // budgets bite.
+    stack.reverse();
+
+    while let Some((element, path, depth)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_MENU_SCAN_NODES || started.elapsed() >= budget {
+            truncated = true;
+            break;
+        }
+
+        let title = path.last().map(String::as_str).unwrap_or_default();
+        // Score the item title and the joined path so multi-level queries
+        // ("safari settings advanced") can match too.
+        let score = match (score_match(title, query), score_match(&path.join(" "), query)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(score) = score {
+            // AXEnabled read only for hits — it is the expensive part.
+            let enabled = copy_bool_attribute(element.as_type_ref(), "AXEnabled")
+                .ok()
+                .flatten()
+                .unwrap_or(true);
+            scored.push((
+                score,
+                MenuMatch {
+                    path: path.clone(),
+                    enabled,
+                },
+            ));
+        }
+
+        if depth < MAX_MENU_SCAN_DEPTH {
+            // One unreadable submenu shouldn't kill the scan.
+            let children = menu_level_items(element.as_type_ref()).unwrap_or_default();
+            for (child, child_title) in children.into_iter().rev() {
+                if !child_title.trim().is_empty() {
+                    let mut child_path = path.clone();
+                    child_path.push(child_title);
+                    stack.push((child, child_path, depth + 1));
+                }
+            }
+        }
+    }
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    MenuScanResult {
+        matches: scored
+            .into_iter()
+            .take(max_results)
+            .map(|(_, entry)| entry)
+            .collect(),
+        truncated,
+    }
 }
 
 /// Match a model-supplied menu title against the level's real titles:

@@ -8,8 +8,8 @@ use super::search::score_match;
 use super::grounding::{GroundingPixel, NoopGrounder};
 use super::types::{
     is_secure_text_role, normalize_signature_name, Action, CoordinateSpace, Element, ElementSource,
-    FocusedApp, FocusedAppProvider, MenuPressOutcome, ObservationError, Planner,
-    PlannerHistoryEntry, Rect, ScreenObserver,
+    FocusedApp, FocusedAppProvider, MenuMatch, MenuPressOutcome, MenuScanResult, ObservationError,
+    Planner, PlannerHistoryEntry, Rect, ScreenObserver,
 };
 use super::vision::{
     click_point_from_rect, coordinate_element, CaptureSize, ObservationMetadata,
@@ -2189,9 +2189,22 @@ where
                 let result_text = if options.execution_policy.is_dry_run() {
                     "dry-run: findUi skipped".to_string()
                 } else {
-                    let matches = find_ui_observation_matches(&before, query);
+                    // Source priority: menu paths beat observation elements —
+                    // a menu press is the more reliable next action.
+                    let mut matches: Vec<FindUiMatch> = Vec::new();
+                    let mut scan_truncated = false;
+                    match observer.search_menu_tree(query, MAX_FIND_UI_MATCHES) {
+                        Ok(scan) => {
+                            scan_truncated = scan.truncated;
+                            matches.extend(find_ui_menu_matches(&scan));
+                        }
+                        // No menu access (permission, no menu bar): degrade
+                        // to observation matches instead of failing.
+                        Err(_) => {}
+                    }
+                    matches.extend(find_ui_observation_matches(&before, query));
                     step.executed = true;
-                    compose_find_ui_result(query, &matches, false)
+                    compose_find_ui_result(query, &matches, false, scan_truncated)
                 };
                 history.push(PlannerHistoryEntry::new(
                     action.clone(),
@@ -3357,10 +3370,11 @@ const MAX_FIND_UI_MATCHES: usize = 3;
 const MAX_FIND_UI_RESULT_CHARS: usize = 200;
 const MAX_FIND_UI_SEGMENT_CHARS: usize = 80;
 
-/// One ranked findUi hit, pre-rendered as a segment the model can act on
-/// next turn ("menu File > Export as PDF…", "element [12] AXButton \"Export\"").
+/// One findUi hit, pre-rendered as a segment the model can act on next turn
+/// ("menu File > Export as PDF…", "element [12] AXButton \"Export\"").
+/// Callers assemble these in source-priority order: hints, then menu
+/// matches, then observation elements.
 struct FindUiMatch {
-    score: u32,
     segment: String,
 }
 
@@ -3377,7 +3391,7 @@ fn truncate_segment(text: &str) -> String {
 }
 
 fn find_ui_observation_matches(obs: &[Element], query: &str) -> Vec<FindUiMatch> {
-    let mut matches: Vec<FindUiMatch> = obs
+    let mut scored: Vec<(u32, FindUiMatch)> = obs
         .iter()
         .filter_map(|element| {
             let name_score = score_match(&element.name, query);
@@ -3397,26 +3411,48 @@ fn find_ui_observation_matches(obs: &[Element], query: &str) -> Vec<FindUiMatch>
                 element.name.clone()
             };
             let disabled = if element.enabled { "" } else { " (disabled now)" };
-            Some(FindUiMatch {
+            Some((
                 score,
-                segment: truncate_segment(&format!(
-                    "element [{}] {} \"{}\"{disabled}",
-                    element.id, element.role, label
-                )),
-            })
+                FindUiMatch {
+                    segment: truncate_segment(&format!(
+                        "element [{}] {} \"{}\"{disabled}",
+                        element.id, element.role, label
+                    )),
+                },
+            ))
         })
         .collect();
-    matches.sort_by(|a, b| b.score.cmp(&a.score));
-    matches
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn find_ui_menu_matches(scan: &MenuScanResult) -> Vec<FindUiMatch> {
+    scan.matches
+        .iter()
+        .map(|entry| {
+            let disabled = if entry.enabled { "" } else { " (disabled now)" };
+            FindUiMatch {
+                segment: truncate_segment(&format!("menu {}{disabled}", entry.path.join(" > "))),
+            }
+        })
+        .collect()
 }
 
 /// Pack the top matches into one history-result line. `web_lookup_available`
-/// only changes the advice in the no-match message.
+/// only changes the advice in the no-match message; `scan_truncated` flags
+/// that a menu-scan budget cut the walk short, so "no match" must not read
+/// as "does not exist".
 fn compose_find_ui_result(
     query: &str,
     matches: &[FindUiMatch],
     web_lookup_available: bool,
+    scan_truncated: bool,
 ) -> String {
+    let truncation_note = if scan_truncated {
+        " (menu scan truncated)"
+    } else {
+        ""
+    };
     if matches.is_empty() {
         let escalation = if web_lookup_available {
             "or use webLookup"
@@ -3424,14 +3460,17 @@ fn compose_find_ui_result(
             "or ask"
         };
         return format!(
-            "no match for \"{}\" in menus, hints, or visible elements; reword the query, scroll, {escalation}",
+            "no match for \"{}\" in menus, hints, or visible elements{truncation_note}; reword the query, scroll, {escalation}",
             truncate_segment(query)
         );
     }
     let mut result = String::from("found: ");
     for entry in matches.iter().take(MAX_FIND_UI_MATCHES) {
         let separator = if result.ends_with(": ") { "" } else { "; " };
-        if result.chars().count() + separator.len() + entry.segment.chars().count()
+        if result.chars().count()
+            + separator.len()
+            + entry.segment.chars().count()
+            + truncation_note.len()
             > MAX_FIND_UI_RESULT_CHARS
         {
             break;
@@ -3439,6 +3478,7 @@ fn compose_find_ui_result(
         result.push_str(separator);
         result.push_str(&entry.segment);
     }
+    result.push_str(truncation_note);
     result
 }
 
@@ -8067,25 +8107,79 @@ mod tests {
 
     #[test]
     fn find_ui_without_matches_suggests_escalation() {
-        let none = compose_find_ui_result("export pdf", &[], false);
+        let none = compose_find_ui_result("export pdf", &[], false, false);
         assert!(none.contains("no match for \"export pdf\""));
         assert!(none.ends_with("or ask"));
-        let with_web = compose_find_ui_result("export pdf", &[], true);
+        let with_web = compose_find_ui_result("export pdf", &[], true, false);
         assert!(with_web.ends_with("or use webLookup"));
+        let truncated = compose_find_ui_result("export pdf", &[], false, true);
+        assert!(truncated.contains("(menu scan truncated)"));
 
         // Result lines stay inside the history truncation budget.
         let matches: Vec<FindUiMatch> = (0..5)
             .map(|index| FindUiMatch {
-                score: 100,
                 segment: truncate_segment(&format!(
                     "element [{index}] AXButton \"{}\"",
                     "long label ".repeat(12)
                 )),
             })
             .collect();
-        let packed = compose_find_ui_result("export pdf", &matches, false);
+        let packed = compose_find_ui_result("export pdf", &matches, false, true);
         assert!(packed.starts_with("found: "));
+        assert!(packed.ends_with("(menu scan truncated)"));
         assert!(packed.chars().count() <= MAX_FIND_UI_RESULT_CHARS);
+    }
+
+    #[test]
+    fn find_ui_ranks_menu_paths_before_observation_elements() {
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask"), element(2, "Export as PDF…")]);
+            6
+        ])
+        .with_menu_tree(vec![
+            vec!["File".into(), "Export as PDF…".into()],
+            vec!["Edit".into(), "Copy".into()],
+        ]);
+        let results = Rc::new(RefCell::new(Vec::<String>::new()));
+        let planner = HistoryRecordingActionPlanner {
+            actions: vec![
+                Action::FindUi {
+                    query: "export pdf".into(),
+                },
+                Action::Done,
+            ],
+            results: results.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        let recorded = results.borrow();
+        let found = recorded
+            .iter()
+            .find(|result| result.starts_with("found: "))
+            .expect("findUi result in history");
+        let menu_at = found.find("menu File > Export as PDF…").expect("menu hit");
+        let element_at = found.find("element [2]").expect("element hit");
+        assert!(
+            menu_at < element_at,
+            "menu path must outrank the element: {found}"
+        );
     }
 
     #[test]
@@ -9852,6 +9946,7 @@ mod tests {
         set_value_texts: Rc<RefCell<Vec<String>>>,
         menu_results: RefCell<VecDeque<Result<MenuPressOutcome, String>>>,
         menu_paths: Rc<RefCell<Vec<Vec<String>>>>,
+        menu_tree_paths: RefCell<Vec<Vec<String>>>,
     }
 
     impl FakeObserver {
@@ -9877,6 +9972,7 @@ mod tests {
                 set_value_texts: Rc::new(RefCell::new(Vec::new())),
                 menu_results: RefCell::new(VecDeque::new()),
                 menu_paths: Rc::new(RefCell::new(Vec::new())),
+                menu_tree_paths: RefCell::new(Vec::new()),
             }
         }
 
@@ -9897,6 +9993,13 @@ mod tests {
 
         fn with_menu_results(self, results: Vec<Result<MenuPressOutcome, String>>) -> Self {
             *self.menu_results.borrow_mut() = results.into();
+            self
+        }
+
+        /// Full menu-item title paths the fake's read-only menu scan should
+        /// fuzzy-search, e.g. `[["File", "Export as PDF…"]]`.
+        fn with_menu_tree(self, paths: Vec<Vec<String>>) -> Self {
+            *self.menu_tree_paths.borrow_mut() = paths;
             self
         }
 
@@ -9968,6 +10071,33 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or_else(|| Err("menu actions are not supported by this observer".into()))
+        }
+
+        fn search_menu_tree(
+            &self,
+            query: &str,
+            max_results: usize,
+        ) -> Result<MenuScanResult, String> {
+            let matches = self
+                .menu_tree_paths
+                .borrow()
+                .iter()
+                .filter(|path| {
+                    path.last()
+                        .map(|leaf| score_match(leaf, query).is_some())
+                        .unwrap_or(false)
+                        || score_match(&path.join(" "), query).is_some()
+                })
+                .take(max_results)
+                .map(|path| MenuMatch {
+                    path: path.clone(),
+                    enabled: true,
+                })
+                .collect();
+            Ok(MenuScanResult {
+                matches,
+                truncated: false,
+            })
         }
     }
 

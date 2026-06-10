@@ -1,6 +1,6 @@
 use super::types::{
     Action, CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider,
-    MenuPressOutcome, ObservationError, Rect, ScreenObserver,
+    MenuPressOutcome, MenuScanResult, ObservationError, Rect, ScreenObserver,
 };
 use ab_glyph::FontArc;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -392,6 +392,10 @@ where
 
     fn press_menu_path(&self, path: &[String]) -> Result<MenuPressOutcome, String> {
         self.base.press_menu_path(path)
+    }
+
+    fn search_menu_tree(&self, query: &str, max_results: usize) -> Result<MenuScanResult, String> {
+        self.base.search_menu_tree(query, max_results)
     }
 }
 

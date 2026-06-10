@@ -30,9 +30,9 @@ pub use macos_observer::MacObserver;
 pub(crate) use planner::ContextAwareLlmPlanner;
 pub use planner::{NameResolvingStubPlanner, StubPlanner};
 pub use types::{
-    Action, CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider,
-    MenuPressOutcome, ObservationError, Planner, PlannerDecision, PlannerHistoryEntry, Rect,
-    ScreenObserver,
+    Action, CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider, MenuMatch,
+    MenuPressOutcome, MenuScanResult, ObservationError, Planner, PlannerDecision,
+    PlannerHistoryEntry, Rect, ScreenObserver,
 };
 pub use vision::{CaptureSize, ObservationMetadata, ObservationSource};
 pub(crate) use vision::{VisionFallbackObserver, VisionFallbackOptions, VisionFallbackState};

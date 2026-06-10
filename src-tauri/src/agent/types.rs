@@ -242,6 +242,23 @@ pub enum MenuPressOutcome {
     },
 }
 
+/// One findUi hit from the read-only menu-bar scan: a full title path ready
+/// for the `menu` action, plus whether the leaf is enabled right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuMatch {
+    pub path: Vec<String>,
+    pub enabled: bool,
+}
+
+/// Result of the read-only menu-bar scan; `truncated` is set when a scan
+/// budget (depth/nodes/time) cut the walk short, so "no match" only means
+/// "not found in what was scanned".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MenuScanResult {
+    pub matches: Vec<MenuMatch>,
+    pub truncated: bool,
+}
+
 pub trait ScreenObserver {
     fn observe(&self) -> Result<Vec<Element>, ObservationError>;
 
@@ -273,6 +290,13 @@ pub trait ScreenObserver {
     /// item. Platform observers override this.
     fn press_menu_path(&self, _path: &[String]) -> Result<MenuPressOutcome, String> {
         Err("menu actions are not supported by this observer".into())
+    }
+
+    /// Read-only fuzzy search over the frontmost app's full menu-bar tree
+    /// for the findUi action. Never presses anything; platform observers
+    /// override this. The default keeps stub and test observers working.
+    fn search_menu_tree(&self, _query: &str, _max_results: usize) -> Result<MenuScanResult, String> {
+        Ok(MenuScanResult::default())
     }
 
     fn refresh_element(&self, el: &Element) -> Option<Element> {
