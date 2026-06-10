@@ -20,6 +20,10 @@ const SEARCH_THRESHOLD = 8;
 const MENU_BOTTOM_MARGIN = 24;
 const MENU_GAP = 6;
 const MENU_MIN_HEIGHT = 140;
+/// Minimum gap between the portaled menu and the viewport edges. The webview
+/// hard-clips anything outside the native window (the quick tooltip window is
+/// barely wider than its trigger row), so the menu must stay inside it.
+const VIEWPORT_EDGE_MARGIN = 8;
 /// Fraction of the viewport the menu can occupy at most. 70% leaves the user
 /// some context (the trigger + a glimpse of the surrounding UI) while still
 /// letting long lists like the OpenAI model picker stretch on tall windows.
@@ -194,6 +198,11 @@ export default function CustomDropdown({
           left = Math.max(panelRect.left + 8, panelRight - maxWidth);
         }
       }
+      // Whatever the panel cap says, the menu can never be wider than the
+      // window itself — the quick tooltip window is narrower than the ghost
+      // menu's CSS max-width (480px).
+      const viewportCap = window.innerWidth - 2 * VIEWPORT_EDGE_MARGIN;
+      maxWidth = maxWidth === undefined ? viewportCap : Math.min(maxWidth, viewportCap);
       setMenuPos({
         left,
         // For above-placement we anchor the menu's BOTTOM edge to the trigger
@@ -211,6 +220,25 @@ export default function CustomDropdown({
       window.removeEventListener("scroll", compute, true);
     };
   }, [open, placementPreference]);
+
+  // The menu anchors to the trigger's LEFT edge, so a trigger near the
+  // window's right edge (the quick tooltip's autonomy select) pushes the
+  // wider menu past the webview bounds, where it is hard-clipped. The ghost
+  // menu is content-sized (`width: max-content`), so its width is only
+  // knowable after render: measure and shift back into the viewport before
+  // paint. Runs after every `compute()` since that resets `left`.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const menu = menuRef.current;
+    if (!menu) return;
+    const menuWidth = menu.getBoundingClientRect().width;
+    const maxLeft = window.innerWidth - VIEWPORT_EDGE_MARGIN - menuWidth;
+    setMenuPos((pos) => {
+      if (!pos) return pos;
+      const left = Math.max(VIEWPORT_EDGE_MARGIN, Math.min(pos.left, maxLeft));
+      return Math.abs(left - pos.left) < 1 ? pos : { ...pos, left };
+    });
+  }, [open, menuPos]);
 
   return (
     <div

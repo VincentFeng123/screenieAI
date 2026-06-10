@@ -479,6 +479,9 @@ function useOverlayFrostRegions(enabled: boolean) {
     lastSignatureRef.current = signature;
     invoke("set_overlay_vibrancy_regions", { regions }).catch((e) => {
       console.error("set_overlay_vibrancy_regions failed:", e);
+      // The signature was stored optimistically; a lost send must not
+      // dedupe-suppress the retry that would repair the panes.
+      lastSignatureRef.current = "";
     });
   }, []);
 

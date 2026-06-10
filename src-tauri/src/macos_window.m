@@ -9,6 +9,7 @@
 #import <objc/message.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -2862,14 +2863,71 @@ typedef struct {
   double radius;  // corner radius in CSS pixels (uniform)
 } ScreenieOverlayVibrancyRegion;
 
-static NSMutableArray<NSVisualEffectView *> *screenieOverlayVibrancyViews = nil;
-static NSMutableArray<NSVisualEffectView *> *screenieQuickTooltipVibrancyViews = nil;
+// A pane pool plus everything needed to keep its panes glued to the window
+// across geometry changes. The Y-flip in screenie_vibrancy_apply_frames
+// bakes the contentView height into every pane frame, and tao applies
+// window resizes on a LATER main-queue drain than the region apply
+// (set_content_size_async) — so a resize landing after the apply silently
+// shifts every pane out from under the UI, and the JS-side re-send that
+// would correct it rides a rAF that WebKit may throttle for a non-activating
+// panel. Storing the CSS-space regions and re-running the flip from a
+// windowDidResize observer reconciles natively, for every JS/IPC ordering.
+typedef struct {
+  NSMutableArray<NSVisualEffectView *> *views;
+  ScreenieOverlayVibrancyRegion *regions; // malloc'd copy of the last apply
+  size_t regionCount;
+  NSWindow *window;  // assign; current pane host + observer filter
+  id resizeObserver; // retained NSNotificationCenter token
+} ScreenieVibrancyPool;
+
+static ScreenieVibrancyPool screenieOverlayVibrancy;
+static ScreenieVibrancyPool screenieQuickTooltipVibrancy;
+
+// Frame every pooled pane from the stored CSS-space regions using the
+// window's CURRENT contentView height. Idempotent — called from the region
+// apply and again from the windowDidResize observer.
+static void screenie_vibrancy_apply_frames(ScreenieVibrancyPool *pool) {
+  if (pool->views == nil || pool->window == nil || pool->regions == NULL) {
+    return;
+  }
+  NSView *contentView = [pool->window contentView];
+  if (contentView == nil) {
+    return;
+  }
+  // JS rects use top-left origin in CSS pixels; the contentView's
+  // coordinate space depends on `isFlipped`. WKWebView's host view is
+  // typically NOT flipped, so we Y-flip.
+  CGFloat ch = NSHeight([contentView bounds]);
+  BOOL flipped = [contentView isFlipped];
+  size_t count = (size_t)pool->views.count;
+  if (count > pool->regionCount) {
+    count = pool->regionCount;
+  }
+  for (size_t i = 0; i < count; i++) {
+    ScreenieOverlayVibrancyRegion r = pool->regions[i];
+    NSVisualEffectView *v = pool->views[i];
+    if (!isfinite(r.x) || !isfinite(r.y) || !isfinite(r.w) ||
+        !isfinite(r.h) || r.w <= 0.0 || r.h <= 0.0) {
+      // Park off-screen instead of removing from the pool, so we
+      // don't churn the view hierarchy on every edge case.
+      [v setFrame:NSMakeRect(-1, -1, 1, 1)];
+      continue;
+    }
+    CGFloat y = flipped ? r.y : (ch - r.y - r.h);
+    [v setFrame:NSMakeRect(r.x, y, r.w, r.h)];
+    // Clamp corner radius to half the shorter side; values like
+    // 9999 (pill) are intentional shorthand for "fully rounded".
+    double maxRadius = MIN(r.w, r.h) / 2.0;
+    double radius = MAX(0.0, MIN(r.radius, maxRadius));
+    v.layer.cornerRadius = radius;
+  }
+}
 
 static bool screenie_set_vibrancy_regions(
     void *window_ptr,
     const ScreenieOverlayVibrancyRegion *regions,
     size_t count,
-    NSMutableArray<NSVisualEffectView *> **viewsRef,
+    ScreenieVibrancyPool *pool,
     NSString *logLabel) {
   @autoreleasepool {
   @try {
@@ -2881,7 +2939,7 @@ static bool screenie_set_vibrancy_regions(
     if (contentView == nil) {
       return false;
     }
-    if (*viewsRef == nil) {
+    if (pool->views == nil) {
       // MRC: `[NSMutableArray array]` is autoreleased and would be freed
       // at the next runloop iteration, leaving the static pointer
       // dangling — a future call would crash or, worse, send a setFrame:
@@ -2889,9 +2947,39 @@ static bool screenie_set_vibrancy_regions(
       // `_CFPasteboardEntry setFrame:` exception with `array` here).
       // `[[NSMutableArray alloc] init]` keeps the +1 retain forever,
       // which is what we want for an app-lifetime singleton.
-      *viewsRef = [[NSMutableArray alloc] init];
+      pool->views = [[NSMutableArray alloc] init];
     }
-    NSMutableArray<NSVisualEffectView *> *views = *viewsRef;
+    NSMutableArray<NSVisualEffectView *> *views = pool->views;
+
+    if (pool->window != window) {
+      // First apply, or the window was rebuilt: re-home surviving panes
+      // and move the resize observer to the new window.
+      for (NSVisualEffectView *v in views) {
+        [v removeFromSuperview];
+        [contentView addSubview:v positioned:NSWindowBelow relativeTo:nil];
+      }
+      if (pool->resizeObserver != nil) {
+        [[NSNotificationCenter defaultCenter]
+            removeObserver:pool->resizeObserver];
+        [pool->resizeObserver release];
+        pool->resizeObserver = nil;
+      }
+      pool->window = window;
+    }
+    if (pool->resizeObserver == nil) {
+      // queue:nil runs the block synchronously on the posting (main)
+      // thread, so panes are re-anchored in the same runloop turn as the
+      // resize — before the next frame paints. The block captures only
+      // the pool pointer (a static), never the window.
+      pool->resizeObserver = [[[NSNotificationCenter defaultCenter]
+          addObserverForName:NSWindowDidResizeNotification
+                      object:window
+                       queue:nil
+                  usingBlock:^(NSNotification *note) {
+                    (void)note;
+                    screenie_vibrancy_apply_frames(pool);
+                  }] retain];
+    }
 
     // Pool: ensure exactly `count` views exist. NSVisualEffectViews
     // added directly to contentView (no wrapper layer between them
@@ -2936,31 +3024,26 @@ static bool screenie_set_vibrancy_regions(
       [views removeLastObject];
     }
 
-    // Update geometry. JS rects use top-left origin in CSS pixels; the
-    // contentView's coordinate space depends on `isFlipped`. WKWebView's
-    // host view is typically NOT flipped, so we Y-flip.
-    CGFloat ch = NSHeight([contentView bounds]);
-    BOOL flipped = [contentView isFlipped];
-
-    for (size_t i = 0; i < count; i++) {
-      ScreenieOverlayVibrancyRegion r = regions[i];
-      NSView *v = views[i];
-      if (!isfinite(r.x) || !isfinite(r.y) || !isfinite(r.w) ||
-          !isfinite(r.h) || r.w <= 0.0 || r.h <= 0.0) {
-        // Park off-screen instead of removing from the pool, so we
-        // don't churn the view hierarchy on every edge case.
-        [v setFrame:NSMakeRect(-1, -1, 1, 1)];
-        continue;
+    // Keep a copy of the CSS-space regions so the windowDidResize observer
+    // can re-run the Y-flip against the then-current height.
+    if (count > 0) {
+      ScreenieOverlayVibrancyRegion *copy = realloc(
+          pool->regions, count * sizeof(ScreenieOverlayVibrancyRegion));
+      if (copy == NULL) {
+        NSLog(@"[screenie] %@: region copy alloc failed", logLabel);
+        pool->regionCount = 0;
+        return false;
       }
-      CGFloat y = flipped ? r.y : (ch - r.y - r.h);
-      NSRect frame = NSMakeRect(r.x, y, r.w, r.h);
-      [v setFrame:frame];
-      // Clamp corner radius to half the shorter side; values like
-      // 9999 (pill) are intentional shorthand for "fully rounded".
-      double maxRadius = MIN(r.w, r.h) / 2.0;
-      double radius = MAX(0.0, MIN(r.radius, maxRadius));
-      v.layer.cornerRadius = radius;
+      memcpy(copy, regions, count * sizeof(ScreenieOverlayVibrancyRegion));
+      pool->regions = copy;
+      pool->regionCount = count;
+    } else {
+      free(pool->regions);
+      pool->regions = NULL;
+      pool->regionCount = 0;
     }
+
+    screenie_vibrancy_apply_frames(pool);
     return true;
   } @catch (NSException *exception) {
     NSLog(@"[screenie] %@ exception: %@ %@",
@@ -2971,16 +3054,25 @@ static bool screenie_set_vibrancy_regions(
 }
 
 static void screenie_clear_vibrancy_regions(
-    NSMutableArray<NSVisualEffectView *> **viewsRef,
+    ScreenieVibrancyPool *pool,
     NSString *logLabel) {
   @autoreleasepool {
   @try {
-    if (*viewsRef == nil) return;
-    NSMutableArray<NSVisualEffectView *> *views = *viewsRef;
-    for (NSVisualEffectView *v in views) {
+    if (pool->resizeObserver != nil) {
+      [[NSNotificationCenter defaultCenter]
+          removeObserver:pool->resizeObserver];
+      [pool->resizeObserver release];
+      pool->resizeObserver = nil;
+    }
+    pool->window = nil;
+    free(pool->regions);
+    pool->regions = NULL;
+    pool->regionCount = 0;
+    if (pool->views == nil) return;
+    for (NSVisualEffectView *v in pool->views) {
       [v removeFromSuperview];
     }
-    [views removeAllObjects];
+    [pool->views removeAllObjects];
   } @catch (NSException *exception) {
     NSLog(@"[screenie] %@ exception: %@ %@",
           logLabel, [exception name], [exception reason]);
@@ -2996,13 +3088,13 @@ bool screenie_set_overlay_vibrancy_regions(
       window_ptr,
       regions,
       count,
-      &screenieOverlayVibrancyViews,
+      &screenieOverlayVibrancy,
       @"set overlay vibrancy regions");
 }
 
 void screenie_clear_overlay_vibrancy_regions(void) {
   screenie_clear_vibrancy_regions(
-      &screenieOverlayVibrancyViews,
+      &screenieOverlayVibrancy,
       @"clear overlay vibrancy regions");
 }
 
@@ -3014,12 +3106,12 @@ bool screenie_set_quick_tooltip_vibrancy_regions(
       window_ptr,
       regions,
       count,
-      &screenieQuickTooltipVibrancyViews,
+      &screenieQuickTooltipVibrancy,
       @"set quick tooltip vibrancy regions");
 }
 
 void screenie_clear_quick_tooltip_vibrancy_regions(void) {
   screenie_clear_vibrancy_regions(
-      &screenieQuickTooltipVibrancyViews,
+      &screenieQuickTooltipVibrancy,
       @"clear quick tooltip vibrancy regions");
 }
