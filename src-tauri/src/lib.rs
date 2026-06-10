@@ -4386,7 +4386,8 @@ pub fn run() {
         voice::voice_stop_listening,
         voice::voice_get_status,
         voice::voice_download_model,
-        voice::voice_set_config
+        voice::voice_set_config,
+        capture::commands::capture_permission
     ]);
 
     #[cfg(desktop)]

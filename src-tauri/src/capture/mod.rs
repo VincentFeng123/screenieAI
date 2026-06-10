@@ -6,8 +6,14 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod win;
 
+pub(crate) mod commands;
+pub(crate) mod engine;
+
 #[cfg(target_os = "macos")]
 pub(crate) mod engine_macos;
+
+#[cfg(target_os = "windows")]
+pub(crate) mod engine_win;
 
 const MAX_PNG_B64_CHARS: usize = 96 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: u64 = 60_000_000;
@@ -20,6 +26,15 @@ pub enum CaptureError {
     Image(#[from] image::ImageError),
     #[error("capture failed: {0}")]
     Other(String),
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+    // Constructed from Phase 3 (recording lifecycle) onward.
+    #[allow(dead_code)]
+    #[error("recording busy: {0}")]
+    Busy(String),
+    #[allow(dead_code)]
+    #[error("recording: {0}")]
+    Recording(String),
 }
 
 impl Serialize for CaptureError {
