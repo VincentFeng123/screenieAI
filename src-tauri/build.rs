@@ -26,6 +26,22 @@ fn main() {
             .compile("screenie_voice_macos");
         println!("cargo:rustc-link-lib=framework=AVFoundation");
 
+        // Screen capture/recording engine: SCStream -> AVAssetWriter recorder,
+        // SCScreenshotManager stills, shareable-target enumeration. Unlike the
+        // older .m units this one is compiled with ARC: recorder objects and
+        // shareable content escape SCK completion blocks, and manual
+        // retain/release across those queue hops is exactly the bug class ARC
+        // eliminates (per-translation-unit flag; safe to mix with MRC units).
+        println!("cargo:rerun-if-changed=src/capture_record_macos.m");
+        cc::Build::new()
+            .file("src/capture_record_macos.m")
+            .flag("-fblocks")
+            .flag("-fobjc-exceptions")
+            .flag("-fobjc-arc")
+            .compile("screenie_capture_record_macos");
+        println!("cargo:rustc-link-lib=framework=CoreMedia");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
+
         // Embed Info.plist into the binary's __TEXT,__info_plist section.
         // `tauri dev` runs the raw binary at target/debug/screenieai (NOT
         // a .app bundle), so without this, macOS sees a "naked" binary

@@ -546,6 +546,14 @@ uint32_t screenie_window_display_id(void *window_ptr) {
 const char *screenie_capture_display_png_excluding_self(uint32_t display_id,
                                                        size_t width,
                                                        size_t height) {
+  // SCScreenshotManager is macOS 14+ (the class weak-links to nil below that,
+  // so the completion handler would never fire and every call would stall on
+  // the 3s semaphore before returning NULL). Fail fast instead; callers fall
+  // back to the screencapture-CLI path.
+  if (@available(macOS 14.0, *)) {
+  } else {
+    return NULL;
+  }
   @autoreleasepool {
     __block char *result = NULL;
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
@@ -573,7 +581,6 @@ const char *screenie_capture_display_png_excluding_self(uint32_t display_id,
       config.height = height > 0 ? height : 64;
       config.scalesToFit = YES;
       config.showsCursor = NO;
-      config.capturesAudio = NO;
 
       [SCScreenshotManager captureImageWithFilter:filter
                                     configuration:config
@@ -631,6 +638,15 @@ static void screenie_request_overlay_background_visual_fingerprint(void) {
     return;
   }
 
+  // SCScreenshotManager is macOS 14+; below that the capture completion never
+  // fires, which used to leave screenieOverlayBackgroundVisualCaptureInFlight
+  // stuck true for the rest of the session. Skip visual fingerprinting
+  // entirely (occlusion/space heuristics still run) and never arm the latch.
+  if (@available(macOS 14.0, *)) {
+  } else {
+    return;
+  }
+
   NSNumber *screenNumber =
       [[screenieOverlayWindow screen] deviceDescription][@"NSScreenNumber"];
   CGDirectDisplayID displayID = screenNumber != nil
@@ -671,7 +687,6 @@ static void screenie_request_overlay_background_visual_fingerprint(void) {
     config.height = 64;
     config.scalesToFit = YES;
     config.showsCursor = NO;
-    config.capturesAudio = NO;
 
     [SCScreenshotManager captureImageWithFilter:filter
                                   configuration:config

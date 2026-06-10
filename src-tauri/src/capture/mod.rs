@@ -6,6 +6,9 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod win;
 
+#[cfg(target_os = "macos")]
+pub(crate) mod engine_macos;
+
 const MAX_PNG_B64_CHARS: usize = 96 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: u64 = 60_000_000;
 
