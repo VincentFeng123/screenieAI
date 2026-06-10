@@ -341,6 +341,27 @@ impl UiChangeSignal for ChangeCounterWaiter {
     }
 }
 
+/// Intersection of two rects, `None` when they do not overlap.
+pub(crate) fn intersect_rects(a: Rect, b: Rect) -> Option<Rect> {
+    let min_x = a.x.max(b.x);
+    let min_y = a.y.max(b.y);
+    let max_x = (a.x + a.width).min(b.x + b.width);
+    let max_y = (a.y + a.height).min(b.y + b.height);
+    (max_x > min_x && max_y > min_y).then_some(Rect {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    })
+}
+
+/// AX role of the scroll container the observer selected for anchoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollContainerKind {
+    WebArea,
+    ScrollArea,
+}
+
 /// Geometry and scroll state of the focused window's main scroll container,
 /// used to anchor scroll wheel events inside it and to verify their effect
 /// (WI-3). All rects are AX screen points; any piece may be unavailable.
@@ -348,6 +369,8 @@ impl UiChangeSignal for ChangeCounterWaiter {
 pub struct ScrollContext {
     /// Frame of the preferred scroll container (AXWebArea / AXScrollArea).
     pub container: Option<Rect>,
+    /// Role of the selected container, when one was found.
+    pub container_kind: Option<ScrollContainerKind>,
     /// Focused window frame.
     pub window: Option<Rect>,
     /// Bounds of the display hosting the window.

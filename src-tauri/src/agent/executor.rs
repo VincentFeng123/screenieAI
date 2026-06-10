@@ -9,12 +9,12 @@ use super::search::score_match;
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
 use super::types::{
-    is_secure_text_role, normalize_signature_name, Action, CoordinateSpace, Element, ElementSource,
-    FocusedApp, FocusedAppProvider, MenuPressOutcome, MenuScanResult, ObservationError, Planner,
-    PlannerHistoryEntry, Rect, ScreenObserver, ScrollContext,
+    intersect_rects, is_secure_text_role, normalize_signature_name, Action, CoordinateSpace,
+    Element, ElementSource, FocusedApp, FocusedAppProvider, MenuPressOutcome, MenuScanResult,
+    ObservationError, Planner, PlannerHistoryEntry, Rect, ScreenObserver, ScrollContext,
 };
 #[cfg(test)]
-use super::types::{ChangeWait, MenuMatch, UiChangeSignal};
+use super::types::{ChangeWait, MenuMatch, ScrollContainerKind, UiChangeSignal};
 use super::vision::{
     click_point_from_rect, coordinate_element, CaptureSize, ObservationMetadata,
     ObservationMetadataProvider, ObservationSource, VisionFallbackContext, VisionFallbackMode,
@@ -6584,20 +6584,6 @@ const SCROLL_SHIFT_EPSILON_POINTS: f64 = 2.0;
 const SCROLL_POSITION_EPSILON: f64 = 0.005;
 const SCROLL_BOUNDARY_TOLERANCE: f64 = 0.005;
 
-/// Intersection of two rects, `None` when they do not overlap.
-fn intersect_rects(a: Rect, b: Rect) -> Option<Rect> {
-    let min_x = a.x.max(b.x);
-    let min_y = a.y.max(b.y);
-    let max_x = (a.x + a.width).min(b.x + b.width);
-    let max_y = (a.y + a.height).min(b.y + b.height);
-    (max_x > min_x && max_y > min_y).then_some(Rect {
-        x: min_x,
-        y: min_y,
-        width: max_x - min_x,
-        height: max_y - min_y,
-    })
-}
-
 /// Center of (container ∩ window ∩ screen); missing pieces are skipped.
 /// `None` means the pieces do not overlap — an anchor must never be
 /// fabricated from a disjoint intersection.
@@ -8547,6 +8533,7 @@ mod tests {
                 width: 1440.0,
                 height: 2000.0, // extends past the screen bottom
             }),
+            container_kind: Some(ScrollContainerKind::WebArea),
             window: Some(Rect {
                 x: 0.0,
                 y: 25.0,
@@ -8722,6 +8709,7 @@ mod tests {
                 width: 800.0,
                 height: 500.0,
             }),
+            container_kind: Some(ScrollContainerKind::ScrollArea),
             window: Some(Rect {
                 x: 0.0,
                 y: 0.0,
@@ -9509,6 +9497,7 @@ mod tests {
         let web = web_element(4, "Search"); // bounds center (60, 35)
         let outside_window = ScrollContext {
             container: None,
+            container_kind: None,
             window: Some(Rect {
                 x: 200.0,
                 y: 100.0,
@@ -9584,6 +9573,7 @@ mod tests {
         let web = web_element(4, "Search"); // bounds center (60, 35)
         let containing_window = ScrollContext {
             container: None,
+            container_kind: None,
             window: Some(Rect {
                 x: 0.0,
                 y: 0.0,

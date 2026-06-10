@@ -6,9 +6,10 @@ use super::observer::{
 use super::safari_dom;
 use super::search::score_match;
 use super::types::{
-    is_secure_text_role, normalize_signature_name, ChangeCounter, CoordinateSpace, Element,
-    ElementSource, FocusedApp, FocusedAppProvider, MenuMatch, MenuPressOutcome, MenuScanResult,
-    ObservationError, PlatformElementHandle, Rect, ScreenObserver, ScrollContext, UiChangeSignal,
+    intersect_rects, is_secure_text_role, normalize_signature_name, ChangeCounter,
+    CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider, MenuMatch,
+    MenuPressOutcome, MenuScanResult, ObservationError, PlatformElementHandle, Rect,
+    ScreenObserver, ScrollContainerKind, ScrollContext, UiChangeSignal,
 };
 use super::vision::{ObservationMetadata, ObservationMetadataProvider};
 use core_foundation::base::TCFType;
@@ -602,22 +603,32 @@ impl MacObserver {
         };
         let window_bounds = copy_bounds(window.as_type_ref())?;
         let window_rect = rect_has_visible_bounds(window_bounds).then_some(window_bounds);
+        let screen = main_display_bounds();
 
-        let mut best: Option<(OwnedCf, Rect)> = None;
+        let mut best: Option<ScrollContainerCandidate> = None;
         let mut visited = 0_usize;
-        find_largest_scroll_container(window.as_type_ref(), 0, &mut best, &mut visited)?;
-        let (container, vertical_position) = match best.as_ref() {
-            Some((handle, bounds)) => (
-                Some(*bounds),
-                container_vertical_position(handle.as_type_ref()).unwrap_or(None),
+        find_largest_scroll_container(
+            window.as_type_ref(),
+            0,
+            window_rect,
+            screen,
+            &mut best,
+            &mut visited,
+        )?;
+        let (container, container_kind, vertical_position) = match best.as_ref() {
+            Some(candidate) => (
+                Some(candidate.bounds),
+                Some(candidate.kind),
+                container_vertical_position(candidate.handle.as_type_ref()).unwrap_or(None),
             ),
-            None => (None, None),
+            None => (None, None, None),
         };
 
         Ok(Some(ScrollContext {
             container,
+            container_kind,
             window: window_rect,
-            screen: main_display_bounds(),
+            screen,
             vertical_position,
         }))
     }
@@ -1523,15 +1534,54 @@ fn copy_number_attribute(
     Ok(ok.then_some(number))
 }
 
-const SCROLL_CONTAINER_MAX_DEPTH: usize = 8;
-const SCROLL_CONTAINER_MAX_NODES: usize = 400;
+// Safari's tab-bar subtree alone can consume hundreds of pre-order nodes
+// before the DFS reaches the web content group, and the web area sits deep
+// in the window hierarchy — caps sized so chrome cannot starve the search.
+const SCROLL_CONTAINER_MAX_DEPTH: usize = 12;
+const SCROLL_CONTAINER_MAX_NODES: usize = 1000;
 
-/// Depth-first, node-capped search for the largest visible scroll container
-/// (AXWebArea or AXScrollArea) under `element`, retaining the best handle.
+struct ScrollContainerCandidate {
+    handle: OwnedCf,
+    bounds: Rect,
+    kind: ScrollContainerKind,
+    rank: (u8, f64),
+}
+
+/// Rank a scroll-container candidate for anchoring: an AXWebArea beats any
+/// AXScrollArea (Safari chrome — the tab bar — is an AXScrollArea), and ties
+/// compare by the area actually visible on screen (bounds ∩ window ∩
+/// screen), not raw area, so a mostly-offscreen full-document web area is
+/// judged by its visible slice. `None` = not anchorable (degenerate bounds
+/// or disjoint from the window/screen).
+fn scroll_container_rank(
+    kind: ScrollContainerKind,
+    bounds: Rect,
+    window: Option<Rect>,
+    screen: Option<Rect>,
+) -> Option<(u8, f64)> {
+    if !rect_has_visible_bounds(bounds) {
+        return None;
+    }
+    let mut visible = bounds;
+    for clamp in [window, screen].into_iter().flatten() {
+        visible = intersect_rects(visible, clamp)?;
+    }
+    let priority = match kind {
+        ScrollContainerKind::WebArea => 1,
+        ScrollContainerKind::ScrollArea => 0,
+    };
+    Some((priority, rect_area(visible)))
+}
+
+/// Depth-first, node-capped search for the best-ranked visible scroll
+/// container (AXWebArea or AXScrollArea) under `element`, retaining the
+/// winning handle.
 fn find_largest_scroll_container(
     element: AXUIElementRef,
     depth: usize,
-    best: &mut Option<(OwnedCf, Rect)>,
+    window: Option<Rect>,
+    screen: Option<Rect>,
+    best: &mut Option<ScrollContainerCandidate>,
     visited: &mut usize,
 ) -> Result<(), ObservationError> {
     if depth > SCROLL_CONTAINER_MAX_DEPTH || *visited >= SCROLL_CONTAINER_MAX_NODES {
@@ -1539,23 +1589,31 @@ fn find_largest_scroll_container(
     }
     *visited += 1;
     let role = copy_string_attribute(element, "AXRole")?.unwrap_or_default();
-    let is_container = role == "AXWebArea" || role == "AXScrollArea";
-    if is_container {
+    let kind = match role.as_str() {
+        "AXWebArea" => Some(ScrollContainerKind::WebArea),
+        "AXScrollArea" => Some(ScrollContainerKind::ScrollArea),
+        _ => None,
+    };
+    if let Some(kind) = kind {
         let bounds = copy_bounds(element)?;
-        if rect_has_visible_bounds(bounds) {
-            let area = bounds.width * bounds.height;
+        if let Some(rank) = scroll_container_rank(kind, bounds, window, screen) {
             let replace = best
                 .as_ref()
-                .map(|(_, current)| area > current.width * current.height)
+                .map(|current| rank > current.rank)
                 .unwrap_or(true);
             if replace {
                 let retained = unsafe { CFRetain(element) };
-                *best = Some((OwnedCf::new(retained), bounds));
+                *best = Some(ScrollContainerCandidate {
+                    handle: OwnedCf::new(retained),
+                    bounds,
+                    kind,
+                    rank,
+                });
             }
         }
         // The page scroller found; nested scroll areas inside it are not
         // the one the wheel should target.
-        if role == "AXWebArea" {
+        if kind == ScrollContainerKind::WebArea {
             return Ok(());
         }
     }
@@ -1566,7 +1624,7 @@ fn find_largest_scroll_container(
                 CFArrayGetValueAtIndex(children.as_array_ref()?, index as isize) as AXUIElementRef
             };
             if !child.is_null() {
-                find_largest_scroll_container(child, depth + 1, best, visited)?;
+                find_largest_scroll_container(child, depth + 1, window, screen, best, visited)?;
             }
         }
     }
@@ -1883,5 +1941,151 @@ mod tests {
                 height: 300.0,
             }
         );
+    }
+
+    #[test]
+    fn scroll_container_rank_prefers_web_area_over_larger_scroll_area() {
+        // Safari's tab bar is an AXScrollArea spanning the window's full
+        // width; the page's AXWebArea must outrank it regardless of area.
+        let window = Some(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        });
+        let screen = window;
+        let tab_bar = scroll_container_rank(
+            ScrollContainerKind::ScrollArea,
+            Rect {
+                x: 3.0,
+                y: 0.0,
+                width: 1437.0,
+                height: 94.0,
+            },
+            window,
+            screen,
+        )
+        .unwrap();
+        let web_area = scroll_container_rank(
+            ScrollContainerKind::WebArea,
+            Rect {
+                x: 0.0,
+                y: 90.0,
+                width: 1440.0,
+                height: 810.0,
+            },
+            window,
+            screen,
+        )
+        .unwrap();
+        assert!(web_area > tab_bar);
+
+        // Even a tiny web area outranks a huge scroll area: role first.
+        let tiny_web_area = scroll_container_rank(
+            ScrollContainerKind::WebArea,
+            Rect {
+                x: 0.0,
+                y: 90.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            window,
+            screen,
+        )
+        .unwrap();
+        assert!(tiny_web_area > tab_bar);
+    }
+
+    #[test]
+    fn scroll_container_rank_uses_visible_not_raw_area() {
+        // A full-document web area scrolled mostly above the screen is
+        // judged by its visible slice, not its (huge) raw area.
+        let window = Some(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        });
+        let screen = window;
+        let mostly_offscreen = scroll_container_rank(
+            ScrollContainerKind::WebArea,
+            Rect {
+                x: 0.0,
+                y: -5000.0,
+                width: 1440.0,
+                height: 5100.0,
+            },
+            window,
+            screen,
+        )
+        .unwrap();
+        let fully_visible = scroll_container_rank(
+            ScrollContainerKind::WebArea,
+            Rect {
+                x: 0.0,
+                y: 90.0,
+                width: 1440.0,
+                height: 810.0,
+            },
+            window,
+            screen,
+        )
+        .unwrap();
+        assert!(fully_visible > mostly_offscreen);
+        // Visible slice = 1440 × 100.
+        assert_eq!(mostly_offscreen.1, 1440.0 * 100.0);
+    }
+
+    #[test]
+    fn scroll_container_rank_rejects_disjoint_candidates() {
+        let window = Some(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        });
+        // Fully above the screen: no visible slice, not anchorable.
+        assert_eq!(
+            scroll_container_rank(
+                ScrollContainerKind::WebArea,
+                Rect {
+                    x: 0.0,
+                    y: -6000.0,
+                    width: 1440.0,
+                    height: 500.0,
+                },
+                window,
+                window,
+            ),
+            None
+        );
+        // Degenerate bounds are rejected outright.
+        assert_eq!(
+            scroll_container_rank(
+                ScrollContainerKind::ScrollArea,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 100.0,
+                },
+                window,
+                window,
+            ),
+            None
+        );
+        // Missing window/screen pieces are skipped, not fatal.
+        assert!(scroll_container_rank(
+            ScrollContainerKind::ScrollArea,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            None,
+            None,
+        )
+        .is_some());
     }
 }
