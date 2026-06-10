@@ -1969,6 +1969,7 @@ where
             grounding_report,
             decision_expect,
             secure_typing,
+            click_text_original,
         ) = if let Some((queued_prepared, queued_action, queued_reason)) = from_queue {
             // Batched follow-up: no model call. The stored target gets
             // re-validated by refresh_prepared_target before execution, and
@@ -1981,6 +1982,7 @@ where
                 None,
                 None,
                 false,
+                None,
             )
         } else {
             // Rejections within this step are appended directly to the goal
@@ -2032,6 +2034,7 @@ where
                 // flows through every existing gate (safety, confirmation,
                 // intent gate, preflight) exactly like a planner-issued id.
                 let mut click_text_intent: Option<String> = None;
+                let mut click_text_original: Option<Action> = None;
                 if let Action::ClickByText {
                     text,
                     role_hint,
@@ -2048,6 +2051,7 @@ where
                                 text,
                                 resolution.element.name
                             );
+                            click_text_original = Some(decision.action.clone());
                             click_text_intent = Some(text);
                             action = Action::Click {
                                 id: resolution.element.id,
@@ -2224,10 +2228,9 @@ where
                 // The target-intent gate runs first: a planner that names one
                 // element and ids another never reaches execution, and the
                 // structured notice teaches it which element the id really is.
-                let expected_target_name = decision
-                    .target_name
+                let expected_target_name = click_text_intent
                     .as_deref()
-                    .or(click_text_intent.as_deref());
+                    .or(decision.target_name.as_deref());
                 let intent_mismatch = target_intent_mismatch_reason(
                     expected_target_name,
                     decision.target_role.as_deref(),
@@ -2361,6 +2364,7 @@ where
                     grounding_report,
                     decision_expect,
                     secure_typing,
+                    click_text_original,
                 );
             }
         };
@@ -3049,7 +3053,7 @@ where
             // never from remembered element positions. The pre-scroll
             // position feeds the postcondition check after execution.
             let mut scroll_pre_position: Option<f64> = None;
-            if matches!(prepared.kind, PreparedKind::Scroll { .. }) {
+            if matches!(prepared.kind, PreparedKind::Scroll { .. }) && prepared.target.is_none() {
                 let context = observer.scroll_context();
                 scroll_pre_position = context.and_then(|ctx| ctx.vertical_position);
                 let anchor = context.and_then(|ctx| {
@@ -3447,7 +3451,7 @@ where
                 // shift / scroll position), not by the whole-app hash diff
                 // that credited carousel animation as progress. Boundary
                 // hits surface as ScrollBoundary instead of NoOp.
-                if step.executed {
+                if step.executed && report.status != VerificationStatus::ObservationFailed {
                     if let PreparedKind::Scroll { dy, .. } = prepared.kind {
                         if dy != 0 {
                             let post_position = observer
@@ -3523,9 +3527,11 @@ where
                     }
                     last_step_clean = true;
                     let history_result = step_history_result(&step);
-                    history.push(PlannerHistoryEntry::new(
-                        action,
-                        planner_reason,
+                    history.push(history_entry_for_step(
+                        click_text_original.as_ref(),
+                        &action,
+                        &prepared,
+                        &planner_reason,
                         history_result,
                     ));
                     apply_pending_milestone(
@@ -3547,9 +3553,11 @@ where
                 | VerificationStatus::SkippedNoUiChangeExpected => {
                     last_step_clean = true;
                     let history_result = step_history_result(&step);
-                    history.push(PlannerHistoryEntry::new(
-                        action,
-                        planner_reason,
+                    history.push(history_entry_for_step(
+                        click_text_original.as_ref(),
+                        &action,
+                        &prepared,
+                        &planner_reason,
                         history_result,
                     ));
                     apply_pending_milestone(
@@ -3562,18 +3570,53 @@ where
                     continue 'steps;
                 }
                 VerificationStatus::ScrollBoundary => {
-                    // Not progress (no milestone, no budget extension, ban
-                    // list untouched) and not a retryable no-op: the planner
-                    // is told which edge was hit so it reverses or stops
-                    // instead of thrashing the same scroll.
+                    // Not progress (no milestone, no budget extension) and
+                    // not a retryable no-op: the planner is told which edge
+                    // was hit so it reverses or stops. Repeats still count
+                    // as no-progress so a planner that keeps scrolling into
+                    // the wall walks the same ban/escalation ladder as any
+                    // other repeated failure instead of burning the budget.
                     let history_result = step_history_result(&step);
-                    history.push(PlannerHistoryEntry::new(
-                        action,
-                        planner_reason,
+                    history.push(history_entry_for_step(
+                        click_text_original.as_ref(),
+                        &action,
+                        &prepared,
+                        &planner_reason,
                         history_result,
                     ));
-                    commit_step(confirmations, &mut steps, step, step_started);
-                    continue 'steps;
+                    let entry = ProgressLoopEntry {
+                        pre_state_hash: pre_state_hash.clone(),
+                        normalized_action: normalized_action.clone(),
+                    };
+                    match handle_no_progress_entry(
+                        &mut recent_no_progress,
+                        &mut stuck_recovery,
+                        entry,
+                        options.progress_loop_window,
+                        options.progress_loop_threshold,
+                        &mut force_visual_replan_next,
+                        &action_display,
+                    ) {
+                        NoProgressOutcome::Exhausted(reason) => {
+                            step.failure_reason = Some(reason.clone());
+                            terminal_status = Some(AgentRunStatus::Failed);
+                            failure_reason = Some(reason);
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            break 'steps;
+                        }
+                        NoProgressOutcome::Recovering(stage) => {
+                            eprintln!(
+                                "[screenie] agent step {} stuck-recovery stage={:?}",
+                                step_number, stage
+                            );
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            continue 'steps;
+                        }
+                        NoProgressOutcome::Recorded => {
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            continue 'steps;
+                        }
+                    }
                 }
                 VerificationStatus::ObservationFailed => {
                     let reason = step
@@ -3661,9 +3704,11 @@ where
                             .as_deref()
                             .unwrap_or("no UI change")
                     );
-                    history.push(PlannerHistoryEntry::new(
-                        action.clone(),
-                        planner_reason.clone(),
+                    history.push(history_entry_for_step(
+                        click_text_original.as_ref(),
+                        &action,
+                        &prepared,
+                        &planner_reason,
                         result,
                     ));
                     let entry = ProgressLoopEntry {
@@ -4738,13 +4783,16 @@ fn resolve_click_by_text(
                 .copied()
                 .filter(|element| matching::role_matches_hint(hint, &element.role))
                 .collect();
-            // An unmatched hint falls back to every element rather than
-            // failing outright — the hint narrows, it never blinds.
+            // A hint that matches nothing fails CLOSED: silently widening
+            // the pool clicked a similar-labeled element of a different
+            // role exactly when the hinted one was scrolled offscreen. The
+            // planner is told to drop the hint or scroll instead.
             if hinted.is_empty() {
-                enabled
-            } else {
-                hinted
+                return Err(format!(
+                    "no visible element has role '{hint}'; scroll to reveal it, or repeat clickText without the role hint"
+                ));
             }
+            hinted
         }
         None => enabled,
     };
@@ -4752,13 +4800,7 @@ fn resolve_click_by_text(
     let mut matches: Vec<(f64, &Element)> = pool
         .into_iter()
         .map(|element| {
-            let score = matching::label_match_score(query, &element.name).max(
-                element
-                    .value
-                    .as_deref()
-                    .map(|value| matching::label_match_score(query, value))
-                    .unwrap_or(0.0),
-            );
+            let score = element_label_match_score(query, &element.name, element.value.as_deref());
             (score, element)
         })
         .filter(|(score, _)| *score >= matching::TARGET_MATCH_ACCEPT_THRESHOLD)
@@ -4845,13 +4887,23 @@ fn resolve_click_by_text(
 /// Best fuzzy score between the planner's echoed target_name and a resolved
 /// target's visible labels (name, then value as fallback for fields).
 fn target_intent_match_score(expected_name: &str, target: &TargetSummary) -> f64 {
-    let name_score = matching::label_match_score(expected_name, &target.name);
-    let value_score = target
-        .value
-        .as_deref()
-        .map(|value| matching::label_match_score(expected_name, value))
-        .unwrap_or(0.0);
-    name_score.max(value_score)
+    element_label_match_score(expected_name, &target.name, target.value.as_deref())
+}
+
+/// Score a query against an element's labels. The value channel only counts
+/// when the element has no usable name: at full weight it let a text field
+/// whose VALUE matched the query outrank (resolver) or validate (gate) the
+/// wrong element whenever the agent had just typed that same text.
+fn element_label_match_score(query: &str, name: &str, value: Option<&str>) -> f64 {
+    let name_score = matching::label_match_score(query, name);
+    if matching::normalize_label(name).is_empty() {
+        return name_score.max(
+            value
+                .map(|value| matching::label_match_score(query, value))
+                .unwrap_or(0.0),
+        );
+    }
+    name_score
 }
 
 /// The target-intent gate (WI-1): when the planner echoed the name of the
@@ -4868,6 +4920,28 @@ fn target_intent_mismatch_reason(
         return None;
     }
     let target = prepared.target.as_ref()?;
+    // Vision-detected candidates carry placeholder names ("Visual candidate
+    // 31"); there is nothing meaningful to compare an echo against, so the
+    // gate stays out of the marks fallback's way.
+    if matches!(
+        target.source,
+        ElementSource::VisionDetected | ElementSource::VisionCoordinate
+    ) {
+        return None;
+    }
+    // No comparable label at all (empty name, no value): refusing here
+    // would make the element permanently unclickable under the mandatory
+    // echo; the preflight hit-test remains the guard for these.
+    if matching::normalize_label(&target.name).is_empty()
+        && target
+            .value
+            .as_deref()
+            .map(|value| matching::normalize_label(value).is_empty())
+            .unwrap_or(true)
+        && target.name.trim().is_empty()
+    {
+        return None;
+    }
     let score = target_intent_match_score(expected, target);
     if score >= matching::TARGET_MATCH_ACCEPT_THRESHOLD {
         return None;
@@ -7552,6 +7626,32 @@ fn commit_step<Q: ConfirmationRequester>(
     steps.push(step);
 }
 
+/// Build the planner-visible history entry for an executed step: a resolved
+/// clickText is recorded as its original text-targeted action (epoch-scoped
+/// ids would otherwise leak back into the planner's context), and
+/// id-targeted actions carry the acted-on element's name so past actions
+/// model the same target_name contract the next action must follow.
+fn history_entry_for_step(
+    original: Option<&Action>,
+    action: &Action,
+    prepared: &PreparedAction,
+    reason: &str,
+    result: String,
+) -> PlannerHistoryEntry {
+    let display = original.cloned().unwrap_or_else(|| action.clone());
+    let target_name = prepared.target.as_ref().and_then(|target| {
+        matches!(
+            display,
+            Action::Click { .. }
+                | Action::DoubleClick { .. }
+                | Action::Type { .. }
+                | Action::RightClick { .. }
+        )
+        .then(|| target.name.clone())
+    });
+    PlannerHistoryEntry::new(display, reason, result).with_target_name(target_name)
+}
+
 fn step_history_result(step: &AgentStepReport) -> String {
     let mut result = if let Some(reason) = &step.failure_reason {
         format!("failed: {reason}")
@@ -8852,6 +8952,190 @@ mod tests {
         assert!(events.borrow().is_empty(), "events: {:?}", events.borrow());
         assert!(observer.pressed_element_ids.borrow().is_empty());
         assert!(report.steps.iter().all(|step| !step.executed));
+    }
+
+    #[test]
+    fn target_intent_gate_skips_vision_candidates_and_unlabeled_targets() {
+        // Vision-detected candidates carry placeholder names; the gate must
+        // not reject a semantically useful echo against "Visual candidate N"
+        // (review finding: the gate was vacuous-or-hostile in marks mode).
+        let vision = Element::new(
+            31,
+            "VisionCandidate".into(),
+            "Visual candidate 31".into(),
+            None,
+            Rect {
+                x: 10.0,
+                y: 10.0,
+                width: 50.0,
+                height: 20.0,
+            },
+            true,
+            false,
+            CoordinateSpace::AxPoints,
+            ElementSource::VisionDetected,
+        );
+        let prepared = prepare_action(&Action::Click { id: 31 }, &[vision]).unwrap();
+        assert_eq!(
+            target_intent_mismatch_reason(Some("Submit"), None, &prepared),
+            None
+        );
+
+        // A glyph-only button: verbatim echo passes via raw equality.
+        let glyph = Element::new(
+            7,
+            "AXButton".into(),
+            "✕".into(),
+            None,
+            Rect {
+                x: 10.0,
+                y: 10.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            true,
+            false,
+            CoordinateSpace::AxPoints,
+            ElementSource::Web,
+        );
+        let prepared = prepare_action(&Action::Click { id: 7 }, &[glyph]).unwrap();
+        assert_eq!(
+            target_intent_mismatch_reason(Some("✕"), None, &prepared),
+            None
+        );
+    }
+
+    #[test]
+    fn click_by_text_unmatched_role_hint_fails_closed() {
+        // Review finding: an unmatched hint silently widened the pool and
+        // clicked a similar-labeled element of a different role.
+        let obs = configurator_fixture();
+        let err = resolve_click_by_text(&obs, "iPhone 17 Pro Max", Some("tab"), None).unwrap_err();
+        assert!(err.contains("role 'tab'"), "got: {err}");
+    }
+
+    #[test]
+    fn click_by_text_ignores_field_values_when_named() {
+        // Review finding: after typing a query, the search field's VALUE
+        // exactly matched the text the agent then wanted to click, and the
+        // field outranked the intended result link.
+        let field = Element::new(
+            4,
+            "AXTextField".into(),
+            "Address and Search".into(),
+            Some("refurbished mac mini".into()),
+            Rect {
+                x: 100.0,
+                y: 10.0,
+                width: 400.0,
+                height: 30.0,
+            },
+            true,
+            true,
+            CoordinateSpace::AxPoints,
+            ElementSource::Ax,
+        );
+        let link = Element::new(
+            12,
+            "AXLink".into(),
+            "Mac mini M2 refurbished - $429.00".into(),
+            None,
+            Rect {
+                x: 100.0,
+                y: 300.0,
+                width: 300.0,
+                height: 24.0,
+            },
+            true,
+            false,
+            CoordinateSpace::AxPoints,
+            ElementSource::Web,
+        );
+
+        let resolved =
+            resolve_click_by_text(&[field, link], "refurbished mac mini", None, None).unwrap();
+        assert_eq!(resolved.element.id, 12, "the link must win, not the field");
+    }
+
+    #[test]
+    fn history_entry_preserves_click_text_intent_and_target_name() {
+        let obs = configurator_fixture();
+        let prepared = prepare_action(&Action::Click { id: 22 }, &obs).unwrap();
+
+        // A resolved clickText is recorded as the original text action.
+        let original = Action::ClickByText {
+            text: "iPhone 17 Pro Max".into(),
+            role_hint: Some("radio".into()),
+            nth: None,
+        };
+        let entry = history_entry_for_step(
+            Some(&original),
+            &Action::Click { id: 22 },
+            &prepared,
+            "select model",
+            "executed".into(),
+        );
+        assert_eq!(entry.action, original);
+        assert_eq!(entry.target_name, None);
+
+        // A plain id click carries the acted-on element's name.
+        let entry = history_entry_for_step(
+            None,
+            &Action::Click { id: 22 },
+            &prepared,
+            "select model",
+            "executed".into(),
+        );
+        assert_eq!(entry.action, Action::Click { id: 22 });
+        assert_eq!(
+            entry.target_name.as_deref(),
+            Some("iPhone 17 Pro Max 6.9-inch display")
+        );
+    }
+
+    #[test]
+    fn repeated_boundary_scrolls_walk_the_stuck_ladder() {
+        // Review finding: the ScrollBoundary arm bypassed every loop-escape
+        // mechanism, letting a planner that keeps scrolling into the wall
+        // burn the whole step budget with real wheel events.
+        let page = || vec![element(1, "Ask"), element(2, "Settings")];
+        let observations: Vec<_> = (0..12).map(|_| Ok(page())).collect();
+        let contexts: Vec<_> = (0..12).map(|_| Some(scroll_test_context(1.0))).collect();
+        let observer = FakeObserver::new(observations).with_scroll_contexts(contexts);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::sequence(vec![
+                Action::Scroll { dx: 0, dy: 300 };
+                6
+            ]),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(6),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        let wheels = events
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, RecordedInput::ScrollPixels(..)))
+            .count();
+        assert!(
+            wheels <= 3,
+            "boundary scrolls must hit the no-progress ladder, posted {wheels} wheels; steps: {}",
+            report.steps.len()
+        );
     }
 
     #[test]

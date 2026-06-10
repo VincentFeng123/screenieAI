@@ -298,6 +298,14 @@ where
         self.base.read_page_text()
     }
 
+    // Scroll geometry comes from the platform AX layer regardless of which
+    // fallback produced the current observation — without this forward the
+    // container anchor and scroll postcondition are dead in production,
+    // where the agent loop always wraps the platform observer in this type.
+    fn scroll_context(&self) -> Option<super::types::ScrollContext> {
+        self.base.scroll_context()
+    }
+
     // Change notifications come from the platform AX layer regardless of
     // which fallback produced the current observation.
     fn change_signal(&self) -> Option<Box<dyn super::types::UiChangeSignal>> {

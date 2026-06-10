@@ -1013,6 +1013,9 @@ static bool screenie_post_mouse_click(CGPoint point, CGMouseButton button) {
 // stamping) because the agent scrolls in deliberate single steps, not
 // relayed trackpad gestures.
 void screenie_agent_post_scroll_pixels(double wheelY, double wheelX) {
+  if (!screenie_can_post_mouse_events()) {
+    return;
+  }
   CGEventRef scroll =
       CGEventCreateScrollWheelEvent(NULL,
                                     kCGScrollEventUnitPixel,

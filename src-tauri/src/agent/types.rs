@@ -1115,6 +1115,10 @@ pub struct PlannerHistoryEntry {
     pub action: Action,
     pub reason: String,
     pub result: String,
+    /// Name of the element an id-targeted action acted on. Rendered into
+    /// the history prompt so the model's own past clicks carry the same
+    /// target_name echo the contract demands of its next one.
+    pub target_name: Option<String>,
 }
 
 impl PlannerHistoryEntry {
@@ -1123,7 +1127,13 @@ impl PlannerHistoryEntry {
             action,
             reason: reason.into(),
             result: result.into(),
+            target_name: None,
         }
+    }
+
+    pub fn with_target_name(mut self, target_name: Option<String>) -> Self {
+        self.target_name = target_name;
+        self
     }
 }
 
