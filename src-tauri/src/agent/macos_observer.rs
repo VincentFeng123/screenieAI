@@ -603,7 +603,15 @@ impl MacObserver {
         };
         let window_bounds = copy_bounds(window.as_type_ref())?;
         let window_rect = rect_has_visible_bounds(window_bounds).then_some(window_bounds);
-        let screen = main_display_bounds();
+        // The main display's bounds are only a meaningful clamp when the
+        // focused window actually lives on it; for a window on another
+        // display the main-display rect would disqualify every container
+        // and anchor. (TODO multi-display: use the display hosting the
+        // window instead.)
+        let screen = match (main_display_bounds(), window_rect) {
+            (Some(display), Some(window)) if intersect_rects(display, window).is_none() => None,
+            (display, _) => display,
+        };
 
         let mut best: Option<ScrollContainerCandidate> = None;
         let mut visited = 0_usize;
@@ -1353,6 +1361,11 @@ fn log_suspect_safari_dom_geometry(web_area: Rect, web_elements: &[Element]) {
     let Some(display) = main_display_bounds() else {
         return;
     };
+    // A window on a secondary display fails the main-display check for
+    // every element; that is the multi-display TODO, not suspect geometry.
+    if !rects_overlap(web_area, display) {
+        return;
+    }
     if let Some(stray) = web_elements
         .iter()
         .find(|element| !rects_overlap(element.bounds, display))

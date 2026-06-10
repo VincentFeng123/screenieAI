@@ -3489,7 +3489,14 @@ where
                 // hits surface as ScrollBoundary instead of NoOp.
                 if step.executed && report.status != VerificationStatus::ObservationFailed {
                     if let PreparedKind::Scroll { dy, .. } = prepared.kind {
-                        if dy != 0 {
+                        // Targeted scrolls (ScrollAt) keep the generic hash
+                        // verdict: both the scroll-context position and the
+                        // whole-window content shift describe the focused
+                        // window's main container, not the inner scroller
+                        // the wheel was aimed at, and the page scrollbar
+                        // parked at an edge must not mint ScrollBoundary
+                        // for a scroll it never received.
+                        if dy != 0 && prepared.target.is_none() {
                             // An untrusted (chrome-strip) container's
                             // scrollbar describes the wrong surface; without
                             // position evidence the verdict rests on
@@ -6557,15 +6564,14 @@ fn point_inside_target_bounds(point: ClickPoint, target: &TargetSummary) -> bool
         && y <= target.bounds.y + target.bounds.height
 }
 
-/// Intersection of the focused window and screen frames from the scroll
-/// context, when at least one is known.
+/// Frame for the web click gate: the focused window when known (AX window
+/// bounds are global coordinates, so they span displays), otherwise the
+/// screen. The two are deliberately NOT intersected — ScrollContext.screen
+/// is the main display only (multi-display TODO in macos_observer), and
+/// clamping a window that straddles a secondary display would wrongly
+/// reject legitimate clicks on the secondary slice.
 fn window_and_screen_frame(ctx: &ScrollContext) -> Option<Rect> {
-    match (ctx.window, ctx.screen) {
-        (Some(window), Some(screen)) => intersect_rects(window, screen),
-        (Some(window), None) => Some(window),
-        (None, Some(screen)) => Some(screen),
-        (None, None) => None,
-    }
+    ctx.window.or(ctx.screen)
 }
 
 fn point_inside_rect(point: ClickPoint, rect: Rect) -> bool {
@@ -9161,6 +9167,59 @@ mod tests {
     }
 
     #[test]
+    fn targeted_scroll_keeps_generic_verdict_and_never_mints_boundary() {
+        // ScrollAt aims the wheel at one element's own scroller; the
+        // window-level scroll context (here parked at the bottom, 1.0)
+        // describes a different surface and must not mint ScrollBoundary —
+        // the verdict stays with the generic observation diff.
+        let page = || vec![element(1, "Ask"), element(2, "Settings")];
+        let observer = FakeObserver::new(vec![Ok(page()), Ok(page())]).with_scroll_contexts(vec![
+            Some(scroll_test_context(1.0)),
+            Some(scroll_test_context(1.0)),
+        ]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::ScrollAt {
+                id: 1,
+                dx: 0,
+                dy: 300,
+            }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        // The wheel anchored at the target element, not a container anchor.
+        assert_eq!(
+            events.borrow()[0],
+            RecordedInput::Move(ClickPoint { x: 50, y: 22 })
+        );
+        assert_ne!(
+            report.steps[0].verification.status,
+            VerificationStatus::ScrollBoundary
+        );
+        assert!(!report.steps[0]
+            .verification
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("boundary"));
+    }
+
+    #[test]
     fn scroll_clamps_pixel_magnitude_per_event() {
         let observer = FakeObserver::new(vec![
             Ok(vec![element(1, "Ask")]),
@@ -9926,7 +9985,16 @@ mod tests {
         };
         let observer = FakeObserver::new(vec![Ok(vec![web.clone()]), Ok(vec![element(2, "Done")])])
             .with_refreshes(vec![Some(web.clone()), Some(web.clone()), Some(web)])
-            .with_scroll_contexts(vec![Some(containing_window)]);
+            // Enough contexts that every possible preflight attempt stays
+            // gated: a wrongly-rejecting gate cannot sneak the click through
+            // a later attempt whose context queue ran dry (None skips the
+            // gate entirely).
+            .with_scroll_contexts(vec![
+                Some(containing_window),
+                Some(containing_window),
+                Some(containing_window),
+            ]);
+        let events = Rc::new(RefCell::new(Vec::new()));
 
         let report = block_on(run_stub_agent_loop(
             &observer,
@@ -9941,7 +10009,7 @@ mod tests {
                 ..Default::default()
             },
             PreflightFactory {
-                events: Rc::new(RefCell::new(Vec::new())),
+                events: events.clone(),
                 clicks: clicks.clone(),
                 location_offset: ClickPoint { x: 0, y: 0 },
             },
@@ -9955,6 +10023,15 @@ mod tests {
         assert_eq!(
             report.steps[0].click_preflight.as_ref().unwrap().status,
             ClickPreflightStatus::Passed
+        );
+        // First-attempt pass: exactly one warp and one settled read. A gate
+        // that wrongly rejected attempt 1 would show extra Move events.
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                RecordedInput::Move(ClickPoint { x: 60, y: 35 }),
+                RecordedInput::MouseLocation,
+            ]
         );
     }
 
