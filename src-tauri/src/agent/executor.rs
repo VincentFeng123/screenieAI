@@ -9444,6 +9444,32 @@ mod tests {
             target_intent_mismatch_reason(Some("✕"), None, &prepared),
             None
         );
+
+        // A truly unlabeled icon button (empty AX name, no value): there is
+        // nothing to compare the mandatory echo against, so the gate must
+        // skip rather than score it 0.0 and reject — refusing would make the
+        // element permanently unclickable.
+        let unlabeled = Element::new(
+            9,
+            "AXButton".into(),
+            "".into(),
+            None,
+            Rect {
+                x: 40.0,
+                y: 10.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            true,
+            false,
+            CoordinateSpace::AxPoints,
+            ElementSource::Ax,
+        );
+        let prepared = prepare_action(&Action::Click { id: 9 }, &[unlabeled]).unwrap();
+        assert_eq!(
+            target_intent_mismatch_reason(Some("anything"), None, &prepared),
+            None
+        );
     }
 
     #[test]
