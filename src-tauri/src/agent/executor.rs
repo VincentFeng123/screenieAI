@@ -6318,6 +6318,31 @@ where
         ));
     }
 
+    // Safari DOM content can never legitimately sit outside the focused
+    // window, so reject web click points that land in chrome or off-screen.
+    // AX targets are exempt (popups/menus may extend beyond the window and
+    // they get the hit-test below); observers without scroll context
+    // (tests, other platforms) skip the gate.
+    if target.source == ElementSource::Web {
+        if let Some(frame) = observer
+            .scroll_context()
+            .as_ref()
+            .and_then(window_and_screen_frame)
+        {
+            if !point_inside_rect(actual_point, frame) {
+                return Err(ClickPreflightReport::failed_with_kind(
+                    expected_point,
+                    Some(actual_point),
+                    format!(
+                        "click point ({}, {}) is outside the focused window/screen",
+                        actual_point.x, actual_point.y
+                    ),
+                    ClickPreflightFailureKind::BoundsCheck,
+                ));
+            }
+        }
+    }
+
     let validation_kind = match target.source {
         ElementSource::Ax => ClickPreflightFailureKind::AxHitTest,
         ElementSource::Web | ElementSource::VisionDetected => {
@@ -6484,6 +6509,23 @@ fn point_inside_target_bounds(point: ClickPoint, target: &TargetSummary) -> bool
         && y >= target.bounds.y
         && x <= target.bounds.x + target.bounds.width
         && y <= target.bounds.y + target.bounds.height
+}
+
+/// Intersection of the focused window and screen frames from the scroll
+/// context, when at least one is known.
+fn window_and_screen_frame(ctx: &ScrollContext) -> Option<Rect> {
+    match (ctx.window, ctx.screen) {
+        (Some(window), Some(screen)) => intersect_rects(window, screen),
+        (Some(window), None) => Some(window),
+        (None, Some(screen)) => Some(screen),
+        (None, None) => None,
+    }
+}
+
+fn point_inside_rect(point: ClickPoint, rect: Rect) -> bool {
+    let x = point.x as f64;
+    let y = point.y as f64;
+    x >= rect.x && y >= rect.y && x <= rect.x + rect.width && y <= rect.y + rect.height
 }
 
 fn click_point_distance(a: ClickPoint, b: ClickPoint) -> f64 {
@@ -9380,6 +9422,138 @@ mod tests {
                 location_offset: ClickPoint { x: 0, y: 0 },
             },
             &FakeCalibrationProbe::hit(TargetSummary::from(&wrong_hit)),
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(clicks.get(), 1);
+        assert!(report.steps[0].executed);
+        assert_eq!(
+            report.steps[0].click_preflight.as_ref().unwrap().status,
+            ClickPreflightStatus::Passed
+        );
+    }
+
+    #[test]
+    fn web_preflight_rejects_click_point_outside_focused_window() {
+        // Safari DOM content cannot legitimately sit outside the focused
+        // window; a web click point landing in chrome (the field repro:
+        // stale geometry pointing at the toolbar) must be refused.
+        let clicks = Rc::new(Cell::new(0));
+        let web = web_element(4, "Search"); // bounds center (60, 35)
+        let outside_window = ScrollContext {
+            container: None,
+            window: Some(Rect {
+                x: 200.0,
+                y: 100.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            screen: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            vertical_position: None,
+        };
+        // Attempt-loop + after-safety refreshes, then one per preflight try.
+        let observer = FakeObserver::new(vec![Ok(vec![web.clone()])])
+            .with_refreshes(vec![
+                Some(web.clone()),
+                Some(web.clone()),
+                Some(web.clone()),
+                Some(web.clone()),
+                Some(web),
+            ])
+            .with_scroll_contexts(vec![
+                Some(outside_window),
+                Some(outside_window),
+                Some(outside_window),
+            ]);
+
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 4 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            PreflightFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+                clicks: clicks.clone(),
+                location_offset: ClickPoint { x: 0, y: 0 },
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(clicks.get(), 0);
+        assert!(!report.steps[0].executed);
+        let preflight = report.steps[0].click_preflight.as_ref().unwrap();
+        assert_eq!(preflight.status, ClickPreflightStatus::Failed);
+        assert_eq!(
+            preflight.failure_kind,
+            Some(ClickPreflightFailureKind::BoundsCheck)
+        );
+        assert!(preflight
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("outside the focused window"));
+    }
+
+    #[test]
+    fn web_preflight_passes_inside_window_with_scroll_context() {
+        // Guards against an inverted containment predicate: a web target
+        // inside the focused window must still click normally when the
+        // observer provides scroll context.
+        let clicks = Rc::new(Cell::new(0));
+        let web = web_element(4, "Search"); // bounds center (60, 35)
+        let containing_window = ScrollContext {
+            container: None,
+            window: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            screen: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            vertical_position: None,
+        };
+        let observer = FakeObserver::new(vec![Ok(vec![web.clone()]), Ok(vec![element(2, "Done")])])
+            .with_refreshes(vec![Some(web.clone()), Some(web.clone()), Some(web)])
+            .with_scroll_contexts(vec![Some(containing_window)]);
+
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 4 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            PreflightFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+                clicks: clicks.clone(),
+                location_offset: ClickPoint { x: 0, y: 0 },
+            },
+            &NoCalibrationProbe,
             &NoConfirmationRequester,
             &AgentAbortState::default(),
         ));
