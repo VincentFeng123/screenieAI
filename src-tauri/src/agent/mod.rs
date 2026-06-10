@@ -1,3 +1,4 @@
+mod capture_tools;
 mod executor;
 mod grounding;
 mod hints;
@@ -25,6 +26,7 @@ pub use executor::{
     SafetyDecision, SafetyGateReport, SettleStatus, StubAgentOptions, TargetSummary,
     UserAnswerOutcome, UserAnswerStatus, VerificationReport, VerificationStatus,
 };
+pub(crate) use capture_tools::CaptureEngine;
 pub(crate) use grounding::GrounderManager;
 pub use grounding::{GroundingMode, GroundingPixel, GroundingReport};
 #[cfg(target_os = "macos")]
@@ -32,9 +34,9 @@ pub use macos_observer::MacObserver;
 pub(crate) use planner::ContextAwareLlmPlanner;
 pub use planner::{NameResolvingStubPlanner, StubPlanner};
 pub use types::{
-    Action, CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider, MenuMatch,
-    MenuPressOutcome, MenuScanResult, ObservationError, Planner, PlannerDecision,
-    PlannerHistoryEntry, Rect, ScreenObserver, ScrollContext,
+    Action, CaptureScope, CoordinateSpace, Element, ElementSource, FocusedApp,
+    FocusedAppProvider, MenuMatch, MenuPressOutcome, MenuScanResult, ObservationError, Planner,
+    PlannerDecision, PlannerHistoryEntry, Rect, ScreenObserver, ScrollContext,
 };
 pub use vision::{CaptureSize, ObservationMetadata, ObservationSource};
 pub(crate) use vision::{VisionFallbackObserver, VisionFallbackOptions, VisionFallbackState};

@@ -223,6 +223,49 @@ const char *screenie_capture_list_targets(void) {
   }
 }
 
+#pragma mark - Frontmost window
+
+// CGWindowID of the frontmost standard (layer-0) window not owned by this
+// process, or 0. Uses the window server's z-ordered list (front-to-back) —
+// no Accessibility grant required.
+uint32_t screenie_frontmost_window_id(void) {
+  CFArrayRef list = CGWindowListCopyWindowInfo(
+      kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+      kCGNullWindowID);
+  if (list == NULL) {
+    return 0;
+  }
+  uint32_t result = 0;
+  pid_t ownPid = getpid();
+  CFIndex count = CFArrayGetCount(list);
+  for (CFIndex i = 0; i < count; i++) {
+    CFDictionaryRef info = CFArrayGetValueAtIndex(list, i);
+    int layer = -1;
+    CFNumberRef layerRef = CFDictionaryGetValue(info, kCGWindowLayer);
+    if (layerRef == NULL ||
+        !CFNumberGetValue(layerRef, kCFNumberIntType, &layer) || layer != 0) {
+      continue;
+    }
+    int pid = 0;
+    CFNumberRef pidRef = CFDictionaryGetValue(info, kCGWindowOwnerPID);
+    if (pidRef != NULL) {
+      CFNumberGetValue(pidRef, kCFNumberIntType, &pid);
+    }
+    if ((pid_t)pid == ownPid) {
+      continue; // skip our own overlay/tooltip panels
+    }
+    int number = 0;
+    CFNumberRef numberRef = CFDictionaryGetValue(info, kCGWindowNumber);
+    if (numberRef != NULL &&
+        CFNumberGetValue(numberRef, kCFNumberIntType, &number) && number > 0) {
+      result = (uint32_t)number;
+      break;
+    }
+  }
+  CFRelease(list);
+  return result;
+}
+
 #pragma mark - Single still (macOS 14+)
 
 // ARC sibling of macos_window.m's static screenie_copy_png_base64_from_image.

@@ -8,10 +8,12 @@ use super::matching;
 use super::search::score_match;
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
+use super::capture_tools::CaptureEngine;
 use super::types::{
-    intersect_rects, is_secure_text_role, normalize_signature_name, Action, CoordinateSpace,
-    Element, ElementSource, FocusedApp, FocusedAppProvider, MenuPressOutcome, MenuScanResult,
-    ObservationError, Planner, PlannerHistoryEntry, Rect, ScreenObserver, ScrollContext,
+    intersect_rects, is_secure_text_role, normalize_signature_name, Action, CaptureScope,
+    CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider, MenuPressOutcome,
+    MenuScanResult, ObservationError, Planner, PlannerCaptureAttachment, PlannerHistoryEntry,
+    Rect, ScreenObserver, ScrollContext,
 };
 #[cfg(test)]
 use super::types::{ChangeWait, MenuMatch, ScrollContainerKind, UiChangeSignal};
@@ -447,6 +449,10 @@ pub enum ActionMechanism {
     UiSearch,
     /// webLookup research call through the planner's web-search model.
     WebLookup,
+    /// Single-frame perception capture (captureFrame / capturePermission).
+    Capture,
+    /// Screen recording (recordClip / startRecording / stopRecording).
+    Record,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1275,6 +1281,15 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
                     "script actions are executed through the script runner".into(),
                 ));
             }
+            PreparedKind::CaptureFrame { .. }
+            | PreparedKind::RecordClip { .. }
+            | PreparedKind::StartRecording { .. }
+            | PreparedKind::StopRecording
+            | PreparedKind::CapturePermission => {
+                return Err(ExecutionError::Input(
+                    "capture actions are executed through the capture engine".into(),
+                ));
+            }
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
             | PreparedKind::FindUi { .. }
@@ -1695,16 +1710,17 @@ where
         calibration_probe,
         confirmations,
         &NoopGrounder,
+        &crate::agent::capture_tools::NoopCaptureEngine,
         abort,
     )
     .await
 }
 
 // One parameter per collaborating subsystem (observer, planner, input,
-// calibration, confirmations, grounder, abort) — bundling them into a struct
-// would only move the argument list.
+// calibration, confirmations, grounder, capture, abort) — bundling them into
+// a struct would only move the argument list.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_stub_agent_loop_with_grounder<O, P, F, C, Q, G>(
+pub(crate) async fn run_stub_agent_loop_with_grounder<O, P, F, C, Q, G, E>(
     observer: &O,
     planner: &P,
     options: StubAgentOptions,
@@ -1712,6 +1728,7 @@ pub(crate) async fn run_stub_agent_loop_with_grounder<O, P, F, C, Q, G>(
     calibration_probe: &C,
     confirmations: &Q,
     grounder: &G,
+    capture: &E,
     abort: &AgentAbortState,
 ) -> AgentRunReport
 where
@@ -1721,6 +1738,7 @@ where
     C: CalibrationProbe,
     Q: ConfirmationRequester,
     G: Grounder + ?Sized,
+    E: CaptureEngine + ?Sized,
 {
     let adaptive_step_budget = options.max_steps.is_none();
     let options = options.resolve();
@@ -2771,6 +2789,332 @@ where
                             "user did not answer; proceed with your best judgment or fail with reason_detail"
                                 .to_string()
                         }
+                    }
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::CapturePermission => {
+                // Read-only: reports the perceive/act grant map so the agent
+                // can fail closed instead of erroring blindly. The probe runs
+                // a real capture to expose the stale-CGPreflight case.
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: capturePermission skipped".to_string()
+                } else {
+                    let map = capture.permissions(true).await;
+                    step.executed = true;
+                    step.mechanism = Some(ActionMechanism::Capture);
+                    capture_permission_result_text(&map)
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::CaptureFrame { scope } => {
+                let scope = *scope;
+                // Loop-level like ReadPage (no input events), but it DOES
+                // write a PNG — stamp an explicit Allow so reports show the
+                // decision, and let AskEverything users approve it.
+                step.safety_gate = Some(capture_allow_gate(
+                    "screen capture only writes a local image file",
+                    &focused_before_observation,
+                ));
+                if options.execution_policy == ExecutionPolicy::AskEverything {
+                    let wait_started = Instant::now();
+                    let outcome = confirmations
+                        .request_confirmation(
+                            AgentConfirmationRequest {
+                                action: action.clone(),
+                                target: None,
+                                reason: format!(
+                                    "capture a screenshot of the {}",
+                                    scope.label()
+                                ),
+                            },
+                            confirmation_timeout,
+                            abort,
+                        )
+                        .await;
+                    user_wait_time += wait_started.elapsed();
+                    step.confirmation = Some(outcome.clone());
+                    match outcome.status {
+                        ConfirmationStatus::Approved => {}
+                        ConfirmationStatus::Aborted => {
+                            step.failure_reason = Some("agent aborted".into());
+                            terminal_status = Some(AgentRunStatus::Aborted);
+                            failure_reason = Some("agent aborted".into());
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            break;
+                        }
+                        ConfirmationStatus::Denied
+                        | ConfirmationStatus::TimedOut
+                        | ConfirmationStatus::Unavailable => {
+                            history.push(PlannerHistoryEntry::new(
+                                action.clone(),
+                                planner_reason.clone(),
+                                "user declined the screen capture; continue without it or ask"
+                                    .to_string(),
+                            ));
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            continue 'steps;
+                        }
+                    }
+                }
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: captureFrame skipped".to_string()
+                } else if let Some(denied) =
+                    capture_denied_feedback(&capture.permissions(false).await)
+                {
+                    // Fail closed: the engine is never called without the grant.
+                    denied
+                } else {
+                    match capture.capture_frame(scope).await {
+                        Ok(frame) if frame.blank => CAPTURE_STALE_GRANT_FEEDBACK.to_string(),
+                        Ok(frame) => {
+                            step.executed = true;
+                            step.mechanism = Some(ActionMechanism::Capture);
+                            let text = format!(
+                                "captured {} frame {}x{}; the screenshot is attached to your next prompt",
+                                scope.label(),
+                                frame.width,
+                                frame.height
+                            );
+                            planner.attach_capture(PlannerCaptureAttachment {
+                                image_png_b64: frame.png_base64,
+                                width: frame.width,
+                                height: frame.height,
+                                scope_label: scope.label(),
+                            });
+                            text
+                        }
+                        Err(err) => format!("captureFrame failed: {err}"),
+                    }
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::RecordClip { seconds, scope } => {
+                let (seconds, scope) = (*seconds, *scope);
+                step.safety_gate = Some(capture_allow_gate(
+                    "screen recording only writes a local video file",
+                    &focused_before_observation,
+                ));
+                if options.execution_policy == ExecutionPolicy::AskEverything {
+                    let wait_started = Instant::now();
+                    let outcome = confirmations
+                        .request_confirmation(
+                            AgentConfirmationRequest {
+                                action: action.clone(),
+                                target: None,
+                                reason: format!(
+                                    "record the {} for {seconds}s",
+                                    scope.label()
+                                ),
+                            },
+                            confirmation_timeout,
+                            abort,
+                        )
+                        .await;
+                    user_wait_time += wait_started.elapsed();
+                    step.confirmation = Some(outcome.clone());
+                    match outcome.status {
+                        ConfirmationStatus::Approved => {}
+                        ConfirmationStatus::Aborted => {
+                            step.failure_reason = Some("agent aborted".into());
+                            terminal_status = Some(AgentRunStatus::Aborted);
+                            failure_reason = Some("agent aborted".into());
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            break;
+                        }
+                        ConfirmationStatus::Denied
+                        | ConfirmationStatus::TimedOut
+                        | ConfirmationStatus::Unavailable => {
+                            history.push(PlannerHistoryEntry::new(
+                                action.clone(),
+                                planner_reason.clone(),
+                                "user declined the recording; continue without it or ask"
+                                    .to_string(),
+                            ));
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            continue 'steps;
+                        }
+                    }
+                }
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: recordClip skipped".to_string()
+                } else if let Some(denied) =
+                    capture_denied_feedback(&capture.permissions(false).await)
+                {
+                    denied
+                } else {
+                    match capture.record_clip(scope, seconds, abort).await {
+                        Ok(clip) => {
+                            step.executed = true;
+                            step.mechanism = Some(ActionMechanism::Record);
+                            format!(
+                                "recorded {:.0}s {} clip; saved to {}",
+                                clip.duration_s,
+                                clip.format.extension(),
+                                clip.path
+                            )
+                        }
+                        Err(err) => format!("recordClip failed: {err}"),
+                    }
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::StartRecording { scope } => {
+                let scope = *scope;
+                step.safety_gate = Some(capture_allow_gate(
+                    "screen recording only writes a local video file",
+                    &focused_before_observation,
+                ));
+                if options.execution_policy == ExecutionPolicy::AskEverything {
+                    let wait_started = Instant::now();
+                    let outcome = confirmations
+                        .request_confirmation(
+                            AgentConfirmationRequest {
+                                action: action.clone(),
+                                target: None,
+                                reason: format!(
+                                    "start an open-ended recording of the {}",
+                                    scope.label()
+                                ),
+                            },
+                            confirmation_timeout,
+                            abort,
+                        )
+                        .await;
+                    user_wait_time += wait_started.elapsed();
+                    step.confirmation = Some(outcome.clone());
+                    match outcome.status {
+                        ConfirmationStatus::Approved => {}
+                        ConfirmationStatus::Aborted => {
+                            step.failure_reason = Some("agent aborted".into());
+                            terminal_status = Some(AgentRunStatus::Aborted);
+                            failure_reason = Some("agent aborted".into());
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            break;
+                        }
+                        ConfirmationStatus::Denied
+                        | ConfirmationStatus::TimedOut
+                        | ConfirmationStatus::Unavailable => {
+                            history.push(PlannerHistoryEntry::new(
+                                action.clone(),
+                                planner_reason.clone(),
+                                "user declined the recording; continue without it or ask"
+                                    .to_string(),
+                            ));
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            continue 'steps;
+                        }
+                    }
+                }
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: startRecording skipped".to_string()
+                } else if let Some(denied) =
+                    capture_denied_feedback(&capture.permissions(false).await)
+                {
+                    denied
+                } else {
+                    match capture.start_recording(scope).await {
+                        Ok(()) => {
+                            step.executed = true;
+                            step.mechanism = Some(ActionMechanism::Record);
+                            format!(
+                                "recording started ({}); the macOS screen-sharing indicator is on; emit stopRecording to save the clip (it auto-stops at the safety cap)",
+                                scope.label()
+                            )
+                        }
+                        Err(err) => format!("startRecording failed: {err}"),
+                    }
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::StopRecording => {
+                // Stopping never confirms: ending a recording is always
+                // allowed (and is also what run-end cleanup does).
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: stopRecording skipped".to_string()
+                } else {
+                    match capture.stop_recording().await {
+                        Ok(clip) => {
+                            step.executed = true;
+                            step.mechanism = Some(ActionMechanism::Record);
+                            format!(
+                                "recording stopped after {:.1}s; saved {} to {}",
+                                clip.duration_s,
+                                clip.format.extension(),
+                                clip.path
+                            )
+                        }
+                        Err(err) => format!("stopRecording: {err}"),
                     }
                 };
                 history.push(PlannerHistoryEntry::new(
@@ -4035,6 +4379,13 @@ fn confirmation_approval_key(
         Action::Scroll { dx, dy } => format!("scroll:{dx}:{dy}"),
         Action::ScrollAt { dx, dy, .. } => format!("scrollAt:{dx}:{dy}"),
         Action::Wait { ms } => format!("wait:{ms}"),
+        Action::CaptureFrame { scope } => format!("captureFrame:{}", scope.label()),
+        Action::RecordClip { seconds, scope } => {
+            format!("recordClip:{}:{seconds}", scope.label())
+        }
+        Action::StartRecording { scope } => format!("startRecording:{}", scope.label()),
+        Action::StopRecording => "stopRecording".into(),
+        Action::CapturePermission => "capturePermission".into(),
         Action::Done => "done".into(),
         Action::Fail { reason } => format!("fail:{}", reason.trim()),
     };
@@ -4864,10 +5215,86 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
         Action::Wait { ms } => Ok(PreparedAction::without_target(PreparedKind::Wait {
             ms: *ms,
         })),
+        Action::CaptureFrame { scope } => Ok(PreparedAction::without_target(
+            PreparedKind::CaptureFrame { scope: *scope },
+        )),
+        Action::RecordClip { seconds, scope } => {
+            if *seconds == 0 || u64::from(*seconds) > super::types::MAX_RECORD_CLIP_SECONDS {
+                return Err(ExecutionError::Input(format!(
+                    "recordClip seconds must be between 1 and {}",
+                    super::types::MAX_RECORD_CLIP_SECONDS
+                )));
+            }
+            Ok(PreparedAction::without_target(PreparedKind::RecordClip {
+                seconds: *seconds,
+                scope: *scope,
+            }))
+        }
+        Action::StartRecording { scope } => Ok(PreparedAction::without_target(
+            PreparedKind::StartRecording { scope: *scope },
+        )),
+        Action::StopRecording => {
+            Ok(PreparedAction::without_target(PreparedKind::StopRecording))
+        }
+        Action::CapturePermission => Ok(PreparedAction::without_target(
+            PreparedKind::CapturePermission,
+        )),
         Action::Done => Ok(PreparedAction::without_target(PreparedKind::Done)),
         Action::Fail { reason } => Ok(PreparedAction::without_target(PreparedKind::Fail {
             reason: reason.clone(),
         })),
+    }
+}
+
+/// Stale-grant feedback: preflight said granted but the pixels are the TCC
+/// all-black placeholder. Only an app relaunch fixes it.
+const CAPTURE_STALE_GRANT_FEEDBACK: &str = "captureFrame returned a BLANK frame: macOS is using a stale Screen Recording grant. Do not retry; tell the user to quit and reopen Screenie AI, then fail with reason_detail.";
+
+/// Explicit Allow stamp for capture/recording arms: they bypass the main
+/// safety gate (loop-level read-mostly arms) but DO write a local media
+/// file, so reports should still show a decision.
+fn capture_allow_gate(reason: &str, focused: &FocusedApp) -> SafetyGateReport {
+    SafetyGateReport {
+        decision: SafetyDecision::Allow,
+        reason: reason.to_string(),
+        focused_app: Some(focused.clone()),
+    }
+}
+
+/// Fail-closed precheck: Some(feedback) when capture must not be attempted.
+fn capture_denied_feedback(map: &crate::capture::engine::CapturePermissionMap) -> Option<String> {
+    use crate::capture::engine::PermissionState;
+    match map.screen_recording {
+        PermissionState::Granted => None,
+        PermissionState::Denied | PermissionState::Undetermined => Some(
+            "Screen Recording permission is not granted - do NOT retry capture; tell the user to enable it for Screenie AI in System Settings > Privacy & Security > Screen Recording, then ask or fail with reason_detail."
+                .to_string(),
+        ),
+    }
+}
+
+/// Planner-visible rendering of the permission map (kept under the 220-char
+/// history truncation where possible, leading with the actionable part).
+fn capture_permission_result_text(map: &crate::capture::engine::CapturePermissionMap) -> String {
+    use crate::capture::engine::PermissionState;
+    let label = |state: PermissionState| match state {
+        PermissionState::Granted => "granted",
+        PermissionState::Denied => "denied",
+        PermissionState::Undetermined => "undetermined",
+    };
+    let ax = label(map.accessibility);
+    match (map.screen_recording, map.screen_capture_verified) {
+        (PermissionState::Granted, Some(false)) => format!(
+            "permissions: screenRecording=granted but captures are BLANK (stale grant) - tell the user to quit and reopen Screenie AI; accessibility={ax}"
+        ),
+        (PermissionState::Granted, verified) => format!(
+            "permissions: screenRecording=granted{}; accessibility={ax}",
+            if verified == Some(true) { " (capture verified)" } else { "" }
+        ),
+        (state, _) => format!(
+            "permissions: screenRecording={} - do NOT capture; tell the user to enable Screen Recording for Screenie AI in System Settings, then ask or fail; accessibility={ax}",
+            label(state)
+        ),
     }
 }
 
@@ -5169,6 +5596,12 @@ impl PreparedAction {
             PreparedKind::AppleScript { .. }
             | PreparedKind::RunShortcut { .. }
             | PreparedKind::MoveToTrash { .. } => false,
+            // Capture/recording observe the screen; they never change it.
+            PreparedKind::CaptureFrame { .. }
+            | PreparedKind::RecordClip { .. }
+            | PreparedKind::StartRecording { .. }
+            | PreparedKind::StopRecording
+            | PreparedKind::CapturePermission => false,
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
             | PreparedKind::FindUi { .. }
@@ -6227,6 +6660,11 @@ fn synthetic_mechanism(kind: &PreparedKind) -> Option<ActionMechanism> {
         | PreparedKind::AppleScript { .. }
         | PreparedKind::RunShortcut { .. }
         | PreparedKind::MoveToTrash { .. }
+        | PreparedKind::CaptureFrame { .. }
+        | PreparedKind::RecordClip { .. }
+        | PreparedKind::StartRecording { .. }
+        | PreparedKind::StopRecording
+        | PreparedKind::CapturePermission
         | PreparedKind::Wait { .. }
         | PreparedKind::Done
         | PreparedKind::Fail { .. } => None,
@@ -7038,6 +7476,13 @@ fn display_progress_action(action: &Action, prepared: &PreparedAction) -> String
         Action::RunShortcut { name, .. } => format!("run shortcut '{}'", name.trim()),
         Action::MoveToTrash { path } => format!("move '{}' to trash", path.trim()),
         Action::ReadPage => "readPage".into(),
+        Action::CaptureFrame { scope } => format!("capture the {}", scope.label()),
+        Action::RecordClip { seconds, scope } => {
+            format!("record the {} for {seconds}s", scope.label())
+        }
+        Action::StartRecording { scope } => format!("start recording the {}", scope.label()),
+        Action::StopRecording => "stop recording".into(),
+        Action::CapturePermission => "check capture permissions".into(),
         Action::Wait { ms } => format!("wait {ms}ms"),
         Action::Done => "done".into(),
         Action::Fail { .. } => "fail".into(),
@@ -7056,6 +7501,13 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
         Action::AppleScript { script } => format!("applescript:{}", compact_history_text(script)),
         Action::RunShortcut { name, .. } => format!("shortcut:{}", name.trim()),
         Action::MoveToTrash { path } => format!("moveToTrash:{}", path.trim()),
+        Action::CaptureFrame { scope } => format!("captureFrame:{}", scope.label()),
+        Action::RecordClip { seconds, scope } => {
+            format!("recordClip:{}:{seconds}", scope.label())
+        }
+        Action::StartRecording { scope } => format!("startRecording:{}", scope.label()),
+        Action::StopRecording => "stopRecording".into(),
+        Action::CapturePermission => "capturePermission".into(),
         Action::Click { .. } | Action::ClickTarget { .. } => format!(
             "click:{}",
             prepared
@@ -7295,6 +7747,21 @@ enum PreparedKind {
     MoveToTrash {
         path: String,
     },
+    /// Perception/recording actions: handled as loop-level arms (like
+    /// ReadPage) through the injected CaptureEngine, never the input
+    /// backend. Low-risk side effect: they only write a local media file.
+    CaptureFrame {
+        scope: CaptureScope,
+    },
+    RecordClip {
+        seconds: u32,
+        scope: CaptureScope,
+    },
+    StartRecording {
+        scope: CaptureScope,
+    },
+    StopRecording,
+    CapturePermission,
     Done,
     Fail {
         reason: String,
@@ -13365,6 +13832,7 @@ mod tests {
             &NoCalibrationProbe,
             &NoConfirmationRequester,
             &grounder,
+            &crate::agent::capture_tools::NoopCaptureEngine,
             &AgentAbortState::default(),
         ));
 
@@ -13422,6 +13890,7 @@ mod tests {
             &NoCalibrationProbe,
             &confirmations,
             &grounder,
+            &crate::agent::capture_tools::NoopCaptureEngine,
             &AgentAbortState::default(),
         ));
 
@@ -13473,6 +13942,7 @@ mod tests {
             &NoCalibrationProbe,
             &NoConfirmationRequester,
             &grounder,
+            &crate::agent::capture_tools::NoopCaptureEngine,
             &AgentAbortState::default(),
         ));
 
@@ -15284,6 +15754,375 @@ mod tests {
                 status: ConfirmationStatus::Approved,
             }
         }
+    }
+
+    /// Configurable CaptureEngine double: grant state, blank frames, the
+    /// one-session guard, and per-operation call counters.
+    struct MockCaptureEngine {
+        granted: bool,
+        blank: bool,
+        frame_calls: Rc<Cell<u32>>,
+        record_calls: Rc<Cell<u32>>,
+        start_calls: Rc<Cell<u32>>,
+        active: Cell<bool>,
+    }
+
+    impl MockCaptureEngine {
+        fn granted() -> Self {
+            Self {
+                granted: true,
+                blank: false,
+                frame_calls: Rc::new(Cell::new(0)),
+                record_calls: Rc::new(Cell::new(0)),
+                start_calls: Rc::new(Cell::new(0)),
+                active: Cell::new(false),
+            }
+        }
+
+        fn denied() -> Self {
+            Self {
+                granted: false,
+                ..Self::granted()
+            }
+        }
+
+        fn blank_frames() -> Self {
+            Self {
+                blank: true,
+                ..Self::granted()
+            }
+        }
+
+        fn clip(path: &str) -> crate::capture::engine::RecordingFile {
+            crate::capture::engine::RecordingFile {
+                path: path.to_string(),
+                bytes: 1024,
+                duration_s: 2.0,
+                width: 640,
+                height: 400,
+                fps: 10,
+                format: crate::capture::engine::ClipFormat::Mp4,
+                frame_count: 20,
+                stopped_reason: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl CaptureEngine for MockCaptureEngine {
+        async fn permissions(&self, _probe: bool) -> crate::capture::engine::CapturePermissionMap {
+            use crate::capture::engine::PermissionState;
+            crate::capture::engine::CapturePermissionMap {
+                screen_recording: if self.granted {
+                    PermissionState::Granted
+                } else {
+                    PermissionState::Denied
+                },
+                accessibility: PermissionState::Granted,
+                screen_capture_verified: None,
+            }
+        }
+
+        async fn capture_frame(
+            &self,
+            _scope: CaptureScope,
+        ) -> Result<crate::capture::engine::CapturedFrame, String> {
+            self.frame_calls.set(self.frame_calls.get() + 1);
+            Ok(crate::capture::engine::CapturedFrame {
+                png_base64: "ZmFrZS1wbmc=".into(),
+                width: 640,
+                height: 400,
+                path: Some("/tmp/captures/frame_test.png".into()),
+                blank: self.blank,
+            })
+        }
+
+        async fn record_clip(
+            &self,
+            _scope: CaptureScope,
+            _seconds: u32,
+            _abort: &AgentAbortState,
+        ) -> Result<crate::capture::engine::RecordingFile, String> {
+            self.record_calls.set(self.record_calls.get() + 1);
+            Ok(Self::clip("/tmp/captures/clip_test.mp4"))
+        }
+
+        async fn start_recording(&self, _scope: CaptureScope) -> Result<(), String> {
+            self.start_calls.set(self.start_calls.get() + 1);
+            if self.active.get() {
+                return Err("a recording session is already active; stopRecording first".into());
+            }
+            self.active.set(true);
+            Ok(())
+        }
+
+        async fn stop_recording(&self) -> Result<crate::capture::engine::RecordingFile, String> {
+            if !self.active.replace(false) {
+                return Err("no recording session is active".into());
+            }
+            Ok(Self::clip("/tmp/captures/clip_session.mp4"))
+        }
+
+        fn recording_active(&self) -> bool {
+            self.active.get()
+        }
+    }
+
+    /// Records every `attach_capture` the executor hands the planner.
+    struct CaptureAttachRecordingPlanner {
+        actions: Vec<Action>,
+        attachments: Rc<RefCell<Vec<PlannerCaptureAttachment>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for CaptureAttachRecordingPlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            let action = self
+                .actions
+                .get(history.len())
+                .or_else(|| self.actions.last())
+                .cloned()
+                .expect("planner needs at least one action");
+            PlannerDecision::new("capture stub", action)
+        }
+
+        fn attach_capture(&self, frame: PlannerCaptureAttachment) {
+            self.attachments.borrow_mut().push(frame);
+        }
+    }
+
+    fn capture_loop_options() -> StubAgentOptions {
+        StubAgentOptions {
+            execution_policy: Some(ExecutionPolicy::Auto),
+            max_steps: Some(8),
+            settle_ms: Some(0),
+            max_action_retries: Some(0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn capture_frame_attaches_image_and_stamps_allow_gate() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 8]);
+        let attachments = Rc::new(RefCell::new(Vec::new()));
+        let planner = CaptureAttachRecordingPlanner {
+            actions: vec![
+                Action::CaptureFrame {
+                    scope: CaptureScope::Window,
+                },
+                Action::Done,
+            ],
+            attachments: attachments.clone(),
+        };
+        let engine = MockCaptureEngine::granted();
+        let frame_calls = engine.frame_calls.clone();
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            capture_loop_options(),
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &NoopGrounder,
+            &engine,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        let step = &report.steps[0];
+        assert_eq!(
+            step.action,
+            Action::CaptureFrame {
+                scope: CaptureScope::Window
+            }
+        );
+        assert!(step.executed);
+        assert_eq!(step.mechanism, Some(ActionMechanism::Capture));
+        assert_eq!(
+            step.safety_gate.as_ref().map(|gate| gate.decision),
+            Some(SafetyDecision::Allow)
+        );
+        assert_eq!(frame_calls.get(), 1);
+        let attachments = attachments.borrow();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].image_png_b64, "ZmFrZS1wbmc=");
+        assert_eq!(attachments[0].scope_label, "window");
+    }
+
+    #[test]
+    fn capture_actions_fail_closed_when_permission_denied() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 8]);
+        let results = Rc::new(RefCell::new(Vec::new()));
+        let planner = HistoryRecordingActionPlanner {
+            actions: vec![
+                Action::CaptureFrame {
+                    scope: CaptureScope::Screen,
+                },
+                Action::Done,
+            ],
+            results: results.clone(),
+        };
+        let engine = MockCaptureEngine::denied();
+        let frame_calls = engine.frame_calls.clone();
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            capture_loop_options(),
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &NoopGrounder,
+            &engine,
+            &AgentAbortState::default(),
+        ));
+
+        // Fail closed: the engine is never invoked, the run keeps going, and
+        // the planner gets actionable guidance instead of a raw error.
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(frame_calls.get(), 0);
+        assert!(!report.steps[0].executed);
+        assert!(
+            results
+                .borrow()
+                .iter()
+                .any(|result| result.contains("do NOT retry capture")),
+            "expected fail-closed guidance, got {:?}",
+            results.borrow()
+        );
+    }
+
+    #[test]
+    fn capture_frame_blank_frame_is_not_attached() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 8]);
+        let attachments = Rc::new(RefCell::new(Vec::new()));
+        let planner = CaptureAttachRecordingPlanner {
+            actions: vec![
+                Action::CaptureFrame {
+                    scope: CaptureScope::Screen,
+                },
+                Action::Done,
+            ],
+            attachments: attachments.clone(),
+        };
+        let engine = MockCaptureEngine::blank_frames();
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            capture_loop_options(),
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &NoopGrounder,
+            &engine,
+            &AgentAbortState::default(),
+        ));
+
+        // A TCC-placeholder frame must never reach the model as evidence.
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(attachments.borrow().is_empty());
+        assert!(!report.steps[0].executed);
+    }
+
+    #[test]
+    fn start_recording_one_session_guard_surfaces_feedback() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 10]);
+        let results = Rc::new(RefCell::new(Vec::new()));
+        let planner = HistoryRecordingActionPlanner {
+            actions: vec![
+                Action::StartRecording {
+                    scope: CaptureScope::Screen,
+                },
+                Action::StartRecording {
+                    scope: CaptureScope::Screen,
+                },
+                Action::StopRecording,
+                Action::Done,
+            ],
+            results: results.clone(),
+        };
+        let engine = MockCaptureEngine::granted();
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            capture_loop_options(),
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &NoopGrounder,
+            &engine,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(report.steps[0].executed, "first start should succeed");
+        assert_eq!(report.steps[0].mechanism, Some(ActionMechanism::Record));
+        assert!(!report.steps[1].executed, "second start must be rejected");
+        assert!(report.steps[2].executed, "stop should save the clip");
+        assert!(!engine.recording_active(), "session must end with the run");
+        let results = results.borrow();
+        assert!(
+            results.iter().any(|r| r.contains("already active")),
+            "one-session feedback missing: {results:?}"
+        );
+        assert!(
+            results.iter().any(|r| r.contains("clip_session.mp4")),
+            "stop result should carry the clip path: {results:?}"
+        );
+    }
+
+    #[test]
+    fn record_clip_confirms_in_ask_everything() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 8]);
+        let planner = StubPlanner::sequence(vec![
+            Action::RecordClip {
+                seconds: 5,
+                scope: CaptureScope::Screen,
+            },
+            Action::Done,
+        ]);
+        let engine = MockCaptureEngine::granted();
+        let record_calls = engine.record_calls.clone();
+        let confirmations = FakeConfirmationRequester::single(ConfirmationStatus::Denied);
+        let confirm_calls = confirmations.calls();
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::AskEverything),
+                max_steps: Some(6),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &confirmations,
+            &NoopGrounder,
+            &engine,
+            &AgentAbortState::default(),
+        ));
+
+        // Denied confirmation: no recording happened, run continued.
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(confirm_calls.get(), 1);
+        assert_eq!(record_calls.get(), 0);
+        assert!(!report.steps[0].executed);
+        assert!(report.steps[0].confirmation.is_some());
     }
 
     struct FakeConfirmationRequester {

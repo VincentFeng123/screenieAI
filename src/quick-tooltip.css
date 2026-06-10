@@ -873,3 +873,72 @@ body,
 .quick-tooltip-send {
   flex: 0 0 auto;
 }
+
+/* Capture/recording surfaces: REC pill while a session is live, and the
+   saved-clip row with Reveal in Finder. Same muted black/white palette as
+   the rest of the status card; the red dot is the only colored element. */
+.quick-tooltip-rec-pill {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(255, 59, 48, 0.18);
+}
+
+.quick-tooltip-rec-pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #ff453a;
+  animation: quick-tooltip-rec-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes quick-tooltip-rec-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.quick-tooltip-clip {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.quick-tooltip-clip-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.quick-tooltip-clip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.quick-tooltip-clip-meta {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.quick-tooltip-clip-row .quick-tooltip-confirm-btn {
+  margin-left: auto;
+}

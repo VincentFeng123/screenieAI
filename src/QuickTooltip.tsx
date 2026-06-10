@@ -21,8 +21,10 @@ import {
   Settings,
   ShieldCheck,
   Square,
+  Video,
   X,
 } from "lucide-react";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -154,7 +156,26 @@ const AGENT_MECHANISM_LABELS: Record<string, string> = {
   syntheticInput: "keys",
   uiSearch: "search",
   webLookup: "web",
+  capture: "capture",
+  record: "record",
 };
+
+type AgentRecordingState = {
+  active: boolean;
+  scope?: string;
+  startedAtMs?: number;
+};
+
+type AgentSavedClip = {
+  path: string;
+  format: string;
+  durationMs: number;
+  bytes?: number;
+};
+
+function clipFileName(path: string): string {
+  return path.split("/").pop() ?? path;
+}
 
 function agentStepDetail(update: AgentStepUpdate): string {
   const parts: string[] = [];
@@ -464,6 +485,8 @@ export default function QuickTooltip() {
   const [agentGoal, setAgentGoal] = useState("");
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentStatus, setAgentStatus] = useState<AgentStepUpdate | null>(null);
+  const [recordingActive, setRecordingActive] = useState(false);
+  const [savedClip, setSavedClip] = useState<AgentSavedClip | null>(null);
   const [confirmation, setConfirmation] =
     useState<AgentConfirmationRequest | null>(null);
   const [question, setQuestion] = useState<AgentQuestionRequest | null>(null);
@@ -516,7 +539,9 @@ export default function QuickTooltip() {
     () => selectedModelLabel(modelOptions, providerInfo.model),
     [modelOptions, providerInfo.model],
   );
-  const hasStatus = Boolean(error || confirmation || question || agentRunning);
+  const hasStatus = Boolean(
+    error || confirmation || question || agentRunning || savedClip,
+  );
   const chatVisible = expanded && !hasStatus;
   const voiceMicState: VoiceMicState = voice.micDenied
     ? "denied"
@@ -626,6 +651,9 @@ export default function QuickTooltip() {
         if (cancelled) return;
         setAgentRunning(false);
         setAgentStatus(null);
+        // Defensive: the run-end cleanup stops any session, so the pill must
+        // never outlive the run even if the state event was missed.
+        setRecordingActive(false);
         setQuestion((current) => {
           if (current) {
             invoke("set_quick_tooltip_keyboard_mode", { enabled: false }).catch(
@@ -680,6 +708,54 @@ export default function QuickTooltip() {
       })
       .catch((e) => {
         console.error("agent step update listener failed:", e);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    getCurrentWindow()
+      .listen<AgentRecordingState>("agent-recording-state", (event) => {
+        if (cancelled) return;
+        setRecordingActive(Boolean(event.payload?.active));
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      })
+      .catch((e) => {
+        console.error("agent recording state listener failed:", e);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    getCurrentWindow()
+      .listen<AgentSavedClip>("agent-clip-saved", (event) => {
+        if (cancelled || !event.payload?.path) return;
+        setSavedClip(event.payload);
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      })
+      .catch((e) => {
+        console.error("agent clip listener failed:", e);
       });
     return () => {
       cancelled = true;
@@ -1466,38 +1542,102 @@ export default function QuickTooltip() {
                 </button>
               </div>
               <div className="quick-tooltip-error-text">{error}</div>
-            </div>
-          ) : (
-            agentRunning && (
-              <div className="quick-tooltip-agent-progress">
-                <div className="quick-tooltip-status-heading">
-                  <Bot size={14} strokeWidth={1.9} aria-hidden />
-                  <span>Agent running</span>
+              {/screen recording/i.test(error) && (
+                <div className="quick-tooltip-confirmation-actions">
                   <button
                     type="button"
-                    className="quick-tooltip-status-close"
+                    className="quick-tooltip-confirm-btn"
                     onClick={() => {
-                      void stopAgentTask();
+                      invoke("open_screen_settings").catch((e) => {
+                        console.error("open_screen_settings failed:", e);
+                      });
                     }}
-                    aria-label="Stop agent task"
-                    title="Stop agent task"
                   >
-                    <Square size={12} strokeWidth={2} aria-hidden />
+                    Open Settings
+                  </button>
+                  <button
+                    type="button"
+                    className="quick-tooltip-confirm-btn primary"
+                    onClick={() => {
+                      invoke("restart_app").catch((e) => {
+                        console.error("restart_app failed:", e);
+                      });
+                    }}
+                  >
+                    Restart Screenie
                   </button>
                 </div>
-                <div className="quick-tooltip-agent-progress-text">
-                  {agentStatus
-                    ? `Step ${agentStatus.step} — ${
-                        agentStatus.reason?.trim() ||
-                        formatAgentAction(agentStatus.action)
-                      }${
-                        agentStatus.target ? ` · ${agentStatus.target}` : ""
-                      }${agentStepDetail(agentStatus)}`
-                    : "Starting…"}
-                </div>
+              )}
+            </div>
+          ) : agentRunning ? (
+            <div className="quick-tooltip-agent-progress">
+              <div className="quick-tooltip-status-heading">
+                <Bot size={14} strokeWidth={1.9} aria-hidden />
+                <span>Agent running</span>
+                {recordingActive && (
+                  <span className="quick-tooltip-rec-pill" title="Screen recording in progress">
+                    REC
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="quick-tooltip-status-close"
+                  onClick={() => {
+                    void stopAgentTask();
+                  }}
+                  aria-label="Stop agent task"
+                  title="Stop agent task"
+                >
+                  <Square size={12} strokeWidth={2} aria-hidden />
+                </button>
               </div>
-            )
-          )}
+              <div className="quick-tooltip-agent-progress-text">
+                {agentStatus
+                  ? `Step ${agentStatus.step} — ${
+                      agentStatus.reason?.trim() ||
+                      formatAgentAction(agentStatus.action)
+                    }${
+                      agentStatus.target ? ` · ${agentStatus.target}` : ""
+                    }${agentStepDetail(agentStatus)}`
+                  : "Starting…"}
+              </div>
+            </div>
+          ) : savedClip ? (
+            <div className="quick-tooltip-clip">
+              <div className="quick-tooltip-status-heading">
+                <Video size={14} strokeWidth={1.9} aria-hidden />
+                <span>Recording saved</span>
+                <button
+                  type="button"
+                  className="quick-tooltip-status-close"
+                  onClick={() => setSavedClip(null)}
+                  aria-label="Dismiss saved recording"
+                  title="Dismiss"
+                >
+                  <X size={13} strokeWidth={2} aria-hidden />
+                </button>
+              </div>
+              <div className="quick-tooltip-clip-row">
+                <span className="quick-tooltip-clip-name" title={savedClip.path}>
+                  {clipFileName(savedClip.path)}
+                </span>
+                <span className="quick-tooltip-clip-meta">
+                  {Math.max(1, Math.round(savedClip.durationMs / 1000))}s
+                </span>
+                <button
+                  type="button"
+                  className="quick-tooltip-confirm-btn"
+                  onClick={() => {
+                    revealItemInDir(savedClip.path).catch((e) => {
+                      console.error("revealItemInDir failed:", e);
+                    });
+                  }}
+                >
+                  Reveal in Finder
+                </button>
+              </div>
+            </div>
+          ) : null}
           <SvgInsetBorder radius={18} strokeAlpha={0.18} />
         </section>
       )}

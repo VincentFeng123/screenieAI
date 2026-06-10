@@ -1483,6 +1483,186 @@ fn prepare_stub_agent_run(
     Ok((text_config, vision_config, state.agent_abort.clone()))
 }
 
+/// Long edge for agent perception frames: big enough to read UI text,
+/// small enough for vision-model token budgets across providers.
+#[cfg(target_os = "macos")]
+const AGENT_FRAME_MAX_DIMENSION: u32 = 1280;
+
+/// Concrete `agent::CaptureEngine` over the capture engine + AppState
+/// recording slots (the TauriConfirmationRequester pattern). Maps the
+/// agent's scope vocabulary to real targets, persists every perception
+/// frame under captures/, and mirrors recording state to the QuickTooltip
+/// via events.
+#[cfg(target_os = "macos")]
+struct TauriCaptureEngine {
+    app: AppHandle,
+    window: WebviewWindow,
+    /// Session id of the recording THIS run started; the agent loop is
+    /// single-threaded (`?Send`), so RefCell suffices.
+    session: std::cell::RefCell<Option<String>>,
+}
+
+#[cfg(target_os = "macos")]
+impl TauriCaptureEngine {
+    fn slots(&self) -> Arc<capture::engine::RecordingSlots> {
+        self.app.state::<AppState>().recording.clone()
+    }
+
+    fn resolve_target(
+        &self,
+        scope: agent::CaptureScope,
+    ) -> Result<capture::engine::CaptureTarget, String> {
+        match scope {
+            agent::CaptureScope::Screen => {
+                Ok(capture::engine::CaptureTarget::Display { id: None })
+            }
+            agent::CaptureScope::Window => capture::engine_macos::frontmost_window_id()
+                .map(|id| capture::engine::CaptureTarget::Window { id })
+                .ok_or_else(|| "no frontmost window found to capture".to_string()),
+        }
+    }
+
+    fn emit_recording_state(&self, active: bool, scope: &str) {
+        let started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let _ = self.window.emit(
+            "agent-recording-state",
+            serde_json::json!({
+                "active": active,
+                "scope": scope,
+                "startedAtMs": started_at_ms,
+            }),
+        );
+    }
+
+    fn emit_clip_saved(&self, clip: &capture::engine::RecordingFile) {
+        // The full path travels via the event — history strings truncate.
+        let _ = self.window.emit(
+            "agent-clip-saved",
+            serde_json::json!({
+                "path": clip.path,
+                "format": clip.format,
+                "durationMs": (clip.duration_s * 1000.0) as u64,
+                "bytes": clip.bytes,
+            }),
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[async_trait::async_trait(?Send)]
+impl agent::CaptureEngine for TauriCaptureEngine {
+    async fn permissions(&self, probe: bool) -> capture::engine::CapturePermissionMap {
+        tauri::async_runtime::spawn_blocking(move || {
+            capture::engine::permission_map_blocking(probe)
+        })
+        .await
+        .unwrap_or(capture::engine::CapturePermissionMap {
+            screen_recording: capture::engine::PermissionState::Denied,
+            accessibility: capture::engine::PermissionState::Denied,
+            screen_capture_verified: None,
+        })
+    }
+
+    async fn capture_frame(
+        &self,
+        scope: agent::CaptureScope,
+    ) -> Result<capture::engine::CapturedFrame, String> {
+        let target = self.resolve_target(scope)?;
+        let app_data = app_data_dir(&self.app)?;
+        capture::engine::capture_frame(
+            target,
+            capture::engine::FrameOpts {
+                max_dimension: AGENT_FRAME_MAX_DIMENSION,
+                persist: true,
+                exclude_self: true,
+                show_cursor: false,
+            },
+            Some(app_data),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    async fn record_clip(
+        &self,
+        scope: agent::CaptureScope,
+        seconds: u32,
+        abort: &agent::AgentAbortState,
+    ) -> Result<capture::engine::RecordingFile, String> {
+        if abort.is_aborted() {
+            return Err("agent aborted before recording started".into());
+        }
+        let target = self.resolve_target(scope)?;
+        let app_data = app_data_dir(&self.app)?;
+        let slots = self.slots();
+        self.emit_recording_state(true, scope.label());
+        // The session lives in the slots, not the future: dropping the
+        // record_clip branch on abort is safe, and the stop branch finalizes
+        // whatever was captured instead of recording past the abort.
+        let result = tokio::select! {
+            biased;
+            _ = abort.notified() => {
+                capture::engine::stop_recording(slots.clone(), None).await
+            }
+            result = capture::engine::record_clip(
+                slots.clone(),
+                app_data,
+                target,
+                f64::from(seconds),
+                capture::engine::RecordOpts::default(),
+            ) => result,
+        };
+        self.emit_recording_state(false, scope.label());
+        match result {
+            Ok(clip) => {
+                self.emit_clip_saved(&clip);
+                Ok(clip)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn start_recording(&self, scope: agent::CaptureScope) -> Result<(), String> {
+        let target = self.resolve_target(scope)?;
+        let app_data = app_data_dir(&self.app)?;
+        let handle = capture::engine::start_recording(
+            self.slots(),
+            app_data,
+            target,
+            capture::engine::RecordOpts::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        *self.session.borrow_mut() = Some(handle.session_id);
+        self.emit_recording_state(true, scope.label());
+        Ok(())
+    }
+
+    async fn stop_recording(&self) -> Result<capture::engine::RecordingFile, String> {
+        let session = self
+            .session
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| "no recording session is active".to_string())?;
+        let result = capture::engine::stop_recording(self.slots(), Some(session)).await;
+        self.emit_recording_state(false, "screen");
+        match result {
+            Ok(clip) => {
+                self.emit_clip_saved(&clip);
+                Ok(clip)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn recording_active(&self) -> bool {
+        self.session.borrow().is_some() && capture::engine::recording_active(&self.slots())
+    }
+}
+
 #[cfg(target_os = "macos")]
 async fn run_prepared_stub_agent(
     app: AppHandle,
@@ -1511,8 +1691,13 @@ async fn run_prepared_stub_agent(
         resolved.scripting_enabled,
         resolved.web_lookup_enabled,
     );
+    let capture_engine = TauriCaptureEngine {
+        app: app.clone(),
+        window: window.clone(),
+        session: std::cell::RefCell::new(None),
+    };
     let confirmations = TauriConfirmationRequester { app, window };
-    agent::run_stub_agent_loop_with_grounder(
+    let report = agent::run_stub_agent_loop_with_grounder(
         &observer,
         &planner,
         options,
@@ -1520,9 +1705,17 @@ async fn run_prepared_stub_agent(
         &base_observer,
         &confirmations,
         &grounder,
+        &capture_engine,
         abort.as_ref(),
     )
-    .await
+    .await;
+    // Run-end cleanup: never leave the macOS recording indicator on past
+    // the run. The clip is saved and announced (agent-clip-saved), never
+    // deleted — the user may still want it.
+    if agent::CaptureEngine::recording_active(&capture_engine) {
+        let _ = agent::CaptureEngine::stop_recording(&capture_engine).await;
+    }
+    report
 }
 
 #[cfg(target_os = "macos")]
@@ -2367,7 +2560,8 @@ fn quit_app(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
 /// and re-spawns Screenie in one call (returns `!`).
 #[tauri::command]
 fn restart_app(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
-    if window.label() != "overlay" && window.label() != "main" {
+    if window.label() != "overlay" && window.label() != "main" && window.label() != "quick_tooltip"
+    {
         return Err("command not allowed from this window".into());
     }
     app.restart()

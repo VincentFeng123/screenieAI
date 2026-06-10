@@ -472,6 +472,40 @@ pub enum ActionTargetRef {
     Target(String),
 }
 
+/// What a capture-perception action looks at. Deliberately NOT window ids or
+/// pixel regions — the LLM never sees those (raw coordinates are already
+/// rejected by the action contract); "window" resolves to the frontmost
+/// window at execution time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureScope {
+    /// The active display (default).
+    #[default]
+    Screen,
+    /// The focused window.
+    Window,
+}
+
+impl CaptureScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Screen => "screen",
+            Self::Window => "window",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "screen" | "display" => Some(Self::Screen),
+            "window" => Some(Self::Window),
+            _ => None,
+        }
+    }
+}
+
+/// Upper bound for `recordClip` seconds (the open-ended session path has its
+/// own engine-side caps). Enforced at deserialize so the planner self-corrects.
+pub const MAX_RECORD_CLIP_SECONDS: u64 = 30;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     ActivateApp { app: String },
@@ -526,6 +560,21 @@ pub enum Action {
     /// Move a file to the Trash via Finder. Permanent deletion does not
     /// exist as a primitive.
     MoveToTrash { path: String },
+    /// Capture one still of the screen/focused window; the image is attached
+    /// to the planner's NEXT prompt. Needs the Screen Recording grant.
+    /// Emits no input events; writes one PNG into the captures directory.
+    CaptureFrame { scope: CaptureScope },
+    /// Record the screen/focused window for `seconds` (1-30) and save a
+    /// local clip. The macOS screen-sharing indicator is visible throughout.
+    RecordClip { seconds: u32, scope: CaptureScope },
+    /// Begin an open-ended recording session (one at a time; auto-stops at
+    /// the engine's safety caps).
+    StartRecording { scope: CaptureScope },
+    /// End the open recording session and save the clip.
+    StopRecording,
+    /// Report the Screen Recording + Accessibility permission map without
+    /// touching the screen. Read-only.
+    CapturePermission,
     Done,
     Fail { reason: String },
 }
@@ -536,7 +585,9 @@ impl Serialize for Action {
         S: Serializer,
     {
         let field_count = match self {
-            Self::Done | Self::ReadPage => 1,
+            Self::Done | Self::ReadPage | Self::StopRecording | Self::CapturePermission => 1,
+            Self::CaptureFrame { .. } | Self::StartRecording { .. } => 2,
+            Self::RecordClip { .. } => 3,
             Self::ActivateApp { .. }
             | Self::Click { .. }
             | Self::ClickTarget { .. }
@@ -690,6 +741,25 @@ impl Serialize for Action {
                 state.serialize_field("action", "moveToTrash")?;
                 state.serialize_field("file", path)?;
             }
+            Self::CaptureFrame { scope } => {
+                state.serialize_field("action", "captureFrame")?;
+                state.serialize_field("scope", scope.label())?;
+            }
+            Self::RecordClip { seconds, scope } => {
+                state.serialize_field("action", "recordClip")?;
+                state.serialize_field("seconds", seconds)?;
+                state.serialize_field("scope", scope.label())?;
+            }
+            Self::StartRecording { scope } => {
+                state.serialize_field("action", "startRecording")?;
+                state.serialize_field("scope", scope.label())?;
+            }
+            Self::StopRecording => {
+                state.serialize_field("action", "stopRecording")?;
+            }
+            Self::CapturePermission => {
+                state.serialize_field("action", "capturePermission")?;
+            }
             Self::Done => {
                 state.serialize_field("action", "done")?;
             }
@@ -735,6 +805,8 @@ impl<'de> Deserialize<'de> for Action {
             reason: Option<String>,
             role: Option<String>,
             nth: Option<u32>,
+            scope: Option<String>,
+            seconds: Option<u64>,
             x: Option<serde_json::Value>,
             y: Option<serde_json::Value>,
         }
@@ -793,7 +865,23 @@ impl<'de> Deserialize<'de> for Action {
             ("reason", raw.reason.is_some()),
             ("role", raw.role.is_some()),
             ("nth", raw.nth.is_some()),
+            ("scope", raw.scope.is_some()),
+            ("seconds", raw.seconds.is_some()),
         ];
+
+        fn parse_scope<E>(scope: Option<String>) -> Result<CaptureScope, E>
+        where
+            E: serde::de::Error,
+        {
+            match scope {
+                None => Ok(CaptureScope::Screen),
+                Some(value) => CaptureScope::parse(&value).ok_or_else(|| {
+                    E::custom(format!(
+                        "scope must be \"screen\" or \"window\", got '{value}'"
+                    ))
+                }),
+            }
+        }
 
         match raw.action.as_str() {
             "activateApp" | "activate_app" => {
@@ -981,6 +1069,41 @@ impl<'de> Deserialize<'de> for Action {
                 let path = required_string::<D::Error>("file", raw.file)?;
                 Ok(Self::MoveToTrash { path })
             }
+            "captureFrame" | "capture_frame" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["scope"])?;
+                Ok(Self::CaptureFrame {
+                    scope: parse_scope::<D::Error>(raw.scope)?,
+                })
+            }
+            "recordClip" | "record_clip" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["seconds", "scope"])?;
+                let seconds = raw
+                    .seconds
+                    .ok_or_else(|| serde::de::Error::custom("recordClip requires seconds"))?;
+                if !(1..=MAX_RECORD_CLIP_SECONDS).contains(&seconds) {
+                    return Err(serde::de::Error::custom(format!(
+                        "recordClip seconds must be between 1 and {MAX_RECORD_CLIP_SECONDS}"
+                    )));
+                }
+                Ok(Self::RecordClip {
+                    seconds: seconds as u32,
+                    scope: parse_scope::<D::Error>(raw.scope)?,
+                })
+            }
+            "startRecording" | "start_recording" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["scope"])?;
+                Ok(Self::StartRecording {
+                    scope: parse_scope::<D::Error>(raw.scope)?,
+                })
+            }
+            "stopRecording" | "stop_recording" => {
+                reject_extra::<D::Error>(&raw.action, &present, &[])?;
+                Ok(Self::StopRecording)
+            }
+            "capturePermission" | "capture_permission" => {
+                reject_extra::<D::Error>(&raw.action, &present, &[])?;
+                Ok(Self::CapturePermission)
+            }
             "done" => {
                 reject_extra::<D::Error>(&raw.action, &present, &[])?;
                 Ok(Self::Done)
@@ -1043,6 +1166,11 @@ impl Action {
             | Self::AppleScript { .. }
             | Self::RunShortcut { .. }
             | Self::MoveToTrash { .. }
+            | Self::CaptureFrame { .. }
+            | Self::RecordClip { .. }
+            | Self::StartRecording { .. }
+            | Self::StopRecording
+            | Self::CapturePermission
             | Self::Done
             | Self::Fail { .. } => Vec::new(),
         }
@@ -1190,6 +1318,22 @@ pub trait Planner {
     async fn web_lookup(&self, _app: &FocusedApp, _query: &str) -> Result<String, String> {
         Err("web lookup is not supported by this planner".into())
     }
+
+    /// Hand the planner a captureFrame result to attach to its NEXT model
+    /// call (consume-once). Default no-op so stub/test planners ignore it.
+    fn attach_capture(&self, _frame: PlannerCaptureAttachment) {}
+}
+
+/// A deliberate captureFrame perception result, routed to the planner's next
+/// prompt as an attached image. Distinct from the vision-FALLBACK context
+/// (marks/grounding), whose prompts are click-grounding prompts and wrong
+/// for requested screenshots.
+#[derive(Clone, Debug)]
+pub struct PlannerCaptureAttachment {
+    pub image_png_b64: String,
+    pub width: u32,
+    pub height: u32,
+    pub scope_label: &'static str,
 }
 
 #[cfg(test)]
@@ -1308,6 +1452,85 @@ mod tests {
     fn action_json_contract_rejects_raw_coordinates() {
         let json = r#"{"action":"click","id":7,"x":10,"y":20}"#;
         assert!(Action::from_json_strict(json).is_err());
+    }
+
+    #[test]
+    fn action_json_contract_round_trips_capture_actions() {
+        use super::CaptureScope;
+        let cases = [
+            (
+                Action::CaptureFrame {
+                    scope: CaptureScope::Screen,
+                },
+                r#"{"action":"captureFrame","scope":"screen"}"#,
+            ),
+            (
+                Action::CaptureFrame {
+                    scope: CaptureScope::Window,
+                },
+                r#"{"action":"captureFrame","scope":"window"}"#,
+            ),
+            (
+                Action::RecordClip {
+                    seconds: 10,
+                    scope: CaptureScope::Screen,
+                },
+                r#"{"action":"recordClip","seconds":10,"scope":"screen"}"#,
+            ),
+            (
+                Action::StartRecording {
+                    scope: CaptureScope::Screen,
+                },
+                r#"{"action":"startRecording","scope":"screen"}"#,
+            ),
+            (Action::StopRecording, r#"{"action":"stopRecording"}"#),
+            (Action::CapturePermission, r#"{"action":"capturePermission"}"#),
+        ];
+        for (action, json) in cases {
+            assert_eq!(action.to_json().unwrap(), json);
+            assert_eq!(Action::from_json_strict(json).unwrap(), action);
+            assert!(action.target_ids().is_empty());
+            assert!(action.target_ref().is_none());
+        }
+    }
+
+    #[test]
+    fn action_json_contract_capture_defaults_aliases_and_bounds() {
+        use super::CaptureScope;
+        // Scope defaults to screen; snake_case aliases are accepted.
+        assert_eq!(
+            Action::from_json_strict(r#"{"action":"captureFrame"}"#).unwrap(),
+            Action::CaptureFrame {
+                scope: CaptureScope::Screen
+            }
+        );
+        assert_eq!(
+            Action::from_json_strict(r#"{"action":"capture_frame","scope":"window"}"#).unwrap(),
+            Action::CaptureFrame {
+                scope: CaptureScope::Window
+            }
+        );
+        assert_eq!(
+            Action::from_json_strict(r#"{"action":"record_clip","seconds":1}"#).unwrap(),
+            Action::RecordClip {
+                seconds: 1,
+                scope: CaptureScope::Screen
+            }
+        );
+        // seconds is required and bounded so the planner self-corrects.
+        assert!(Action::from_json_strict(r#"{"action":"recordClip","scope":"screen"}"#).is_err());
+        assert!(Action::from_json_strict(r#"{"action":"recordClip","seconds":0}"#).is_err());
+        assert!(Action::from_json_strict(r#"{"action":"recordClip","seconds":31}"#).is_err());
+        // Unknown scopes and stray fields are rejected.
+        assert!(
+            Action::from_json_strict(r#"{"action":"captureFrame","scope":"desktop"}"#).is_err()
+        );
+        assert!(
+            Action::from_json_strict(r#"{"action":"stopRecording","scope":"screen"}"#).is_err()
+        );
+        assert!(
+            Action::from_json_strict(r#"{"action":"capturePermission","seconds":5}"#).is_err()
+        );
     }
 
     #[test]

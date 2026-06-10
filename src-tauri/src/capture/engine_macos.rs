@@ -44,6 +44,7 @@ extern "C" {
     // capture_record_macos.m
     pub(crate) fn screenie_screenshot_api_available() -> bool;
     pub(crate) fn screenie_has_accessibility_access() -> bool;
+    pub(crate) fn screenie_frontmost_window_id() -> u32;
     pub(crate) fn screenie_capture_list_targets() -> *const c_char;
     pub(crate) fn screenie_capture_target_png(
         display_id: u32,
@@ -91,6 +92,12 @@ pub(crate) fn take_bridge_error(slot: *mut c_char) -> Option<String> {
 
 pub(crate) fn screen_capture_access_granted() -> bool {
     unsafe { screenie_has_screen_capture_access() }
+}
+
+/// CGWindowID of the frontmost standard window not owned by this process.
+pub(crate) fn frontmost_window_id() -> Option<u32> {
+    let id = unsafe { screenie_frontmost_window_id() };
+    (id != 0).then_some(id)
 }
 
 // ---------------------------------------------------------------------------
