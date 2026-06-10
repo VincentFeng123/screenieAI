@@ -58,6 +58,10 @@ const DEFAULT_VISION_FALLBACK_MIN_WINDOW_AREA_POINTS: f64 = 120_000.0;
 const CLICK_PREFLIGHT_CURSOR_TOLERANCE_POINTS: f64 = 3.0;
 const CLICK_PREFLIGHT_MAX_ATTEMPTS: u32 = 3;
 const CLICK_PREFLIGHT_RETRY_SETTLE_MS: u64 = 150;
+/// Re-read delays after a mouse warp whose first cursor read came back
+/// stale; a fixed schedule (not wall-clock) keeps fake-backend tests
+/// deterministic.
+const CURSOR_SETTLE_DELAYS_MS: [u64; 4] = [10, 20, 40, 80];
 // Confirmation is reserved for genuinely destructive/financial controls.
 // Generic words like "confirm", "approve", "submit", or "discard" used to
 // over-trigger on ordinary dialogs and forms; they are intentionally absent.
@@ -1125,7 +1129,19 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
         backend
             .move_mouse_abs(point)
             .map_err(ExecutionError::Input)?;
-        backend.mouse_location().map_err(ExecutionError::Input)
+        // The move is an async CGEvent; an immediate read returns the stale
+        // pre-warp position. Poll on a short fixed schedule until the cursor
+        // settles within tolerance, returning the last read either way — the
+        // caller's distance check stays the single source of pass/fail.
+        let mut location = backend.mouse_location().map_err(ExecutionError::Input)?;
+        for delay_ms in CURSOR_SETTLE_DELAYS_MS {
+            if click_point_distance(point, location) <= CLICK_PREFLIGHT_CURSOR_TOLERANCE_POINTS {
+                break;
+            }
+            thread::sleep(Duration::from_millis(delay_ms));
+            location = backend.mouse_location().map_err(ExecutionError::Input)?;
+        }
+        Ok(location)
     }
 
     fn execute(&mut self, prepared: &PreparedAction) -> Result<bool, ExecutionError> {
@@ -9272,16 +9288,66 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("cursor landed"));
-        // One move+read per preflight attempt; a permanent cursor mismatch
-        // exhausts all attempts and never bypasses.
+        // One move then the full settle-poll read schedule per preflight
+        // attempt; a permanent cursor mismatch exhausts all attempts and
+        // never bypasses.
+        let mut expected = Vec::new();
+        for _ in 0..CLICK_PREFLIGHT_MAX_ATTEMPTS {
+            expected.push(RecordedInput::Move(ClickPoint { x: 50, y: 22 }));
+            for _ in 0..=CURSOR_SETTLE_DELAYS_MS.len() {
+                expected.push(RecordedInput::MouseLocation);
+            }
+        }
+        assert_eq!(*events.borrow(), expected);
+    }
+
+    #[test]
+    fn cursor_settling_late_passes_preflight_on_first_attempt() {
+        // The async mouse warp often returns one stale cursor read before
+        // the move lands. The settle poll must absorb it within the same
+        // preflight attempt — no CursorMismatch failure, no 150ms retry
+        // settle, no second target refresh.
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            SettlingPreflightFactory {
+                events: events.clone(),
+                clicks: clicks.clone(),
+                stale_reads: Rc::new(RefCell::new(VecDeque::from([ClickPoint {
+                    x: 20,
+                    y: 0,
+                }]))),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(clicks.get(), 1);
+        assert!(report.steps[0].executed);
+        assert_eq!(
+            report.steps[0].click_preflight.as_ref().unwrap().status,
+            ClickPreflightStatus::Passed
+        );
+        // Exactly one move and two reads: the stale read, then the settled
+        // one — the old behavior failed the attempt and warped again.
         assert_eq!(
             *events.borrow(),
             vec![
                 RecordedInput::Move(ClickPoint { x: 50, y: 22 }),
                 RecordedInput::MouseLocation,
-                RecordedInput::Move(ClickPoint { x: 50, y: 22 }),
-                RecordedInput::MouseLocation,
-                RecordedInput::Move(ClickPoint { x: 50, y: 22 }),
                 RecordedInput::MouseLocation,
             ]
         );
@@ -14556,6 +14622,30 @@ mod tests {
                 clicks: self.clicks.clone(),
                 cursor: ClickPoint { x: 0, y: 0 },
                 location_offset: self.location_offset,
+                stale_reads: Rc::new(RefCell::new(VecDeque::new())),
+            })
+        }
+    }
+
+    /// PreflightFactory variant whose first cursor reads come back with
+    /// queued stale offsets before settling to accurate ones — models the
+    /// async CGEvent warp lag the settle poll exists for.
+    struct SettlingPreflightFactory {
+        events: Rc<RefCell<Vec<RecordedInput>>>,
+        clicks: Rc<Cell<u32>>,
+        stale_reads: Rc<RefCell<VecDeque<ClickPoint>>>,
+    }
+
+    impl InputBackendFactory for SettlingPreflightFactory {
+        type Backend = PreflightBackend;
+
+        fn create(&mut self) -> Result<Self::Backend, String> {
+            Ok(PreflightBackend {
+                events: self.events.clone(),
+                clicks: self.clicks.clone(),
+                cursor: ClickPoint { x: 0, y: 0 },
+                location_offset: ClickPoint { x: 0, y: 0 },
+                stale_reads: self.stale_reads.clone(),
             })
         }
     }
@@ -14570,6 +14660,7 @@ mod tests {
         clicks: Rc<Cell<u32>>,
         cursor: ClickPoint,
         location_offset: ClickPoint,
+        stale_reads: Rc<RefCell<VecDeque<ClickPoint>>>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14650,9 +14741,14 @@ mod tests {
 
         fn mouse_location(&mut self) -> Result<ClickPoint, String> {
             self.events.borrow_mut().push(RecordedInput::MouseLocation);
+            let offset = self
+                .stale_reads
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(self.location_offset);
             Ok(ClickPoint {
-                x: self.cursor.x + self.location_offset.x,
-                y: self.cursor.y + self.location_offset.y,
+                x: self.cursor.x + offset.x,
+                y: self.cursor.y + offset.y,
             })
         }
 
