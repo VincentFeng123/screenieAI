@@ -11,7 +11,7 @@ use super::grounding::{GroundingPixel, NoopGrounder};
 use super::types::{
     is_secure_text_role, normalize_signature_name, Action, CoordinateSpace, Element, ElementSource,
     FocusedApp, FocusedAppProvider, MenuPressOutcome, MenuScanResult, ObservationError, Planner,
-    PlannerHistoryEntry, Rect, ScreenObserver,
+    PlannerHistoryEntry, Rect, ScreenObserver, ScrollContext,
 };
 #[cfg(test)]
 use super::types::{ChangeWait, MenuMatch, UiChangeSignal};
@@ -810,6 +810,10 @@ pub enum VerificationStatus {
     SkippedNoUiChangeExpected,
     Progressed,
     NoOp,
+    /// A scroll reached the commanded extreme of its container: not progress
+    /// and not a retryable no-op — the planner must reverse or stop. The
+    /// edge is named in the verification reason.
+    ScrollBoundary,
     ObservationFailed,
 }
 
@@ -1033,6 +1037,28 @@ pub(crate) trait InputBackend {
     fn text(&mut self, text: &str) -> Result<(), String>;
     fn key(&mut self, key: InputKey, direction: InputDirection) -> Result<(), String>;
     fn scroll(&mut self, length: i32, axis: ScrollAxis) -> Result<(), String>;
+
+    /// Post a pixel-unit scroll at the current cursor position (WI-3). The
+    /// default approximates with line units (~40 px/line) for backends
+    /// without a native pixel wheel; macOS posts kCGScrollEventUnitPixel.
+    fn scroll_pixels(&mut self, dx: i32, dy: i32) -> Result<(), String> {
+        const PIXELS_PER_LINE: f64 = 40.0;
+        if dy != 0 {
+            let lines = (f64::from(dy) / PIXELS_PER_LINE).round() as i32;
+            self.scroll(
+                if lines == 0 { dy.signum() } else { lines },
+                ScrollAxis::Vertical,
+            )?;
+        }
+        if dx != 0 {
+            let lines = (f64::from(dx) / PIXELS_PER_LINE).round() as i32;
+            self.scroll(
+                if lines == 0 { dx.signum() } else { lines },
+                ScrollAxis::Horizontal,
+            )?;
+        }
+        Ok(())
+    }
     fn activate_app(&mut self, app: &str) -> Result<(), String> {
         let _ = app;
         Err("app activation is not supported on this platform".into())
@@ -1213,14 +1239,11 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
                         .move_mouse_abs(point)
                         .map_err(ExecutionError::Input)?;
                 }
-                if *dy != 0 {
+                let dx = clamp_scroll_pixels(*dx);
+                let dy = clamp_scroll_pixels(*dy);
+                if dx != 0 || dy != 0 {
                     self.backend()?
-                        .scroll(*dy, ScrollAxis::Vertical)
-                        .map_err(ExecutionError::Input)?;
-                }
-                if *dx != 0 {
-                    self.backend()?
-                        .scroll(*dx, ScrollAxis::Horizontal)
+                        .scroll_pixels(dx, dy)
                         .map_err(ExecutionError::Input)?;
                 }
             }
@@ -1411,6 +1434,18 @@ impl InputBackend for EnigoBackend {
             .map_err(|err| err.to_string())
     }
 
+    fn scroll_pixels(&mut self, dx: i32, dy: i32) -> Result<(), String> {
+        // The preceding anchor move is an async CGEvent; give the window
+        // server a beat so the wheel routes to the anchored point rather
+        // than the cursor's previous position.
+        thread::sleep(Duration::from_millis(30));
+        // CGEvent wheel deltas are inverted relative to the planner's
+        // positive-dy-scrolls-down convention (the same negation enigo
+        // applies for line scrolls).
+        unsafe { screenie_agent_post_scroll_pixels(f64::from(-dy), f64::from(-dx)) };
+        Ok(())
+    }
+
     fn activate_app(&mut self, app: &str) -> Result<(), String> {
         activate_app_by_name(app)
     }
@@ -1418,6 +1453,13 @@ impl InputBackend for EnigoBackend {
     fn open_url(&mut self, url: &str) -> Result<(), String> {
         open_url_in_default_browser(url)
     }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    /// macos_window.m: posts a kCGScrollEventUnitPixel wheel event at the
+    /// current cursor position (the agent's pixel-scroll rung).
+    fn screenie_agent_post_scroll_pixels(wheel_y: f64, wheel_x: f64);
 }
 
 #[cfg(target_os = "macos")]
@@ -3001,6 +3043,31 @@ where
                     }
                 }
             };
+
+            // WI-3: scroll anchors come from the live scroll container,
+            // clamped to window and screen, recomputed on every attempt —
+            // never from remembered element positions. The pre-scroll
+            // position feeds the postcondition check after execution.
+            let mut scroll_pre_position: Option<f64> = None;
+            if matches!(prepared.kind, PreparedKind::Scroll { .. }) {
+                let context = observer.scroll_context();
+                scroll_pre_position = context.and_then(|ctx| ctx.vertical_position);
+                let anchor = context.and_then(|ctx| {
+                    derive_scroll_anchor(&ctx).or_else(|| {
+                        eprintln!(
+                            "[screenie] agent step {} scroll_anchor_invalid context={:?}; recomputing without container",
+                            step_number, ctx
+                        );
+                        derive_scroll_anchor(&ScrollContext {
+                            container: None,
+                            ..ctx
+                        })
+                    })
+                });
+                prepared.click_point = anchor
+                    .or_else(|| scroll_point_from_observation(&before))
+                    .or(prepared.click_point);
+            }
             update_step_target(&mut step, &prepared);
 
             if options.calibrate
@@ -3363,7 +3430,11 @@ where
             } else if prepared.expects_observation_change() {
                 let (mut report, post) =
                     verify_expected_effect(observer, &pre_state_hash, pre_step_settle, stable_poll);
+                let mut scroll_shift: Option<f64> = None;
                 if let Some(post) = post {
+                    if matches!(prepared.kind, PreparedKind::Scroll { .. }) {
+                        scroll_shift = vertical_content_shift(&pre_elements, &post.elements);
+                    }
                     let mut detail = summarize_observation_diff(&pre_elements, &post.elements);
                     if let Some(expect) = decision_expect.as_deref() {
                         detail.push_str("; ");
@@ -3371,6 +3442,46 @@ where
                     }
                     report.reason = Some(detail);
                     carried_observation = Some((post, Instant::now()));
+                }
+                // WI-3: a scroll is judged by its postcondition (content
+                // shift / scroll position), not by the whole-app hash diff
+                // that credited carousel animation as progress. Boundary
+                // hits surface as ScrollBoundary instead of NoOp.
+                if step.executed {
+                    if let PreparedKind::Scroll { dy, .. } = prepared.kind {
+                        if dy != 0 {
+                            let post_position = observer
+                                .scroll_context()
+                                .and_then(|ctx| ctx.vertical_position);
+                            let fmt_pos = |value: Option<f64>| {
+                                value
+                                    .map(|pos| format!("{pos:.3}"))
+                                    .unwrap_or_else(|| "na".into())
+                            };
+                            eprintln!(
+                                "[screenie] agent step {} scroll_pos_before={} scroll_pos_after={} unit=px anchor={} content_shift={}",
+                                step_number,
+                                fmt_pos(scroll_pre_position),
+                                fmt_pos(post_position),
+                                prepared
+                                    .click_point
+                                    .map(|point| format!("({}, {})", point.x, point.y))
+                                    .unwrap_or_else(|| "none".into()),
+                                scroll_shift
+                                    .map(|shift| format!("{shift:.0}"))
+                                    .unwrap_or_else(|| "na".into()),
+                            );
+                            if let Some((status, reason)) = scroll_verification(
+                                dy,
+                                scroll_pre_position,
+                                post_position,
+                                scroll_shift,
+                            ) {
+                                report.status = status;
+                                report.reason = Some(reason);
+                            }
+                        }
+                    }
                 }
                 if report.status == VerificationStatus::NoOp && step.executed {
                     if let Some(reason) = type_noop_override(observer, &prepared) {
@@ -3447,6 +3558,20 @@ where
                         &milestones,
                         step_number,
                     );
+                    commit_step(confirmations, &mut steps, step, step_started);
+                    continue 'steps;
+                }
+                VerificationStatus::ScrollBoundary => {
+                    // Not progress (no milestone, no budget extension, ban
+                    // list untouched) and not a retryable no-op: the planner
+                    // is told which edge was hit so it reverses or stops
+                    // instead of thrashing the same scroll.
+                    let history_result = step_history_result(&step);
+                    history.push(PlannerHistoryEntry::new(
+                        action,
+                        planner_reason,
+                        history_result,
+                    ));
                     commit_step(confirmations, &mut steps, step, step_started);
                     continue 'steps;
                 }
@@ -6314,6 +6439,167 @@ fn target_move_distance(a: Rect, b: Rect) -> f64 {
     ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
 }
 
+/// One wheel event is capped to roughly two viewport-heights; the planner
+/// scrolls again rather than teleporting (and a weak model emitting a huge
+/// dy cannot fling the page).
+const MAX_SCROLL_PIXELS_PER_EVENT: i32 = 1600;
+
+fn clamp_scroll_pixels(value: i32) -> i32 {
+    value.clamp(-MAX_SCROLL_PIXELS_PER_EVENT, MAX_SCROLL_PIXELS_PER_EVENT)
+}
+
+const SCROLL_SHIFT_EPSILON_POINTS: f64 = 2.0;
+const SCROLL_POSITION_EPSILON: f64 = 0.005;
+const SCROLL_BOUNDARY_TOLERANCE: f64 = 0.005;
+
+/// Intersection of two rects, `None` when they do not overlap.
+fn intersect_rects(a: Rect, b: Rect) -> Option<Rect> {
+    let min_x = a.x.max(b.x);
+    let min_y = a.y.max(b.y);
+    let max_x = (a.x + a.width).min(b.x + b.width);
+    let max_y = (a.y + a.height).min(b.y + b.height);
+    (max_x > min_x && max_y > min_y).then_some(Rect {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    })
+}
+
+/// Center of (container ∩ window ∩ screen); missing pieces are skipped.
+/// `None` means the pieces do not overlap — an anchor must never be
+/// fabricated from a disjoint intersection.
+fn derive_scroll_anchor(ctx: &ScrollContext) -> Option<ClickPoint> {
+    let mut frame: Option<Rect> = None;
+    for rect in [ctx.container, ctx.window, ctx.screen].into_iter().flatten() {
+        if !rect_is_finite(rect) || rect.is_empty() {
+            return None;
+        }
+        frame = Some(match frame {
+            None => rect,
+            Some(acc) => intersect_rects(acc, rect)?,
+        });
+    }
+    let frame = frame?;
+    let (x, y) = frame.center();
+    Some(ClickPoint {
+        x: x.round() as i32,
+        y: y.round() as i32,
+    })
+}
+
+/// Median vertical shift of the page content between two observations, by
+/// matching elements that appear exactly once on each side (geometry-free
+/// key). `None` = inconclusive (fewer than two matchable elements);
+/// `Some(0.0)` = content verifiably did not move.
+fn vertical_content_shift(pre: &[Element], post: &[Element]) -> Option<f64> {
+    fn unique_by_key(obs: &[Element]) -> HashMap<String, f64> {
+        let mut counts: HashMap<String, (u32, f64)> = HashMap::new();
+        for element in obs {
+            if !rect_is_finite(element.bounds) || element.bounds.is_empty() {
+                continue;
+            }
+            let key = format!(
+                "{:?}\u{1f}{}\u{1f}{}",
+                element.source,
+                element.role,
+                normalize_signature_name(&element.name, element.source)
+            );
+            let center_y = element.bounds.y + element.bounds.height / 2.0;
+            counts
+                .entry(key)
+                .and_modify(|entry| entry.0 += 1)
+                .or_insert((1, center_y));
+        }
+        counts
+            .into_iter()
+            .filter(|(_, (count, _))| *count == 1)
+            .map(|(key, (_, y))| (key, y))
+            .collect()
+    }
+
+    let pre_map = unique_by_key(pre);
+    let post_map = unique_by_key(post);
+    let mut deltas: Vec<f64> = pre_map
+        .iter()
+        .filter_map(|(key, pre_y)| post_map.get(key).map(|post_y| post_y - pre_y))
+        .collect();
+    if deltas.len() < 2 {
+        return None;
+    }
+
+    // A scroll moves most of the matched content the same way; one stray
+    // mover is animation noise and sticky chrome legitimately stays put.
+    let moved: Vec<f64> = deltas
+        .iter()
+        .copied()
+        .filter(|delta| delta.abs() > SCROLL_SHIFT_EPSILON_POINTS)
+        .collect();
+    if moved.len() < 2 {
+        return Some(0.0);
+    }
+    let down = moved.iter().filter(|delta| **delta < 0.0).count();
+    let mut dominant: Vec<f64> = if down * 2 >= moved.len() {
+        moved.iter().copied().filter(|delta| *delta < 0.0).collect()
+    } else {
+        moved.iter().copied().filter(|delta| *delta > 0.0).collect()
+    };
+    if dominant.len() < 2 {
+        return Some(0.0);
+    }
+    dominant.sort_by(f64::total_cmp);
+    deltas.clear();
+    Some(dominant[dominant.len() / 2])
+}
+
+/// Scroll postcondition verdict from offset evidence. `None` means no
+/// evidence either way (caller keeps the generic diff verdict).
+fn scroll_verification(
+    dy: i32,
+    pre_position: Option<f64>,
+    post_position: Option<f64>,
+    content_shift: Option<f64>,
+) -> Option<(VerificationStatus, String)> {
+    if let Some(shift) = content_shift {
+        if shift.abs() > SCROLL_SHIFT_EPSILON_POINTS {
+            return Some((
+                VerificationStatus::Progressed,
+                format!("scroll moved content by {:.0} points", shift),
+            ));
+        }
+    }
+    if let (Some(pre), Some(post)) = (pre_position, post_position) {
+        if (post - pre).abs() > SCROLL_POSITION_EPSILON {
+            return Some((
+                VerificationStatus::Progressed,
+                format!("scroll position {pre:.3} -> {post:.3}"),
+            ));
+        }
+    }
+    if let Some(post) = post_position {
+        if dy > 0 && post >= 1.0 - SCROLL_BOUNDARY_TOLERANCE {
+            return Some((
+                VerificationStatus::ScrollBoundary,
+                "scroll boundary: bottom edge reached; reverse direction or stop scrolling"
+                    .into(),
+            ));
+        }
+        if dy < 0 && post <= SCROLL_BOUNDARY_TOLERANCE {
+            return Some((
+                VerificationStatus::ScrollBoundary,
+                "scroll boundary: top edge reached; reverse direction or stop scrolling".into(),
+            ));
+        }
+    }
+    if content_shift.is_some() || (pre_position.is_some() && post_position.is_some()) {
+        return Some((
+            VerificationStatus::NoOp,
+            "scroll did not move the content".into(),
+        ));
+    }
+    None
+}
+
 fn scroll_point_from_observation(obs: &[Element]) -> Option<ClickPoint> {
     let mut min_x = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
@@ -6330,6 +6616,12 @@ fn scroll_point_from_observation(obs: &[Element]) -> Option<ClickPoint> {
         let x = x as f64;
         let y = y as f64;
         if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        // Content scrolled out of the viewport keeps negative AX
+        // coordinates; anchoring on it posted wheels at (723, -5909) in the
+        // failing run. Only on-screen centers may pull the anchor.
+        if x < 0.0 || y < 0.0 {
             continue;
         }
 
@@ -7270,7 +7562,12 @@ fn step_history_result(step: &AgentStepReport) -> String {
             step.verification.status,
             step.verification.reason.as_deref(),
         ) {
-            (VerificationStatus::Progressed | VerificationStatus::NoOp, Some(detail)) => {
+            (
+                VerificationStatus::Progressed
+                | VerificationStatus::NoOp
+                | VerificationStatus::ScrollBoundary,
+                Some(detail),
+            ) => {
                 format!("executed; {detail}")
             }
             _ => format!("executed; verification={:?}", step.verification.status),
@@ -7708,7 +8005,7 @@ mod tests {
             *events.borrow(),
             vec![
                 RecordedInput::Move(ClickPoint { x: 95, y: 362 }),
-                RecordedInput::Scroll(300, ScrollAxis::Vertical),
+                RecordedInput::ScrollPixels(0, 300),
             ]
         );
     }
@@ -8081,6 +8378,340 @@ mod tests {
                 ElementSource::Web,
             ),
         ]
+    }
+
+    #[test]
+    fn derive_scroll_anchor_centers_the_clamped_intersection() {
+        let ctx = ScrollContext {
+            container: Some(Rect {
+                x: 0.0,
+                y: 100.0,
+                width: 1440.0,
+                height: 2000.0, // extends past the screen bottom
+            }),
+            window: Some(Rect {
+                x: 0.0,
+                y: 25.0,
+                width: 1440.0,
+                height: 875.0,
+            }),
+            screen: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            vertical_position: None,
+        };
+
+        // container ∩ window ∩ screen = (0,100)-(1440,900) → center (720,500)
+        assert_eq!(
+            derive_scroll_anchor(&ctx),
+            Some(ClickPoint { x: 720, y: 500 })
+        );
+
+        // A container fully above the screen yields no anchor — never an
+        // off-screen point like the failing run's (723, -5909).
+        let off_screen = ScrollContext {
+            container: Some(Rect {
+                x: 0.0,
+                y: -6000.0,
+                width: 1440.0,
+                height: 500.0,
+            }),
+            ..ctx
+        };
+        assert_eq!(derive_scroll_anchor(&off_screen), None);
+
+        // Missing pieces are skipped: window∩screen still anchors.
+        let no_container = ScrollContext {
+            container: None,
+            ..ctx
+        };
+        assert_eq!(
+            derive_scroll_anchor(&no_container),
+            Some(ClickPoint { x: 720, y: 463 })
+        );
+
+        assert_eq!(derive_scroll_anchor(&ScrollContext::default()), None);
+    }
+
+    #[test]
+    fn scroll_point_from_observation_ignores_offscreen_elements() {
+        let on_screen = element_with_bounds(
+            1,
+            "Visible",
+            Rect {
+                x: 100.0,
+                y: 200.0,
+                width: 100.0,
+                height: 40.0,
+            },
+        );
+        let scrolled_above = element_with_bounds(
+            2,
+            "Above viewport",
+            Rect {
+                x: 100.0,
+                y: -6000.0,
+                width: 100.0,
+                height: 40.0,
+            },
+        );
+
+        // The failing run anchored at y=-5909 because off-screen elements
+        // dragged the bounding-box midpoint above the display.
+        let point = scroll_point_from_observation(&[on_screen.clone(), scrolled_above]).unwrap();
+        assert_eq!(point, ClickPoint { x: 150, y: 220 });
+
+        // All elements off-screen → no anchor at all.
+        let off = element_with_bounds(
+            3,
+            "Off",
+            Rect {
+                x: -500.0,
+                y: -500.0,
+                width: 100.0,
+                height: 40.0,
+            },
+        );
+        assert_eq!(scroll_point_from_observation(&[off]), None);
+    }
+
+    #[test]
+    fn vertical_content_shift_reports_consistent_movement() {
+        let chrome = |id| {
+            element_with_bounds(
+                id,
+                "Reload this page",
+                Rect {
+                    x: 986.0,
+                    y: 12.0,
+                    width: 23.0,
+                    height: 29.0,
+                },
+            )
+        };
+        let link = |id, name: &str, y: f64| {
+            Element::new(
+                id,
+                "AXLink".into(),
+                name.into(),
+                None,
+                Rect {
+                    x: 100.0,
+                    y,
+                    width: 200.0,
+                    height: 30.0,
+                },
+                true,
+                false,
+                CoordinateSpace::AxPoints,
+                ElementSource::Web,
+            )
+        };
+
+        // Two links moved up 300pt, chrome stayed: a real scroll.
+        let pre = vec![chrome(1), link(2, "Buy", 700.0), link(3, "Specs", 760.0)];
+        let post = vec![chrome(1), link(2, "Buy", 400.0), link(3, "Specs", 460.0)];
+        let shift = vertical_content_shift(&pre, &post).unwrap();
+        assert!((shift - (-300.0)).abs() < 1.0, "got {shift}");
+
+        // Nothing moved → verifiably zero.
+        assert_eq!(vertical_content_shift(&pre, &pre.clone()), Some(0.0));
+
+        // A single mover is animation noise, not a scroll.
+        let one_mover = vec![chrome(1), link(2, "Buy", 400.0), link(3, "Specs", 760.0)];
+        assert_eq!(vertical_content_shift(&pre, &one_mover), Some(0.0));
+
+        // Fewer than two matchable elements → inconclusive.
+        assert_eq!(vertical_content_shift(&[chrome(1)], &[chrome(1)]), None);
+    }
+
+    #[test]
+    fn scroll_verification_distinguishes_progress_boundary_and_noop() {
+        // Content moved → Progressed regardless of scrollbar.
+        let (status, reason) = scroll_verification(300, None, None, Some(-280.0)).unwrap();
+        assert_eq!(status, VerificationStatus::Progressed);
+        assert!(reason.contains("280"), "got: {reason}");
+
+        // Scrollbar moved → Progressed.
+        let (status, _) = scroll_verification(300, Some(0.2), Some(0.4), Some(0.0)).unwrap();
+        assert_eq!(status, VerificationStatus::Progressed);
+
+        // At the bottom extreme with no movement → ScrollBoundary, not NoOp.
+        let (status, reason) = scroll_verification(300, Some(1.0), Some(1.0), Some(0.0)).unwrap();
+        assert_eq!(status, VerificationStatus::ScrollBoundary);
+        assert!(reason.contains("bottom"), "got: {reason}");
+
+        let (status, reason) = scroll_verification(-300, Some(0.0), Some(0.0), Some(0.0)).unwrap();
+        assert_eq!(status, VerificationStatus::ScrollBoundary);
+        assert!(reason.contains("top"), "got: {reason}");
+
+        // Mid-page, verifiably no movement → NoOp.
+        let (status, _) = scroll_verification(300, Some(0.5), Some(0.5), Some(0.0)).unwrap();
+        assert_eq!(status, VerificationStatus::NoOp);
+
+        // No evidence at all → None (generic diff keeps the verdict).
+        assert_eq!(scroll_verification(300, None, None, None), None);
+    }
+
+    fn scroll_test_context(position: f64) -> ScrollContext {
+        ScrollContext {
+            container: Some(Rect {
+                x: 0.0,
+                y: 100.0,
+                width: 800.0,
+                height: 500.0,
+            }),
+            window: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            screen: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            vertical_position: Some(position),
+        }
+    }
+
+    #[test]
+    fn scroll_anchors_in_container_and_verifies_by_scroll_position() {
+        // Identical pre/post observations: the generic hash diff would say
+        // NoOp, but the scroll position moved 0.2 -> 0.5, so the
+        // postcondition verdict is Progressed.
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask")]),
+        ])
+        .with_scroll_contexts(vec![
+            Some(scroll_test_context(0.2)),
+            Some(scroll_test_context(0.5)),
+        ]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Scroll { dx: 0, dy: 300 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        // Anchor = center of container ∩ window ∩ screen = (400, 350).
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                RecordedInput::Move(ClickPoint { x: 400, y: 350 }),
+                RecordedInput::ScrollPixels(0, 300),
+            ]
+        );
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::Progressed
+        );
+        assert!(report.steps[0]
+            .verification
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("scroll position"));
+    }
+
+    #[test]
+    fn scroll_at_bottom_reports_boundary_instead_of_noop() {
+        let page = || vec![element(1, "Ask"), element(2, "Settings")];
+        let observer = FakeObserver::new(vec![Ok(page()), Ok(page())]).with_scroll_contexts(vec![
+            Some(scroll_test_context(1.0)),
+            Some(scroll_test_context(1.0)),
+        ]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Scroll { dx: 0, dy: 300 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                // Retries allowed: a boundary must NOT consume them.
+                max_action_retries: Some(2),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::ScrollBoundary
+        );
+        assert!(report.steps[0]
+            .verification
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("bottom"));
+        // Exactly one move + one wheel: the boundary verdict skipped the
+        // no-op retry ladder entirely.
+        assert_eq!(events.borrow().len(), 2);
+    }
+
+    #[test]
+    fn scroll_clamps_pixel_magnitude_per_event() {
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(2, "Settings")]),
+        ]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _ = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Scroll { dx: 0, dy: 5000 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(
+            events
+                .borrow()
+                .contains(&RecordedInput::ScrollPixels(0, MAX_SCROLL_PIXELS_PER_EVENT)),
+            "events: {:?}",
+            events.borrow()
+        );
     }
 
     #[test]
@@ -12793,6 +13424,7 @@ mod tests {
         menu_paths: Rc<RefCell<Vec<Vec<String>>>>,
         menu_tree_paths: RefCell<Vec<Vec<String>>>,
         change_signals: RefCell<VecDeque<Box<dyn UiChangeSignal>>>,
+        scroll_contexts: RefCell<VecDeque<Option<ScrollContext>>>,
     }
 
     impl FakeObserver {
@@ -12820,11 +13452,17 @@ mod tests {
                 menu_paths: Rc::new(RefCell::new(Vec::new())),
                 menu_tree_paths: RefCell::new(Vec::new()),
                 change_signals: RefCell::new(VecDeque::new()),
+                scroll_contexts: RefCell::new(VecDeque::new()),
             }
         }
 
         fn with_change_signals(self, signals: Vec<Box<dyn UiChangeSignal>>) -> Self {
             *self.change_signals.borrow_mut() = signals.into();
+            self
+        }
+
+        fn with_scroll_contexts(self, contexts: Vec<Option<ScrollContext>>) -> Self {
+            *self.scroll_contexts.borrow_mut() = contexts.into();
             self
         }
 
@@ -12899,6 +13537,10 @@ mod tests {
 
         fn change_signal(&self) -> Option<Box<dyn UiChangeSignal>> {
             self.change_signals.borrow_mut().pop_front()
+        }
+
+        fn scroll_context(&self) -> Option<ScrollContext> {
+            self.scroll_contexts.borrow_mut().pop_front().flatten()
         }
 
         fn refresh_element(&self, el: &Element) -> Option<Element> {
@@ -13480,6 +14122,7 @@ mod tests {
         Text(String),
         Key(InputKey, InputDirection),
         Scroll(i32, ScrollAxis),
+        ScrollPixels(i32, i32),
     }
 
     impl InputBackend for RecordingBackend {
@@ -13491,6 +14134,13 @@ mod tests {
 
         fn mouse_location(&mut self) -> Result<ClickPoint, String> {
             Ok(self.cursor)
+        }
+
+        fn scroll_pixels(&mut self, dx: i32, dy: i32) -> Result<(), String> {
+            self.events
+                .borrow_mut()
+                .push(RecordedInput::ScrollPixels(dx, dy));
+            Ok(())
         }
 
         fn click_left(&mut self) -> Result<(), String> {
@@ -13530,6 +14180,13 @@ mod tests {
         fn move_mouse_abs(&mut self, point: ClickPoint) -> Result<(), String> {
             self.cursor = point;
             self.events.borrow_mut().push(RecordedInput::Move(point));
+            Ok(())
+        }
+
+        fn scroll_pixels(&mut self, dx: i32, dy: i32) -> Result<(), String> {
+            self.events
+                .borrow_mut()
+                .push(RecordedInput::ScrollPixels(dx, dy));
             Ok(())
         }
 

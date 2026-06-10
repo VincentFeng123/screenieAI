@@ -742,7 +742,7 @@ pub(crate) fn build_system_prompt(scripting_enabled: bool, web_lookup_available:
         "Action history includes completed and rejected actions. If an action was rejected as already executed, do not repeat it; choose a different visible target or key action for the unfinished goal.",
         "If the requested app is already focused and no in-app target is requested, emit done.",
         "If the target is not among the visible elements: scroll to reveal more; if it is still missing, emit findUi with a short feature query (e.g. \"export pdf\"); if findUi finds nothing, ask or fail with reason_detail. Do not guess ids.",
-        "For scroll, positive dy scrolls down and negative dy scrolls up; positive dx scrolls right and negative dx scrolls left.",
+        "For scroll, dx/dy are PIXELS: positive dy scrolls down, negative up; positive dx right, negative left. One screen-page is roughly 600-900, so prefer dy around 600. If the step result reports a scroll boundary, that edge is reached - reverse direction or stop scrolling.",
         "Emit done the moment the goal is satisfied. Emit fail if the goal is not achievable with the visible elements.",
         "Allowed objects:",
         r#"{"reason":"brief reason","action":"activateApp","app":"Safari"}"#,

@@ -34,7 +34,7 @@ pub use planner::{NameResolvingStubPlanner, StubPlanner};
 pub use types::{
     Action, CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider, MenuMatch,
     MenuPressOutcome, MenuScanResult, ObservationError, Planner, PlannerDecision,
-    PlannerHistoryEntry, Rect, ScreenObserver,
+    PlannerHistoryEntry, Rect, ScreenObserver, ScrollContext,
 };
 pub use vision::{CaptureSize, ObservationMetadata, ObservationSource};
 pub(crate) use vision::{VisionFallbackObserver, VisionFallbackOptions, VisionFallbackState};

@@ -1006,6 +1006,26 @@ static bool screenie_post_mouse_click(CGPoint point, CGMouseButton button) {
   return true;
 }
 
+// Agent scroll rung (WI-3): one pixel-unit wheel event posted at the
+// current cursor position. The Rust executor has already moved the cursor
+// to a clamped, container-derived anchor and pre-negated the deltas to
+// CGEvent's wheel convention; this stays a plain discrete wheel (no phase
+// stamping) because the agent scrolls in deliberate single steps, not
+// relayed trackpad gestures.
+void screenie_agent_post_scroll_pixels(double wheelY, double wheelX) {
+  CGEventRef scroll =
+      CGEventCreateScrollWheelEvent(NULL,
+                                    kCGScrollEventUnitPixel,
+                                    2,
+                                    (int32_t)lrint(wheelY),
+                                    (int32_t)lrint(wheelX));
+  if (scroll == NULL) {
+    return;
+  }
+  CGEventPost(kCGHIDEventTap, scroll);
+  CFRelease(scroll);
+}
+
 static const NSTimeInterval SCREENIE_SCROLL_RELAY_IDLE_SECONDS = 0.14;
 static const int SCREENIE_CG_SCROLL_PHASE_ENDED = 4;
 static const int64_t SCREENIE_SYNTHETIC_SCROLL_USER_DATA = 0x5343524f4c4cLL;

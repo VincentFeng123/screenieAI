@@ -341,8 +341,32 @@ impl UiChangeSignal for ChangeCounterWaiter {
     }
 }
 
+/// Geometry and scroll state of the focused window's main scroll container,
+/// used to anchor scroll wheel events inside it and to verify their effect
+/// (WI-3). All rects are AX screen points; any piece may be unavailable.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollContext {
+    /// Frame of the preferred scroll container (AXWebArea / AXScrollArea).
+    pub container: Option<Rect>,
+    /// Focused window frame.
+    pub window: Option<Rect>,
+    /// Bounds of the display hosting the window.
+    pub screen: Option<Rect>,
+    /// Vertical scroll position, 0.0 (top) ..= 1.0 (bottom), when readable.
+    pub vertical_position: Option<f64>,
+}
+
 pub trait ScreenObserver {
     fn observe(&self) -> Result<Vec<Element>, ObservationError>;
+
+    /// Geometry + scroll position of the focused window's main scroll
+    /// container, re-read on every call so scroll anchors and postconditions
+    /// track the live UI. The default (stub/test observers, platforms
+    /// without AX) reports no context; callers fall back to
+    /// observation-derived anchors and the generic verify diff.
+    fn scroll_context(&self) -> Option<ScrollContext> {
+        None
+    }
 
     /// Subscribe to UI-change notifications for the frontmost app, letting
     /// the executor settle event-driven instead of polling blind. `None`

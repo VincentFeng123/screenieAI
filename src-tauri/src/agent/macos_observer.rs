@@ -8,7 +8,7 @@ use super::search::score_match;
 use super::types::{
     is_secure_text_role, normalize_signature_name, ChangeCounter, CoordinateSpace, Element,
     ElementSource, FocusedApp, FocusedAppProvider, MenuMatch, MenuPressOutcome, MenuScanResult,
-    ObservationError, PlatformElementHandle, Rect, ScreenObserver, UiChangeSignal,
+    ObservationError, PlatformElementHandle, Rect, ScreenObserver, ScrollContext, UiChangeSignal,
 };
 use super::vision::{ObservationMetadata, ObservationMetadataProvider};
 use core_foundation::base::TCFType;
@@ -22,7 +22,10 @@ use core_foundation_sys::base::{
     Boolean, CFCopyDescription, CFGetTypeID, CFRelease, CFRetain, CFTypeID, CFTypeRef,
 };
 use core_foundation_sys::dictionary::CFDictionaryRef;
-use core_foundation_sys::number::{CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef};
+use core_foundation_sys::number::{
+    kCFNumberFloat64Type, CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef, CFNumberGetTypeID,
+    CFNumberGetValue, CFNumberRef,
+};
 use core_foundation_sys::runloop::{
     kCFRunLoopDefaultMode, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRef,
     CFRunLoopRemoveSource, CFRunLoopRun, CFRunLoopSourceContext, CFRunLoopSourceCreate,
@@ -117,8 +120,17 @@ type AXObserverCallback = unsafe extern "C" fn(
     refcon: *mut c_void,
 );
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CGRectRaw {
+    origin: CGPoint,
+    size: CGSize,
+}
+
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayBounds(display: u32) -> CGRectRaw;
     fn AXObserverCreate(
         application: Pid,
         callback: AXObserverCallback,
@@ -569,11 +581,54 @@ impl MacObserver {
 
         Ok(largest_visible_web_area(&walker.web_areas))
     }
+
+    /// Live scroll geometry for the agent's scroll anchor + postcondition
+    /// (WI-3): focused window frame, largest visible scroll container under
+    /// it, that container's vertical scrollbar position, and the display
+    /// bounds for clamping.
+    fn read_scroll_context(&self) -> Result<Option<ScrollContext>, ObservationError> {
+        ensure_accessibility_permission_with(system_accessibility_trusted, prompt_accessibility)?;
+        let focused_app = frontmost_application_info()?.ok_or(ObservationError::NoFrontmostApp)?;
+        let pid = focused_app.pid.ok_or(ObservationError::NoFrontmostApp)?;
+        let app = unsafe { AXUIElementCreateApplication(pid) };
+        if app.is_null() {
+            return Ok(None);
+        }
+        let _app_ref = OwnedCf::new(app);
+
+        let Some(window) = copy_attribute(app, "AXFocusedWindow")? else {
+            return Ok(None);
+        };
+        let window_bounds = copy_bounds(window.as_type_ref())?;
+        let window_rect = rect_has_visible_bounds(window_bounds).then_some(window_bounds);
+
+        let mut best: Option<(OwnedCf, Rect)> = None;
+        let mut visited = 0_usize;
+        find_largest_scroll_container(window.as_type_ref(), 0, &mut best, &mut visited)?;
+        let (container, vertical_position) = match best.as_ref() {
+            Some((handle, bounds)) => (
+                Some(*bounds),
+                container_vertical_position(handle.as_type_ref()).unwrap_or(None),
+            ),
+            None => (None, None),
+        };
+
+        Ok(Some(ScrollContext {
+            container,
+            window: window_rect,
+            screen: main_display_bounds(),
+            vertical_position,
+        }))
+    }
 }
 
 impl ScreenObserver for MacObserver {
     fn observe(&self) -> Result<Vec<Element>, ObservationError> {
         self.observe_frontmost_app()
+    }
+
+    fn scroll_context(&self) -> Option<ScrollContext> {
+        self.read_scroll_context().ok().flatten()
     }
 
     /// Event-driven settle support: ensure an AXObserver is registered on
@@ -1422,6 +1477,97 @@ fn copy_bool_attribute(
     Ok(Some(unsafe {
         CFBooleanGetValue(value.as_type_ref() as CFBooleanRef)
     }))
+}
+
+fn copy_number_attribute(
+    element: AXUIElementRef,
+    attribute: &str,
+) -> Result<Option<f64>, ObservationError> {
+    let Some(value) = copy_attribute(element, attribute)? else {
+        return Ok(None);
+    };
+    if !value.has_type_id(unsafe { CFNumberGetTypeID() }) {
+        return Ok(None);
+    }
+    let mut number = 0.0_f64;
+    let ok = unsafe {
+        CFNumberGetValue(
+            value.as_type_ref() as CFNumberRef,
+            kCFNumberFloat64Type,
+            (&mut number as *mut f64).cast(),
+        )
+    };
+    Ok(ok.then_some(number))
+}
+
+const SCROLL_CONTAINER_MAX_DEPTH: usize = 8;
+const SCROLL_CONTAINER_MAX_NODES: usize = 400;
+
+/// Depth-first, node-capped search for the largest visible scroll container
+/// (AXWebArea or AXScrollArea) under `element`, retaining the best handle.
+fn find_largest_scroll_container(
+    element: AXUIElementRef,
+    depth: usize,
+    best: &mut Option<(OwnedCf, Rect)>,
+    visited: &mut usize,
+) -> Result<(), ObservationError> {
+    if depth > SCROLL_CONTAINER_MAX_DEPTH || *visited >= SCROLL_CONTAINER_MAX_NODES {
+        return Ok(());
+    }
+    *visited += 1;
+    let role = copy_string_attribute(element, "AXRole")?.unwrap_or_default();
+    let is_container = role == "AXWebArea" || role == "AXScrollArea";
+    if is_container {
+        let bounds = copy_bounds(element)?;
+        if rect_has_visible_bounds(bounds) {
+            let area = bounds.width * bounds.height;
+            let replace = best
+                .as_ref()
+                .map(|(_, current)| area > current.width * current.height)
+                .unwrap_or(true);
+            if replace {
+                let retained = unsafe { CFRetain(element) };
+                *best = Some((OwnedCf::new(retained), bounds));
+            }
+        }
+        // The page scroller found; nested scroll areas inside it are not
+        // the one the wheel should target.
+        if role == "AXWebArea" {
+            return Ok(());
+        }
+    }
+    if let Some(children) = copy_array_attribute(element, "AXChildren")? {
+        let count = (cf_array_len(&children)? as usize).min(MAX_AX_CHILDREN_PER_NODE);
+        for index in 0..count {
+            let child = unsafe {
+                CFArrayGetValueAtIndex(children.as_array_ref()?, index as isize) as AXUIElementRef
+            };
+            if !child.is_null() {
+                find_largest_scroll_container(child, depth + 1, best, visited)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// AXVerticalScrollBar value of a scroll container, 0.0 (top) ..= 1.0.
+fn container_vertical_position(container: AXUIElementRef) -> Result<Option<f64>, ObservationError> {
+    let Some(scrollbar) = copy_attribute(container, "AXVerticalScrollBar")? else {
+        return Ok(None);
+    };
+    copy_number_attribute(scrollbar.as_type_ref(), "AXValue")
+}
+
+fn main_display_bounds() -> Option<Rect> {
+    // TODO multi-display: clamp against the display actually hosting the
+    // focused window instead of the main display.
+    let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    (bounds.size.width > 0.0 && bounds.size.height > 0.0).then_some(Rect {
+        x: bounds.origin.x,
+        y: bounds.origin.y,
+        width: bounds.size.width,
+        height: bounds.size.height,
+    })
 }
 
 fn copy_array_attribute(
