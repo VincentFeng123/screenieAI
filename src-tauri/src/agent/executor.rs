@@ -3,6 +3,7 @@ use super::grounding::{
     DEFAULT_GROUNDER_CONFIDENCE_THRESHOLD, DEFAULT_GROUNDER_ENDPOINT, DEFAULT_GROUNDER_HEALTH_URL,
     DEFAULT_GROUNDER_MODEL,
 };
+use super::search::score_match;
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
 use super::types::{
@@ -1173,6 +1174,8 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
             }
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
+            | PreparedKind::FindUi { .. }
+            | PreparedKind::WebLookup { .. }
             | PreparedKind::Ask { .. }
             | PreparedKind::Done
             | PreparedKind::Fail { .. } => {}
@@ -2170,6 +2173,41 @@ where
                         Err(err) => format!("readPage failed: {err}"),
                     }
                 };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::FindUi { query } => {
+                // Read-only like readPage: searches without touching the UI,
+                // so it bypasses the safety gate, execution, and the
+                // progress-loop detector. Spam is bounded by the duplicate-
+                // query rejection instead.
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: findUi skipped".to_string()
+                } else {
+                    let matches = find_ui_observation_matches(&before, query);
+                    step.executed = true;
+                    compose_find_ui_result(query, &matches, false)
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::WebLookup { .. } => {
+                // Graceful rung descent, mirroring the disabled-scripting
+                // path: the planner learns the action is unavailable instead
+                // of the run failing.
+                let result_text =
+                    "web lookup is disabled in Settings \u{2192} Agent (or unsupported by this provider); use findUi, scroll, or ask instead"
+                        .to_string();
                 history.push(PlannerHistoryEntry::new(
                     action.clone(),
                     planner_reason.clone(),
@@ -3194,6 +3232,8 @@ fn confirmation_approval_key(
         Action::OpenUrl { url } => format!("openUrl:{}", url.trim()),
         Action::WebSearch { query } => format!("webSearch:{}", query.trim()),
         Action::ReadPage => "readPage".into(),
+        Action::FindUi { query } => format!("findUi:{}", normalize_text_for_match(query)),
+        Action::WebLookup { query } => format!("webLookup:{}", normalize_text_for_match(query)),
         Action::Ask { question, .. } => format!("ask:{}", question.trim()),
         Action::AppleScript { script } => format!("applescript:{}", compact_history_text(script)),
         Action::RunShortcut { name, .. } => format!("shortcut:{}", name.trim()),
@@ -3309,6 +3349,97 @@ fn page_text_preview(text: &str) -> String {
         .collect::<String>();
     preview.push_str("...");
     preview
+}
+
+const MAX_FIND_UI_MATCHES: usize = 3;
+/// Stays under the 220-char history-result truncation so a menu path or
+/// element label is never cut mid-string.
+const MAX_FIND_UI_RESULT_CHARS: usize = 200;
+const MAX_FIND_UI_SEGMENT_CHARS: usize = 80;
+
+/// One ranked findUi hit, pre-rendered as a segment the model can act on
+/// next turn ("menu File > Export as PDF…", "element [12] AXButton \"Export\"").
+struct FindUiMatch {
+    score: u32,
+    segment: String,
+}
+
+fn truncate_segment(text: &str) -> String {
+    if text.chars().count() <= MAX_FIND_UI_SEGMENT_CHARS {
+        return text.to_string();
+    }
+    let mut truncated = text
+        .chars()
+        .take(MAX_FIND_UI_SEGMENT_CHARS.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn find_ui_observation_matches(obs: &[Element], query: &str) -> Vec<FindUiMatch> {
+    let mut matches: Vec<FindUiMatch> = obs
+        .iter()
+        .filter_map(|element| {
+            let name_score = score_match(&element.name, query);
+            let value_score = element
+                .value
+                .as_deref()
+                .and_then(|value| score_match(value, query));
+            let score = match (name_score, value_score) {
+                (Some(a), Some(b)) => a.max(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => return None,
+            };
+            let label = if element.name.trim().is_empty() {
+                element.value.clone().unwrap_or_default()
+            } else {
+                element.name.clone()
+            };
+            let disabled = if element.enabled { "" } else { " (disabled now)" };
+            Some(FindUiMatch {
+                score,
+                segment: truncate_segment(&format!(
+                    "element [{}] {} \"{}\"{disabled}",
+                    element.id, element.role, label
+                )),
+            })
+        })
+        .collect();
+    matches.sort_by(|a, b| b.score.cmp(&a.score));
+    matches
+}
+
+/// Pack the top matches into one history-result line. `web_lookup_available`
+/// only changes the advice in the no-match message.
+fn compose_find_ui_result(
+    query: &str,
+    matches: &[FindUiMatch],
+    web_lookup_available: bool,
+) -> String {
+    if matches.is_empty() {
+        let escalation = if web_lookup_available {
+            "or use webLookup"
+        } else {
+            "or ask"
+        };
+        return format!(
+            "no match for \"{}\" in menus, hints, or visible elements; reword the query, scroll, {escalation}",
+            truncate_segment(query)
+        );
+    }
+    let mut result = String::from("found: ");
+    for entry in matches.iter().take(MAX_FIND_UI_MATCHES) {
+        let separator = if result.ends_with(": ") { "" } else { "; " };
+        if result.chars().count() + separator.len() + entry.segment.chars().count()
+            > MAX_FIND_UI_RESULT_CHARS
+        {
+            break;
+        }
+        result.push_str(separator);
+        result.push_str(&entry.segment);
+    }
+    result
 }
 
 fn push_agent_note(notes: &mut Vec<String>, note: &str) {
@@ -3513,6 +3644,25 @@ fn validated_web_url(url: &str) -> Result<String, ExecutionError> {
     }
 }
 
+/// findUi/webLookup queries are short feature phrases. The cap also bounds
+/// what a webLookup is allowed to send off-machine.
+const MAX_SEARCH_QUERY_CHARS: usize = 64;
+
+fn validated_search_query(action: &str, query: &str) -> Result<String, ExecutionError> {
+    let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    if query.is_empty() {
+        return Err(ExecutionError::Input(format!(
+            "{action} requires a non-empty query"
+        )));
+    }
+    if query.chars().count() > MAX_SEARCH_QUERY_CHARS {
+        return Err(ExecutionError::Input(format!(
+            "{action} query must stay under {MAX_SEARCH_QUERY_CHARS} characters; use a short feature phrase"
+        )));
+    }
+    Ok(query)
+}
+
 fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, ExecutionError> {
     match action {
         Action::ActivateApp { app } => Ok(PreparedAction::activate_app(app.clone())),
@@ -3531,6 +3681,14 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
             }))
         }
         Action::ReadPage => Ok(PreparedAction::without_target(PreparedKind::ReadPage)),
+        Action::FindUi { query } => Ok(PreparedAction::without_target(PreparedKind::FindUi {
+            query: validated_search_query("findUi", query)?,
+        })),
+        Action::WebLookup { query } => {
+            Ok(PreparedAction::without_target(PreparedKind::WebLookup {
+                query: validated_search_query("webLookup", query)?,
+            }))
+        }
         Action::Ask { question, options } => {
             if question.trim().is_empty() {
                 return Err(ExecutionError::Input("ask requires a question".into()));
@@ -3739,6 +3897,8 @@ impl PreparedAction {
             | PreparedKind::MoveToTrash { .. } => false,
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
+            | PreparedKind::FindUi { .. }
+            | PreparedKind::WebLookup { .. }
             | PreparedKind::Ask { .. }
             | PreparedKind::Done
             | PreparedKind::Fail { .. } => false,
@@ -3856,6 +4016,21 @@ fn planner_action_rejection_reason(
                 "you already read this page; act on its text or navigate somewhere new before reading again"
                     .to_string()
             })
+        }
+        Action::FindUi { query } => {
+            let normalized = normalize_text_for_match(query);
+            steps
+                .iter()
+                .rev()
+                .take_while(|step| step.verification.status != VerificationStatus::Progressed)
+                .any(|step| {
+                    matches!(&step.action, Action::FindUi { query: searched }
+                        if normalize_text_for_match(searched) == normalized)
+                })
+                .then(|| {
+                    "you already searched findUi for that; use the result in your history or try a different query"
+                        .to_string()
+                })
         }
         Action::Ask { .. } => {
             let last = steps.last()?;
@@ -4681,6 +4856,8 @@ fn synthetic_mechanism(kind: &PreparedKind) -> Option<ActionMechanism> {
         | PreparedKind::OpenUrl { .. }
         | PreparedKind::Menu { .. }
         | PreparedKind::ReadPage
+        | PreparedKind::FindUi { .. }
+        | PreparedKind::WebLookup { .. }
         | PreparedKind::Ask { .. }
         | PreparedKind::AppleScript { .. }
         | PreparedKind::RunShortcut { .. }
@@ -5056,6 +5233,8 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
         Action::OpenUrl { url } => format!("openUrl:{}", url.trim()),
         Action::WebSearch { query } => format!("webSearch:{}", normalize_text_for_match(query)),
         Action::ReadPage => "readPage".into(),
+        Action::FindUi { query } => format!("findUi:{}", normalize_text_for_match(query)),
+        Action::WebLookup { query } => format!("webLookup:{}", normalize_text_for_match(query)),
         Action::Ask { question, .. } => format!("ask:{}", normalize_text_for_match(question)),
         Action::AppleScript { script } => format!("applescript:{}", compact_history_text(script)),
         Action::RunShortcut { name, .. } => format!("shortcut:{}", name.trim()),
@@ -5178,6 +5357,16 @@ enum PreparedKind {
         url: String,
     },
     ReadPage,
+    /// Read-only local search over hints, the menu tree, and the current
+    /// observation; emits no input events.
+    FindUi {
+        query: String,
+    },
+    /// Research call for UI-navigation knowledge; gated by a user setting
+    /// and provider support. Emits no input events.
+    WebLookup {
+        query: String,
+    },
     Click {
         times: u8,
     },
@@ -7825,6 +8014,212 @@ mod tests {
     }
 
     #[test]
+    fn find_ui_is_intercepted_and_reports_observation_matches() {
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask"), element(2, "Export as PDF…")]);
+            6
+        ]);
+        let results = Rc::new(RefCell::new(Vec::<String>::new()));
+        let planner = HistoryRecordingActionPlanner {
+            actions: vec![
+                Action::FindUi {
+                    query: "export pdf".into(),
+                },
+                Action::Done,
+            ],
+            results: results.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(
+            report.steps[0].action,
+            Action::FindUi {
+                query: "export pdf".into()
+            }
+        );
+        assert!(report.steps[0].executed);
+        assert!(
+            results
+                .borrow()
+                .iter()
+                .any(|result| result.contains("found: element [2] AXButton \"Export as PDF…\"")),
+            "planner must see the findUi matches, got {:?}",
+            results.borrow()
+        );
+    }
+
+    #[test]
+    fn find_ui_without_matches_suggests_escalation() {
+        let none = compose_find_ui_result("export pdf", &[], false);
+        assert!(none.contains("no match for \"export pdf\""));
+        assert!(none.ends_with("or ask"));
+        let with_web = compose_find_ui_result("export pdf", &[], true);
+        assert!(with_web.ends_with("or use webLookup"));
+
+        // Result lines stay inside the history truncation budget.
+        let matches: Vec<FindUiMatch> = (0..5)
+            .map(|index| FindUiMatch {
+                score: 100,
+                segment: truncate_segment(&format!(
+                    "element [{index}] AXButton \"{}\"",
+                    "long label ".repeat(12)
+                )),
+            })
+            .collect();
+        let packed = compose_find_ui_result("export pdf", &matches, false);
+        assert!(packed.starts_with("found: "));
+        assert!(packed.chars().count() <= MAX_FIND_UI_RESULT_CHARS);
+    }
+
+    #[test]
+    fn consecutive_find_ui_same_query_rejected_until_progress() {
+        let action = Action::FindUi {
+            query: "Export  PDF".into(),
+        };
+        let prepared = prepare_action(&action, &[]).unwrap();
+        let prior = vec![executed_step(
+            1,
+            Action::FindUi {
+                query: "export pdf".into(),
+            },
+            None,
+            VerificationReport::skipped_no_change_expected(),
+        )];
+
+        let reason =
+            planner_action_rejection_reason(&action, &prepared, &[], &prior, "export the note")
+                .unwrap();
+        assert!(reason.contains("already searched findUi"));
+
+        // A different query is allowed.
+        let other = Action::FindUi {
+            query: "word count".into(),
+        };
+        assert!(planner_action_rejection_reason(
+            &other,
+            &prepared,
+            &[],
+            &prior,
+            "export the note"
+        )
+        .is_none());
+
+        // Verified progress since the search resets the dedupe window.
+        let progressed = vec![
+            executed_step(
+                1,
+                Action::FindUi {
+                    query: "export pdf".into(),
+                },
+                None,
+                VerificationReport::skipped_no_change_expected(),
+            ),
+            executed_step(
+                2,
+                Action::Menu {
+                    path: vec!["File".into(), "Export as PDF…".into()],
+                },
+                None,
+                VerificationReport::progressed(1),
+            ),
+        ];
+        assert!(planner_action_rejection_reason(
+            &action,
+            &prepared,
+            &[],
+            &progressed,
+            "export the note"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn web_lookup_descends_gracefully_when_unavailable() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+        let results = Rc::new(RefCell::new(Vec::<String>::new()));
+        let planner = HistoryRecordingActionPlanner {
+            actions: vec![
+                Action::WebLookup {
+                    query: "develop menu".into(),
+                },
+                Action::Done,
+            ],
+            results: results.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(!report.steps[0].executed);
+        assert!(
+            results
+                .borrow()
+                .iter()
+                .any(|result| result.contains("web lookup is disabled")),
+            "planner must learn web lookup is unavailable, got {:?}",
+            results.borrow()
+        );
+    }
+
+    #[test]
+    fn search_query_validation_rejects_empty_and_oversized() {
+        assert!(prepare_action(&Action::FindUi { query: "  ".into() }, &[]).is_err());
+        assert!(prepare_action(
+            &Action::WebLookup {
+                query: "x".repeat(MAX_SEARCH_QUERY_CHARS + 1)
+            },
+            &[]
+        )
+        .is_err());
+        let prepared = prepare_action(
+            &Action::FindUi {
+                query: "  export   pdf  ".into(),
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.kind,
+            PreparedKind::FindUi {
+                query: "export pdf".into()
+            }
+        );
+        assert!(!prepared.expects_observation_change());
+    }
+
+    #[test]
     fn semantic_hash_changes_when_selected_text_changes() {
         let field = text_field_with_value(1, "Address", "example.com");
         let mut selected = field.clone();
@@ -9668,6 +10063,34 @@ mod tests {
     struct GoalRecordingActionPlanner {
         actions: Vec<Action>,
         goals: Rc<RefCell<Vec<String>>>,
+    }
+
+    /// Plays a fixed action sequence while capturing every history result it
+    /// is shown — the lens for asserting what feedback the planner receives.
+    struct HistoryRecordingActionPlanner {
+        actions: Vec<Action>,
+        results: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for HistoryRecordingActionPlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            let mut results = self.results.borrow_mut();
+            results.clear();
+            results.extend(history.iter().map(|entry| entry.result.clone()));
+            let action = self
+                .actions
+                .get(history.len())
+                .or_else(|| self.actions.last())
+                .cloned()
+                .expect("planner needs at least one action");
+            PlannerDecision::new("recording stub", action)
+        }
     }
 
     #[async_trait::async_trait(?Send)]

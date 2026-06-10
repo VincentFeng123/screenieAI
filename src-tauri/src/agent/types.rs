@@ -337,6 +337,14 @@ pub enum Action {
     /// Extract the visible text of the focused page/window into the
     /// planner's next prompt. Emits no input events.
     ReadPage,
+    /// Search the frontmost app's saved hints, full menu-bar tree, and the
+    /// current observation for a feature by name. Read-only; matches arrive
+    /// in the step result. Emits no input events.
+    FindUi { query: String },
+    /// Ask a research model with web access where a feature lives in the
+    /// frontmost app's UI. Gated by a user setting and provider support;
+    /// results are untrusted navigation data. Emits no input events.
+    WebLookup { query: String },
     /// Pause and ask the user one short question; the answer arrives in the
     /// planner's history. Emits no input events.
     Ask { question: String, options: Vec<String> },
@@ -373,6 +381,8 @@ impl Serialize for Action {
             | Self::Wait { .. }
             | Self::OpenUrl { .. }
             | Self::WebSearch { .. }
+            | Self::FindUi { .. }
+            | Self::WebLookup { .. }
             | Self::AppleScript { .. }
             | Self::MoveToTrash { .. }
             | Self::Fail { .. } => 2,
@@ -464,6 +474,14 @@ impl Serialize for Action {
             }
             Self::ReadPage => {
                 state.serialize_field("action", "readPage")?;
+            }
+            Self::FindUi { query } => {
+                state.serialize_field("action", "findUi")?;
+                state.serialize_field("query", query)?;
+            }
+            Self::WebLookup { query } => {
+                state.serialize_field("action", "webLookup")?;
+                state.serialize_field("query", query)?;
             }
             Self::Ask { question, options } => {
                 state.serialize_field("action", "ask")?;
@@ -726,6 +744,16 @@ impl<'de> Deserialize<'de> for Action {
                 reject_extra::<D::Error>(&raw.action, &present, &[])?;
                 Ok(Self::ReadPage)
             }
+            "findUi" | "find_ui" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["query"])?;
+                let query = required_string::<D::Error>("query", raw.query)?;
+                Ok(Self::FindUi { query })
+            }
+            "webLookup" | "web_lookup" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["query"])?;
+                let query = required_string::<D::Error>("query", raw.query)?;
+                Ok(Self::WebLookup { query })
+            }
             "ask" => {
                 reject_extra::<D::Error>(&raw.action, &present, &["question", "options"])?;
                 let question = required_string::<D::Error>("question", raw.question)?;
@@ -809,6 +837,8 @@ impl Action {
             | Self::OpenUrl { .. }
             | Self::WebSearch { .. }
             | Self::ReadPage
+            | Self::FindUi { .. }
+            | Self::WebLookup { .. }
             | Self::Ask { .. }
             | Self::AppleScript { .. }
             | Self::RunShortcut { .. }
@@ -1019,6 +1049,41 @@ mod tests {
 
         assert!(Action::from_json_strict(r#"{"action":"openUrl"}"#).is_err());
         assert!(Action::from_json_strict(r#"{"action":"readPage","url":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn find_ui_and_web_lookup_round_trip_strictly() {
+        let find = Action::FindUi {
+            query: "export pdf".into(),
+        };
+        let find_json = find.to_json().unwrap();
+        assert_eq!(find_json, r#"{"action":"findUi","query":"export pdf"}"#);
+        assert_eq!(Action::from_json_strict(&find_json).unwrap(), find);
+
+        let lookup = Action::WebLookup {
+            query: "enable develop menu".into(),
+        };
+        let lookup_json = lookup.to_json().unwrap();
+        assert_eq!(
+            lookup_json,
+            r#"{"action":"webLookup","query":"enable develop menu"}"#
+        );
+        assert_eq!(Action::from_json_strict(&lookup_json).unwrap(), lookup);
+
+        // Snake-case aliases parse to the same actions.
+        assert_eq!(
+            Action::from_json_strict(r#"{"action":"find_ui","query":"q"}"#).unwrap(),
+            Action::FindUi { query: "q".into() }
+        );
+        assert_eq!(
+            Action::from_json_strict(r#"{"action":"web_lookup","query":"q"}"#).unwrap(),
+            Action::WebLookup { query: "q".into() }
+        );
+
+        // Strictness: query is required and extra fields are rejected.
+        assert!(Action::from_json_strict(r#"{"action":"findUi"}"#).is_err());
+        assert!(Action::from_json_strict(r#"{"action":"webLookup","query":"  "}"#).is_err());
+        assert!(Action::from_json_strict(r#"{"action":"findUi","query":"q","url":"x"}"#).is_err());
     }
 
     #[test]

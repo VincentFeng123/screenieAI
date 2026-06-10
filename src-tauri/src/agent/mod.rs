@@ -8,6 +8,7 @@ mod page_reader;
 mod planner;
 #[cfg(target_os = "macos")]
 mod safari_dom;
+mod search;
 mod types;
 mod vision;
 

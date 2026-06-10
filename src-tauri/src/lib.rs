@@ -1465,6 +1465,7 @@ async fn run_prepared_stub_agent(
         vision_config,
         fallback_state,
         resolved.scripting_enabled,
+        false, // web lookup ships in a later commit; never advertise before then
     );
     let confirmations = TauriConfirmationRequester { app, window };
     agent::run_stub_agent_loop_with_grounder(
