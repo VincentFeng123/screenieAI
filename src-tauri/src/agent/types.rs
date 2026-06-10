@@ -430,6 +430,14 @@ pub enum Action {
     ActivateApp { app: String },
     Click { id: u32 },
     ClickTarget { target: String },
+    /// Click the visible element whose label best matches `text`, resolved
+    /// at execution time against the current observation (WI-2). `nth` is
+    /// 1-based in reading order, for when several elements share the label.
+    ClickByText {
+        text: String,
+        role_hint: Option<String>,
+        nth: Option<u32>,
+    },
     DoubleClick { id: u32 },
     DoubleClickTarget { target: String },
     Type { id: u32, text: String },
@@ -505,6 +513,9 @@ impl Serialize for Action {
             Self::Drag { .. } => 3,
             Self::Ask { .. } => 3,
             Self::RunShortcut { input, .. } => 2 + usize::from(input.is_some()),
+            Self::ClickByText { role_hint, nth, .. } => {
+                2 + usize::from(role_hint.is_some()) + usize::from(nth.is_some())
+            }
             Self::ScrollAt { .. } => 4,
         };
         let mut state = serializer.serialize_struct("Action", field_count)?;
@@ -520,6 +531,20 @@ impl Serialize for Action {
             Self::ClickTarget { target } => {
                 state.serialize_field("action", "click")?;
                 state.serialize_field("target", target)?;
+            }
+            Self::ClickByText {
+                text,
+                role_hint,
+                nth,
+            } => {
+                state.serialize_field("action", "clickText")?;
+                state.serialize_field("text", text)?;
+                if let Some(role_hint) = role_hint {
+                    state.serialize_field("role", role_hint)?;
+                }
+                if let Some(nth) = nth {
+                    state.serialize_field("nth", nth)?;
+                }
             }
             Self::DoubleClick { id } => {
                 state.serialize_field("action", "doubleClick")?;
@@ -661,6 +686,8 @@ impl<'de> Deserialize<'de> for Action {
             url: Option<String>,
             query: Option<String>,
             reason: Option<String>,
+            role: Option<String>,
+            nth: Option<u32>,
             x: Option<serde_json::Value>,
             y: Option<serde_json::Value>,
         }
@@ -717,6 +744,8 @@ impl<'de> Deserialize<'de> for Action {
             ("url", raw.url.is_some()),
             ("query", raw.query.is_some()),
             ("reason", raw.reason.is_some()),
+            ("role", raw.role.is_some()),
+            ("nth", raw.nth.is_some()),
         ];
 
         match raw.action.as_str() {
@@ -737,6 +766,14 @@ impl<'de> Deserialize<'de> for Action {
                     )),
                     (None, None) => Err(serde::de::Error::custom("click requires id or target")),
                 }
+            }
+            "clickText" | "click_text" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["text", "role", "nth"])?;
+                Ok(Self::ClickByText {
+                    text: required_string::<D::Error>("text", raw.text)?,
+                    role_hint: raw.role.filter(|role| !role.trim().is_empty()),
+                    nth: raw.nth.filter(|nth| *nth >= 1),
+                })
             }
             "doubleClick" | "double_click" => {
                 reject_extra::<D::Error>(&raw.action, &present, &["id", "target"])?;
@@ -941,6 +978,7 @@ impl Action {
             | Self::ScrollAt { id, .. } => vec![*id],
             Self::Drag { from_id, to_id } => vec![*from_id, *to_id],
             Self::ActivateApp { .. }
+            | Self::ClickByText { .. }
             | Self::ClickTarget { .. }
             | Self::DoubleClickTarget { .. }
             | Self::TypeTarget { .. }

@@ -1984,6 +1984,89 @@ where
                 let decision_expect = decision.expect.clone();
                 let mut action = decision.action.clone();
                 let planner_reason = decision.reason.clone();
+
+                // WI-2: a text-targeted click resolves here, against the same
+                // observation the planner saw. The resolved Click{id} then
+                // flows through every existing gate (safety, confirmation,
+                // intent gate, preflight) exactly like a planner-issued id.
+                let mut click_text_intent: Option<String> = None;
+                if let Action::ClickByText {
+                    text,
+                    role_hint,
+                    nth,
+                } = action.clone()
+                {
+                    match resolve_click_by_text(&before, &text, role_hint.as_deref(), nth) {
+                        Ok(resolution) => {
+                            eprintln!(
+                                "[screenie] agent step {} resolve epoch={} via=name match_score={:.2} expected=\"{}\" resolved=\"{}\"",
+                                step_number,
+                                observation_epoch,
+                                resolution.score,
+                                text,
+                                resolution.element.name
+                            );
+                            click_text_intent = Some(text);
+                            action = Action::Click {
+                                id: resolution.element.id,
+                            };
+                        }
+                        Err(reason) => {
+                            eprintln!(
+                                "[screenie] agent step {} clickText-unresolved: {reason}",
+                                step_number
+                            );
+                            if duplicate_rejections < MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP {
+                                planning_history.push(PlannerHistoryEntry::new(
+                                    action.clone(),
+                                    planner_reason.clone(),
+                                    format!("rejected without execution: {reason}"),
+                                ));
+                                step_rejection_lines
+                                    .push(format!("- clickText \"{text}\": {reason}"));
+                                attempt_goal =
+                                    compose_attempt_goal(&planner_goal, &step_rejection_lines);
+                                duplicate_rejections = duplicate_rejections.saturating_add(1);
+                                continue;
+                            }
+                            // Rejection cap: surface a non-executed step and
+                            // replan next step from a fresh observation.
+                            history.push(PlannerHistoryEntry::new(
+                                action.clone(),
+                                planner_reason.clone(),
+                                format!("rejected without execution: {reason}"),
+                            ));
+                            let step = AgentStepReport {
+                                step: step_number,
+                                action,
+                                planner_reason: Some(planner_reason),
+                                target: None,
+                                click_point: None,
+                                click_preflight: None,
+                                execution_policy: options.execution_policy,
+                                executed: false,
+                                mechanism: None,
+                                duration_ms: None,
+                                safety_gate: None,
+                                confirmation: None,
+                                verification: VerificationReport::skipped_no_change_expected(),
+                                settle_status,
+                                calibration: None,
+                                observation_source: observation_metadata.source,
+                                vision_candidate_count: observation_metadata.candidate_count,
+                                vision_trigger_reason: observation_metadata
+                                    .trigger_reason
+                                    .clone(),
+                                vision_capture_size: observation_metadata.capture_size,
+                                vision_detector_kind: observation_metadata.detector_kind.clone(),
+                                grounding: None,
+                                failure_reason: Some(reason),
+                            };
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            continue 'steps;
+                        }
+                    }
+                }
                 let mut preparation_observation = before.clone();
                 let grounding_plan = GroundedActionPlan::from_action(&action);
                 let mut grounding_report = None;
@@ -2099,13 +2182,17 @@ where
                 // The target-intent gate runs first: a planner that names one
                 // element and ids another never reaches execution, and the
                 // structured notice teaches it which element the id really is.
+                let expected_target_name = decision
+                    .target_name
+                    .as_deref()
+                    .or(click_text_intent.as_deref());
                 let intent_mismatch = target_intent_mismatch_reason(
-                    decision.target_name.as_deref(),
+                    expected_target_name,
                     decision.target_role.as_deref(),
                     &prepared,
                 );
                 if let (Some(expected), Some(target)) =
-                    (decision.target_name.as_deref(), prepared.target.as_ref())
+                    (expected_target_name, prepared.target.as_ref())
                 {
                     eprintln!(
                         "[screenie] agent step {} resolve epoch={} via=id match_score={:.2} expected=\"{}\" resolved=\"{}\"",
@@ -3623,7 +3710,9 @@ fn confirmation_approval_key(
     reason: &str,
 ) -> Option<ConfirmationApprovalKey> {
     let action_kind = match action {
-        Action::Click { .. } | Action::ClickTarget { .. } => "click".to_string(),
+        Action::Click { .. } | Action::ClickTarget { .. } | Action::ClickByText { .. } => {
+            "click".to_string()
+        }
         Action::DoubleClick { .. } | Action::DoubleClickTarget { .. } => "doubleClick".to_string(),
         Action::Type { text, .. } | Action::TypeTarget { text, .. } => {
             format!("type:{}", normalize_text_for_match(text))
@@ -4328,6 +4417,12 @@ fn validated_search_query(action: &str, query: &str) -> Result<String, Execution
 fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, ExecutionError> {
     match action {
         Action::ActivateApp { app } => Ok(PreparedAction::activate_app(app.clone())),
+        // Text-targeted clicks are resolved to Click{id} in the planning
+        // loop (resolve_click_by_text); reaching preparation unresolved is
+        // an internal error, never an input path.
+        Action::ClickByText { text, .. } => Err(ExecutionError::Input(format!(
+            "clickText \"{text}\" must resolve to an element id before preparation"
+        ))),
         Action::OpenUrl { url } => Ok(PreparedAction::without_target(PreparedKind::OpenUrl {
             url: validated_web_url(url)?,
         })),
@@ -4482,6 +4577,144 @@ fn target_element_by_id(obs: &[Element], id: u32) -> Result<Element, ExecutionEr
         .find(|element| element.id == id)
         .cloned()
         .ok_or(ExecutionError::TargetMissing(id))
+}
+
+/// A text-targeted click resolved to a concrete element (WI-2).
+#[derive(Clone, Debug)]
+struct TextResolution {
+    element: Element,
+    score: f64,
+}
+
+const CLICK_TEXT_AMBIGUITY_WINDOW: f64 = 0.1;
+const CLICK_TEXT_MAX_LISTED_CANDIDATES: usize = 4;
+
+/// Resolve `clickText` against the current observation: fuzzy-score every
+/// enabled element's labels, prefer the hinted role, and refuse to act when
+/// the best two candidates are within the ambiguity window — the failure
+/// string lists the candidates with their `nth` positions so the planner
+/// can disambiguate instead of the executor guessing.
+fn resolve_click_by_text(
+    obs: &[Element],
+    text: &str,
+    role_hint: Option<&str>,
+    nth: Option<u32>,
+) -> Result<TextResolution, String> {
+    let query = text.trim();
+    if query.is_empty() {
+        return Err("clickText requires non-empty text".into());
+    }
+
+    let enabled: Vec<&Element> = obs.iter().filter(|element| element.enabled).collect();
+    let pool: Vec<&Element> = match role_hint {
+        Some(hint) => {
+            let hinted: Vec<&Element> = enabled
+                .iter()
+                .copied()
+                .filter(|element| matching::role_matches_hint(hint, &element.role))
+                .collect();
+            // An unmatched hint falls back to every element rather than
+            // failing outright — the hint narrows, it never blinds.
+            if hinted.is_empty() {
+                enabled
+            } else {
+                hinted
+            }
+        }
+        None => enabled,
+    };
+
+    let mut matches: Vec<(f64, &Element)> = pool
+        .into_iter()
+        .map(|element| {
+            let score = matching::label_match_score(query, &element.name).max(
+                element
+                    .value
+                    .as_deref()
+                    .map(|value| matching::label_match_score(query, value))
+                    .unwrap_or(0.0),
+            );
+            (score, element)
+        })
+        .filter(|(score, _)| *score >= matching::TARGET_MATCH_ACCEPT_THRESHOLD)
+        .collect();
+
+    if matches.is_empty() {
+        let role_note = role_hint
+            .map(|hint| format!(" with role '{hint}'"))
+            .unwrap_or_default();
+        return Err(format!(
+            "no visible element matches \"{query}\"{role_note}; scroll or readPage to reveal it, or refine the text"
+        ));
+    }
+
+    // Reading order — on-screen first, then top-to-bottom, left-to-right.
+    // This is the order `nth` indexes and the order candidates are listed.
+    matches.sort_by(|(_, a), (_, b)| {
+        let offscreen = |element: &Element| u8::from(element.bounds.y < 0.0 || element.bounds.x < 0.0);
+        offscreen(a)
+            .cmp(&offscreen(b))
+            .then(a.bounds.y.total_cmp(&b.bounds.y))
+            .then(a.bounds.x.total_cmp(&b.bounds.x))
+    });
+
+    if let Some(nth) = nth {
+        return match matches.get(nth.saturating_sub(1) as usize) {
+            Some((score, element)) => Ok(TextResolution {
+                element: (*element).clone(),
+                score: *score,
+            }),
+            None => Err(format!(
+                "nth={nth} is out of range: only {} element(s) match \"{query}\"",
+                matches.len()
+            )),
+        };
+    }
+
+    let (best_index, best_score) = matches
+        .iter()
+        .enumerate()
+        .max_by(|(_, (a, _)), (_, (b, _))| a.total_cmp(b))
+        .map(|(index, (score, _))| (index, *score))
+        .expect("matches is non-empty");
+    let runner_up = matches
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != best_index)
+        .map(|(_, (score, _))| *score)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if matches.len() > 1 && best_score - runner_up < CLICK_TEXT_AMBIGUITY_WINDOW {
+        let listed = matches
+            .iter()
+            .enumerate()
+            .take(CLICK_TEXT_MAX_LISTED_CANDIDATES)
+            .map(|(index, (score, element))| {
+                format!(
+                    "[nth={}] {} \"{}\" score={score:.2}",
+                    index + 1,
+                    element.role,
+                    element.name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let extra = matches.len().saturating_sub(CLICK_TEXT_MAX_LISTED_CANDIDATES);
+        let extra_note = if extra > 0 {
+            format!(" (+{extra} more)")
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "ambiguous: {} elements match \"{query}\": {listed}{extra_note}; repeat clickText with nth (1-based, top to bottom) or more specific text",
+            matches.len()
+        ));
+    }
+
+    let (score, element) = matches[best_index];
+    Ok(TextResolution {
+        element: element.clone(),
+        score,
+    })
 }
 
 /// Best fuzzy score between the planner's echoed target_name and a resolved
@@ -6141,6 +6374,9 @@ fn display_progress_action(action: &Action, prepared: &PreparedAction) -> String
     };
     match action {
         Action::Click { .. } | Action::ClickTarget { .. } => with_target("click"),
+        Action::ClickByText { text, .. } => {
+            format!("clickText \"{}\"", compact_history_text(text))
+        }
         Action::DoubleClick { .. } | Action::DoubleClickTarget { .. } => {
             with_target("double-click")
         }
@@ -6198,6 +6434,9 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
                 .map(|target| target.signature.as_str())
                 .unwrap_or("missing")
         ),
+        Action::ClickByText { text, .. } => {
+            format!("clickText:{}", normalize_text_for_match(text))
+        }
         Action::DoubleClick { .. } | Action::DoubleClickTarget { .. } => format!(
             "doubleClick:{}",
             prepared
@@ -7797,6 +8036,191 @@ mod tests {
             target_intent_mismatch_reason(Some("anything"), None, &scroll),
             None
         );
+    }
+
+    fn radio(id: u32, name: &str, y: f64) -> Element {
+        Element::new(
+            id,
+            "AXRadioButton".into(),
+            name.into(),
+            None,
+            Rect {
+                x: 100.0,
+                y,
+                width: 200.0,
+                height: 40.0,
+            },
+            true,
+            false,
+            CoordinateSpace::AxPoints,
+            ElementSource::Web,
+        )
+    }
+
+    /// Hand-authored stand-in for the Apple configurator's model picker:
+    /// two radios plus the two elements the failing run actually clicked.
+    fn configurator_fixture() -> Vec<Element> {
+        vec![
+            specialist_link(),
+            radio(21, "iPhone 17 Pro 6.3-inch display", 100.0),
+            radio(22, "iPhone 17 Pro Max 6.9-inch display", 160.0),
+            Element::new(
+                28,
+                "AXButton".into(),
+                "Show more Need help choosing a model?".into(),
+                None,
+                Rect {
+                    x: 1279.0,
+                    y: 502.0,
+                    width: 27.0,
+                    height: 21.0,
+                },
+                true,
+                false,
+                CoordinateSpace::AxPoints,
+                ElementSource::Web,
+            ),
+        ]
+    }
+
+    #[test]
+    fn click_by_text_resolves_pro_max_radio() {
+        let obs = configurator_fixture();
+
+        let resolved =
+            resolve_click_by_text(&obs, "iPhone 17 Pro Max", Some("radio"), None).unwrap();
+
+        assert_eq!(resolved.element.id, 22);
+        assert_eq!(resolved.element.name, "iPhone 17 Pro Max 6.9-inch display");
+        assert!(resolved.score >= matching::TARGET_MATCH_ACCEPT_THRESHOLD);
+    }
+
+    #[test]
+    fn click_by_text_ambiguous_query_lists_candidates_without_acting() {
+        let obs = configurator_fixture();
+
+        let err = resolve_click_by_text(&obs, "Pro", Some("radio"), None).unwrap_err();
+
+        assert!(err.contains("ambiguous"), "got: {err}");
+        assert!(err.contains("iPhone 17 Pro 6.3-inch display"), "got: {err}");
+        assert!(err.contains("iPhone 17 Pro Max 6.9-inch display"), "got: {err}");
+        assert!(err.contains("nth"), "got: {err}");
+    }
+
+    #[test]
+    fn click_by_text_nth_picks_reading_order_position() {
+        let obs = configurator_fixture();
+
+        let resolved = resolve_click_by_text(&obs, "Pro", Some("radio"), Some(2)).unwrap();
+        assert_eq!(resolved.element.id, 22);
+
+        let resolved = resolve_click_by_text(&obs, "Pro", Some("radio"), Some(1)).unwrap();
+        assert_eq!(resolved.element.id, 21);
+
+        let err = resolve_click_by_text(&obs, "Pro", Some("radio"), Some(5)).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn click_by_text_reports_no_match() {
+        let obs = configurator_fixture();
+
+        let err = resolve_click_by_text(&obs, "Add to Bag", None, None).unwrap_err();
+
+        assert!(err.contains("no visible element"), "got: {err}");
+    }
+
+    #[test]
+    fn click_by_text_executes_through_existing_gates() {
+        let planner = StubPlanner::decision_sequence(vec![PlannerDecision::new(
+            "select largest display",
+            Action::ClickByText {
+                text: "iPhone 17 Pro Max".into(),
+                role_hint: Some("radio".into()),
+                nth: None,
+            },
+        )]);
+        let observer = FakeObserver::new(vec![
+            Ok(configurator_fixture()),
+            Ok(vec![element(2, "Done")]),
+        ]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.steps.len(), 1);
+        assert!(report.steps[0].executed);
+        // The committed step is a resolved Click on the radio's id, so the
+        // safety gate, intent gate, and preflight all saw a normal targeted
+        // click (Web-source elements have no AX handle, hence mouse path).
+        assert_eq!(report.steps[0].action, Action::Click { id: 22 });
+        assert_eq!(
+            report.steps[0].target.as_ref().map(|t| t.name.as_str()),
+            Some("iPhone 17 Pro Max 6.9-inch display")
+        );
+        assert!(
+            events
+                .borrow()
+                .contains(&RecordedInput::Move(ClickPoint { x: 200, y: 180 })),
+            "expected a move to the radio center, events: {:?}",
+            events.borrow()
+        );
+    }
+
+    #[test]
+    fn click_by_text_ambiguity_posts_no_input() {
+        let planner = StubPlanner::decision_sequence(vec![PlannerDecision::new(
+            "select a model",
+            Action::ClickByText {
+                text: "Pro".into(),
+                role_hint: Some("radio".into()),
+                nth: None,
+            },
+        )]);
+        let observer = FakeObserver::new(vec![Ok(configurator_fixture())]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        // The ambiguous proposal fired nothing; the stub's fallback (done)
+        // ended the run cleanly.
+        assert!(events.borrow().is_empty(), "events: {:?}", events.borrow());
+        assert!(observer.pressed_element_ids.borrow().is_empty());
+        assert!(report.steps.iter().all(|step| !step.executed));
     }
 
     #[test]
