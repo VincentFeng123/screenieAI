@@ -214,7 +214,7 @@ const QUICK_TOOLTIP_FROST_REGION_SELECTOR = [
   ".screenie-select-menu-portal",
 ].join(", ");
 const QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR =
-  ".quick-tooltip-error, .quick-tooltip-confirmation, .quick-tooltip-question, .quick-tooltip-agent-progress";
+  ".quick-tooltip-error, .quick-tooltip-confirmation, .quick-tooltip-question, .quick-tooltip-agent-progress, .quick-tooltip-clip";
 const QUICK_TOOLTIP_STATUS_MIN_HEIGHT = 82;
 const QUICK_TOOLTIP_STATUS_MAX_HEIGHT = 420;
 // Must match QUICK_TOOLTIP_AGENT_CARD_H / _MAX_H in src-tauri/src/lib.rs.
@@ -411,6 +411,9 @@ function useQuickTooltipFrostRegions(enabled: boolean) {
     lastSignatureRef.current = signature;
     invoke("set_quick_tooltip_vibrancy_regions", { regions }).catch((e) => {
       console.error("set_quick_tooltip_vibrancy_regions failed:", e);
+      // The signature was stored optimistically; a lost send must not
+      // dedupe-suppress the retry that would repair the panes.
+      lastSignatureRef.current = "";
     });
   }, []);
 
@@ -1202,6 +1205,8 @@ export default function QuickTooltip() {
     setAgentRunning(true);
     setAgentStatus(null);
     setError(null);
+    // A new run replaces the previous run's saved-clip card.
+    setSavedClip(null);
     try {
       await invoke("start_agent_task", {
         goal,
@@ -1429,7 +1434,9 @@ export default function QuickTooltip() {
                 ? "Agent question"
                 : error
                   ? "Screenie status"
-                  : "Agent progress"
+                  : agentRunning
+                    ? "Agent progress"
+                    : "Saved recording"
           }
           role={error && !confirmation && !question ? "alert" : undefined}
           onMouseDown={(e) => e.stopPropagation()}

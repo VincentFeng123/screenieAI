@@ -1598,23 +1598,32 @@ impl agent::CaptureEngine for TauriCaptureEngine {
         let target = self.resolve_target(scope)?;
         let app_data = app_data_dir(&self.app)?;
         let slots = self.slots();
+        let opts = capture::engine::RecordOpts::default();
+        let params = capture::engine::effective_record_params(&opts);
+        let duration = f64::from(seconds).clamp(0.5, f64::from(params.max_duration_s));
+
+        // Cancel-safety: await the start to COMPLETION before anything can
+        // race it, so the native recorder is always registered in the slots
+        // (a select! that dropped the start future mid-spawn_blocking would
+        // orphan a live recorder). The wait then POLLS is_aborted every
+        // 200ms — immune to the notify_waiters lost-wakeup that a
+        // notified() branch would have — and every outcome funnels through
+        // the same stop, finalizing a partial clip on abort.
+        let handle = capture::engine::start_recording(slots.clone(), app_data, target, opts)
+            .await
+            .map_err(|e| e.to_string())?;
         self.emit_recording_state(true, scope.label());
-        // The session lives in the slots, not the future: dropping the
-        // record_clip branch on abort is safe, and the stop branch finalizes
-        // whatever was captured instead of recording past the abort.
-        let result = tokio::select! {
-            biased;
-            _ = abort.notified() => {
-                capture::engine::stop_recording(slots.clone(), None).await
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(duration);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if abort.is_aborted() || std::time::Instant::now() >= deadline {
+                break;
             }
-            result = capture::engine::record_clip(
-                slots.clone(),
-                app_data,
-                target,
-                f64::from(seconds),
-                capture::engine::RecordOpts::default(),
-            ) => result,
-        };
+            if !capture::engine::recording_active(&slots) {
+                break; // the cap-watchdog stopped it first
+            }
+        }
+        let result = capture::engine::stop_recording(slots, Some(handle.session_id)).await;
         self.emit_recording_state(false, scope.label());
         match result {
             Ok(clip) => {

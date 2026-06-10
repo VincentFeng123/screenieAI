@@ -90,3 +90,25 @@ enigo = "0.6"
 gif = "0.13"
 whisper-rs = { version = "0.16", features = ["metal"] }
 xcap = "=0.9.6"
+
+# GIF encoding is per-pixel work (NeuQuant quantization + LZW) on a live
+# frame tap with a bounded 4-slot channel: unoptimized debug builds encode
+# ~20x slower and silently drop most frames. Optimizing just these crates
+# keeps dev-build GIF QA representative without slowing the rest of the
+# debug build.
+[profile.dev.package.color_quant]
+opt-level = 3
+[profile.dev.package.gif]
+opt-level = 3
+[profile.dev.package.weezl]
+opt-level = 3
+# Same story for the still-image stack: every perception frame round-trips
+# PNG encode/decode of up to Retina-sized bitmaps.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3

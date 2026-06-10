@@ -16,8 +16,8 @@ pub(crate) mod engine_macos;
 #[cfg(target_os = "windows")]
 pub(crate) mod engine_win;
 
-const MAX_PNG_B64_CHARS: usize = 96 * 1024 * 1024;
-const MAX_IMAGE_PIXELS: u64 = 60_000_000;
+pub(crate) const MAX_PNG_B64_CHARS: usize = 96 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_PIXELS: u64 = 60_000_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {

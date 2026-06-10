@@ -20,6 +20,21 @@
 # When to run:
 #   - Once after every `cargo build` / `npm run tauri dev` first launch.
 #   - With --reset if macOS keeps re-prompting despite the script.
+#
+# Stronger option (recommended for capture/recording work):
+#   Newer macOS versions can pin ad-hoc grants to the cdhash, which still
+#   changes every rebuild even with a stable identifier. A one-time
+#   self-signed code-signing certificate gives TCC a real identity to anchor
+#   to instead:
+#     1. Keychain Access > Certificate Assistant > Create a Certificate…
+#        Name: "ScreenieAI Dev", Identity Type: Self Signed Root,
+#        Certificate Type: Code Signing.
+#     2. export SCREENIE_DEV_IDENTITY="ScreenieAI Dev"   (e.g. in ~/.zshrc)
+#   This script signs with $SCREENIE_DEV_IDENTITY when set, ad-hoc otherwise.
+#
+# Heads-up for capture/recording QA: an unsigned rebuild does NOT error —
+# screenshots and recordings silently come back as BLANK frames. If captures
+# look black, run this script and relaunch before debugging anything else.
 
 set -euo pipefail
 
@@ -51,16 +66,24 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# A real (even self-signed) identity survives rebuilds more reliably than
+# ad-hoc: TCC anchors to identifier + certificate instead of the per-build
+# cdhash. Falls back to ad-hoc ("-") when SCREENIE_DEV_IDENTITY is unset.
+SIGN_IDENTITY="${SCREENIE_DEV_IDENTITY:--}"
+if [ "$SIGN_IDENTITY" != "-" ]; then
+  echo "Signing with identity: $SIGN_IDENTITY"
+fi
+
 resigned_anything=false
 
 if [ -f "$DEV_BIN" ]; then
-  codesign --force --identifier "$BUNDLE_ID" --sign - "$DEV_BIN"
+  codesign --force --identifier "$BUNDLE_ID" --sign "$SIGN_IDENTITY" "$DEV_BIN"
   echo "Re-signed dev binary: $DEV_BIN"
   resigned_anything=true
 fi
 
 if [ -d "$INSTALLED_APP" ]; then
-  codesign --force --deep --identifier "$BUNDLE_ID" --sign - "$INSTALLED_APP"
+  codesign --force --deep --identifier "$BUNDLE_ID" --sign "$SIGN_IDENTITY" "$INSTALLED_APP"
   echo "Re-signed installed app: $INSTALLED_APP"
   resigned_anything=true
 fi

@@ -2980,17 +2980,22 @@ where
                 }
                 let result_text = if options.execution_policy.is_dry_run() {
                     "dry-run: recordClip skipped".to_string()
-                } else if let Some(denied) =
-                    capture_denied_feedback(&capture.permissions(false).await)
+                } else if let Some(blocked) =
+                    recording_precheck_feedback(&capture.permissions(true).await)
                 {
-                    denied
+                    blocked
                 } else {
                     match capture.record_clip(scope, seconds, abort).await {
                         Ok(clip) => {
                             step.executed = true;
                             step.mechanism = Some(ActionMechanism::Record);
+                            let stop_note = clip
+                                .stopped_reason
+                                .as_deref()
+                                .map(|reason| format!(" (stopped: {reason})"))
+                                .unwrap_or_default();
                             format!(
-                                "recorded {:.0}s {} clip; saved to {}",
+                                "recorded {:.0}s {} clip; saved to {}{stop_note}",
                                 clip.duration_s,
                                 clip.format.extension(),
                                 clip.path
@@ -3064,10 +3069,10 @@ where
                 }
                 let result_text = if options.execution_policy.is_dry_run() {
                     "dry-run: startRecording skipped".to_string()
-                } else if let Some(denied) =
-                    capture_denied_feedback(&capture.permissions(false).await)
+                } else if let Some(blocked) =
+                    recording_precheck_feedback(&capture.permissions(true).await)
                 {
-                    denied
+                    blocked
                 } else {
                     match capture.start_recording(scope).await {
                         Ok(()) => {
@@ -5271,6 +5276,25 @@ fn capture_denied_feedback(map: &crate::capture::engine::CapturePermissionMap) -
                 .to_string(),
         ),
     }
+}
+
+/// Recording precheck: denial plus the stale-grant case. captureFrame
+/// detects staleness from its own frame's `blank` flag, but a recording has
+/// no equivalent per-frame ground truth before it starts — so these arms pay
+/// for one probed permission map instead of saving an all-black clip.
+fn recording_precheck_feedback(
+    map: &crate::capture::engine::CapturePermissionMap,
+) -> Option<String> {
+    if let Some(denied) = capture_denied_feedback(map) {
+        return Some(denied);
+    }
+    if map.screen_capture_verified == Some(false) {
+        return Some(
+            "Screen Recording shows granted but captures come back BLANK: macOS cached a stale grant. Do not record; tell the user to quit and reopen Screenie AI, then fail with reason_detail."
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Planner-visible rendering of the permission map (kept under the 220-char

@@ -254,15 +254,20 @@ pub(crate) async fn capture_frame(
 ) -> Result<CapturedFrame, CaptureError> {
     let sck = sck_still_path_available();
 
-    let png_base64 = match (&target, sck) {
-        (CaptureTarget::Window { id }, true) => {
-            sck_target_png(0, *id, opts.max_dimension, false, opts.show_cursor).await?
-        }
+    let (png_base64, known_blank) = match (&target, sck) {
+        (CaptureTarget::Window { id }, true) => (
+            sck_target_png(0, *id, opts.max_dimension, false, opts.show_cursor).await?,
+            None,
+        ),
         (CaptureTarget::Window { id }, false) => {
             let capture = super::macos::capture_window_cli(*id).await?;
-            super::downscale_for_cloud(&capture.png_base64, opts.max_dimension).await?
+            let blank = capture.blank;
+            (
+                super::downscale_for_cloud(&capture.png_base64, opts.max_dimension).await?,
+                Some(blank),
+            )
         }
-        (CaptureTarget::Display { id }, true) => {
+        (CaptureTarget::Display { id }, true) => (
             sck_target_png(
                 id.unwrap_or(0),
                 0,
@@ -270,8 +275,9 @@ pub(crate) async fn capture_frame(
                 opts.exclude_self,
                 opts.show_cursor,
             )
-            .await?
-        }
+            .await?,
+            None,
+        ),
         (CaptureTarget::Display { id }, false) => {
             let targets = list_targets().await?;
             let display = match id {
@@ -286,7 +292,11 @@ pub(crate) async fn capture_frame(
                 display.height as i32,
             )
             .await?;
-            super::downscale_for_cloud(&capture.png_base64, opts.max_dimension).await?
+            let blank = capture.blank;
+            (
+                super::downscale_for_cloud(&capture.png_base64, opts.max_dimension).await?,
+                Some(blank),
+            )
         }
         (CaptureTarget::Region { x, y, w, h }, true) => {
             let (x, y, w, h) = (*x, *y, *w, *h);
@@ -295,9 +305,9 @@ pub(crate) async fn capture_frame(
             }
             let targets = list_targets().await?;
             let display = display_for_region(&targets, x, y, w, h)?;
-            // Native-pixel grab of the containing display, then the proven
-            // device-pixel crop (cropping a pre-downscaled image would lose
-            // region precision).
+            // Native-pixel grab of the containing display (cropping a
+            // pre-downscaled image would lose region precision), then crop +
+            // downscale + blank probe + persist in ONE decode pass.
             let full =
                 sck_target_png(display.id, 0, 0, opts.exclude_self, opts.show_cursor).await?;
             let scale = display.scale();
@@ -305,24 +315,56 @@ pub(crate) async fn capture_frame(
             let crop_y = ((y - display.y) * scale).max(0.0) as u32;
             let crop_w = (w * scale).round().max(1.0) as u32;
             let crop_h = (h * scale).round().max(1.0) as u32;
-            let cropped = super::crop_png_b64(full, crop_x, crop_y, crop_w, crop_h).await?;
-            super::downscale_for_cloud(&cropped.png_base64, opts.max_dimension).await?
+            let max_dimension = opts.max_dimension;
+            return tauri::async_runtime::spawn_blocking(move || {
+                let processed = decode_process_frame_blocking(
+                    &full,
+                    Some((crop_x, crop_y, crop_w, crop_h)),
+                    max_dimension,
+                )?;
+                let path = match persist_dir {
+                    Some(dir) => Some(
+                        super::storage::persist_frame(&dir, &processed.png_bytes)?
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    None => None,
+                };
+                Ok(CapturedFrame {
+                    png_base64: processed.png_base64,
+                    width: processed.width,
+                    height: processed.height,
+                    path,
+                    blank: processed.blank,
+                })
+            })
+            .await
+            .map_err(|e| CaptureError::Other(format!("frame process task join: {e}")))?;
         }
         (CaptureTarget::Region { x, y, w, h }, false) => {
             let capture =
                 super::capture_rect(*x as i32, *y as i32, *w as i32, *h as i32).await?;
-            super::downscale_for_cloud(&capture.png_base64, opts.max_dimension).await?
+            let blank = capture.blank;
+            (
+                super::downscale_for_cloud(&capture.png_base64, opts.max_dimension).await?,
+                Some(blank),
+            )
         }
     };
 
-    finish_frame(png_base64, persist_dir).await
+    finish_frame(png_base64, persist_dir, known_blank).await
 }
 
-/// Shared tail: dimensions from the PNG header, the strict blank probe
-/// (TCC ground truth), optional persistence.
+/// Shared tail: dimensions from the PNG header (no decode), the strict
+/// blank probe (TCC ground truth), optional persistence. `known_blank`
+/// short-circuits the probe when the source already ran it (the CLI paths,
+/// whose `ScreenCapture` carries a `blank` flag); on the SCK paths this is
+/// the frame's ONLY decode — bounded by the max_dimension downscale, so a
+/// few ms, accepted.
 async fn finish_frame(
     png_base64: String,
     persist_dir: Option<PathBuf>,
+    known_blank: Option<bool>,
 ) -> Result<CapturedFrame, CaptureError> {
     tauri::async_runtime::spawn_blocking(move || {
         let bytes = STANDARD
@@ -330,7 +372,7 @@ async fn finish_frame(
             .map_err(|e| CaptureError::Other(format!("base64 decode: {e}")))?;
         let (width, height) = super::png_dimensions(&bytes)
             .ok_or_else(|| CaptureError::Other("could not parse PNG dimensions".into()))?;
-        let blank = super::png_is_blank(&bytes);
+        let blank = known_blank.unwrap_or_else(|| super::png_is_blank(&bytes));
         let path = match persist_dir {
             Some(dir) => Some(
                 super::storage::persist_frame(&dir, &bytes)?
@@ -349,6 +391,74 @@ async fn finish_frame(
     })
     .await
     .map_err(|e| CaptureError::Other(format!("frame finish task join: {e}")))?
+}
+
+struct ProcessedFrame {
+    png_bytes: Vec<u8>,
+    png_base64: String,
+    width: u32,
+    height: u32,
+    blank: bool,
+}
+
+/// One-pass crop + downscale + blank probe + encode for region captures:
+/// the native full-display PNG is decoded exactly once instead of bouncing
+/// through crop_png_b64 → downscale_for_cloud → blank probe (three decodes
+/// and three encodes of a Retina-sized image).
+fn decode_process_frame_blocking(
+    src_b64: &str,
+    crop: Option<(u32, u32, u32, u32)>,
+    max_dimension: u32,
+) -> Result<ProcessedFrame, CaptureError> {
+    if src_b64.len() > super::MAX_PNG_B64_CHARS {
+        return Err(CaptureError::Other("PNG payload too large".into()));
+    }
+    let bytes = STANDARD
+        .decode(src_b64)
+        .map_err(|e| CaptureError::Other(format!("base64 decode: {e}")))?;
+    let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)?;
+    if (img.width() as u64).saturating_mul(img.height() as u64) > super::MAX_IMAGE_PIXELS {
+        return Err(CaptureError::Other("image dimensions too large".into()));
+    }
+
+    let img = match crop {
+        Some((x, y, w, h)) => {
+            let (img_w, img_h) = (img.width(), img.height());
+            let x = x.min(img_w.saturating_sub(1));
+            let y = y.min(img_h.saturating_sub(1));
+            let w = w.min(img_w - x).max(1);
+            let h = h.min(img_h - y).max(1);
+            img.crop_imm(x, y, w, h)
+        }
+        None => img,
+    };
+
+    let (w, h) = (img.width(), img.height());
+    let long = w.max(h);
+    let img = if max_dimension > 0 && long > max_dimension {
+        let scale = f64::from(max_dimension) / f64::from(long);
+        img.resize_exact(
+            ((f64::from(w) * scale).round().max(1.0)) as u32,
+            ((f64::from(h) * scale).round().max(1.0)) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+
+    let rgba = img.to_rgba8();
+    let blank = super::rgba_is_blank(&rgba);
+    let (width, height) = (rgba.width(), rgba.height());
+    let mut out = Vec::with_capacity((width * height * 4) as usize);
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(ProcessedFrame {
+        png_base64: STANDARD.encode(&out),
+        png_bytes: out,
+        width,
+        height,
+        blank,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +756,36 @@ impl MacRecording {
             finalized,
             error,
             frame_count,
+        }
+    }
+}
+
+/// Leak backstop: a `MacRecording` dropped without `stop()` (e.g. a
+/// cancelled future orphaning the spawn_blocking that created it) must not
+/// leave the SCStream running — the macOS indicator would stay lit and the
+/// gif encoder thread would block on its channel forever. After a normal
+/// `stop()` this is a no-op (`handle` nulled, `gif` taken). The blocking FFI
+/// in drop is acceptable for a backstop: the realistic drop site is a
+/// blocking-pool thread.
+impl Drop for MacRecording {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            eprintln!("[screenie] recording dropped without stop(); tearing down native session");
+            let mut err_slot: *mut c_char = std::ptr::null_mut();
+            let _ = unsafe { screenie_recording_stop(self.handle, &mut err_slot) };
+            if let Some(msg) = take_bridge_error(err_slot) {
+                eprintln!("[screenie] leaked recording stop: {msg}");
+            }
+            unsafe { screenie_recording_release(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+        if let Some(mut pipeline) = self.gif.take() {
+            // Reclaim the tap ctx (hangs up the channel) and join the
+            // encoder so the thread can't outlive the session.
+            drop(unsafe { Arc::from_raw(pipeline.ctx as *const GifTapCtx) });
+            if let Some(encoder) = pipeline.encoder.take() {
+                let _ = encoder.join();
+            }
         }
     }
 }
