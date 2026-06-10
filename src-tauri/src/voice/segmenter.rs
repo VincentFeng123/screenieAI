@@ -120,6 +120,10 @@ pub struct UtteranceSegmenter {
     frames_since_voice: u64,
     idle_fired: bool,
     frame_counter: u64,
+    /// Peak values since the last `take_debug_stats`, for the
+    /// SCREENIE_VOICE_DEBUG pipeline-health trace.
+    debug_max_prob: f32,
+    debug_max_rms: f32,
 }
 
 /// Trailing silence kept on an emitted utterance so whisper sees a natural
@@ -139,18 +143,33 @@ impl UtteranceSegmenter {
             frames_since_voice: 0,
             idle_fired: false,
             frame_counter: 0,
+            debug_max_prob: 0.0,
+            debug_max_rms: 0.0,
         }
+    }
+
+    /// Peak (speech probability, rms) observed since the previous call;
+    /// resets on read. Diagnostic only — distinguishes "no audio reaching
+    /// the pipeline" (rms ≈ 0, e.g. TCC-denied zeros or a dead input
+    /// device) from "audio flows but VAD never crosses the threshold".
+    pub fn take_debug_stats(&mut self) -> (f32, f32) {
+        let stats = (self.debug_max_prob, self.debug_max_rms);
+        self.debug_max_prob = 0.0;
+        self.debug_max_rms = 0.0;
+        stats
     }
 
     /// Feed one frame; any resulting events are appended to `out`.
     pub fn push(&mut self, frame: Frame, out: &mut Vec<SegmenterOutput>) {
         let p = self.detector.predict(&frame);
         let is_voiced = p > self.cfg.speech_threshold;
+        self.debug_max_prob = self.debug_max_prob.max(p);
 
         self.frame_counter += 1;
         if self.cfg.level_every > 0 && self.frame_counter % self.cfg.level_every == 0 {
             let rms =
                 (frame.iter().map(|s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+            self.debug_max_rms = self.debug_max_rms.max(rms);
             out.push(SegmenterOutput::Level { rms });
         }
 

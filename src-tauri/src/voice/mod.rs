@@ -118,6 +118,10 @@ pub enum VoiceError {
     Stt(String),
     #[error("download: {0}")]
     Download(String),
+    /// The input device streams exact digital zeros (Bluetooth mic idle in
+    /// its case, hardware mute). Message is user-facing as written.
+    #[error("{0}")]
+    InputSilent(String),
 }
 
 impl VoiceError {
@@ -130,6 +134,7 @@ impl VoiceError {
             VoiceError::Audio(_) => "audio",
             VoiceError::Stt(_) => "stt",
             VoiceError::Download(_) => "download",
+            VoiceError::InputSilent(_) => "input_silent",
         }
     }
 }
@@ -299,8 +304,8 @@ pub fn start_session(
         }
     };
     eprintln!(
-        "[screenie] voice capture started: {} Hz, {} ch -> 16 kHz mono",
-        spec.device_rate, spec.channels
+        "[screenie] voice capture started: '{}' {} Hz, {} ch -> 16 kHz mono",
+        spec.device_name, spec.device_rate, spec.channels
     );
 
     emit_voice(app, "voice:status", VoiceStatus::Listening);
@@ -343,9 +348,35 @@ fn segmenter_thread(
 ) {
     let mut seg = segmenter::UtteranceSegmenter::new(seg_cfg, detector);
     let mut out = Vec::new();
+    // SCREENIE_VOICE_DEBUG=1: once a second, log the peak speech probability
+    // and RMS so a dead pipeline is diagnosable from the dev terminal —
+    // rms ≈ 0.000000 means no real audio (denied mic / wrong device); real
+    // probability that never crosses 0.6 means a VAD threshold problem.
+    let debug = std::env::var("SCREENIE_VOICE_DEBUG").is_ok();
+    let mut debug_frames = 0u32;
+    // SCREENIE_VOICE_TAP=<path>: record the exact 16 kHz mono stream the
+    // VAD/STT see (raw little-endian f32) for offline inspection.
+    let mut tap = std::env::var("SCREENIE_VOICE_TAP")
+        .ok()
+        .and_then(|path| std::fs::File::create(path).ok());
     while let Ok(frame) = frame_rx.recv() {
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        if let Some(file) = tap.as_mut() {
+            use std::io::Write;
+            let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
+            let _ = file.write_all(&bytes);
+        }
+        if debug {
+            debug_frames += 1;
+            if debug_frames >= 31 {
+                debug_frames = 0;
+                let (max_prob, max_rms) = seg.take_debug_stats();
+                eprintln!(
+                    "[screenie] voice debug: max_prob={max_prob:.3} max_rms={max_rms:.6}"
+                );
+            }
         }
         seg.push(frame, &mut out);
         for event in out.drain(..) {
