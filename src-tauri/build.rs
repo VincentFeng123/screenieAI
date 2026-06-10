@@ -16,6 +16,16 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=ScreenCaptureKit");
 
+        // Voice command mode: AVCaptureDevice microphone-permission preflight
+        // (cpal reports denied mic as silence, not an error).
+        println!("cargo:rerun-if-changed=src/voice_macos.m");
+        cc::Build::new()
+            .file("src/voice_macos.m")
+            .flag("-fblocks")
+            .flag("-fobjc-exceptions")
+            .compile("screenie_voice_macos");
+        println!("cargo:rustc-link-lib=framework=AVFoundation");
+
         // Embed Info.plist into the binary's __TEXT,__info_plist section.
         // `tauri dev` runs the raw binary at target/debug/screenieai (NOT
         // a .app bundle), so without this, macOS sees a "naked" binary

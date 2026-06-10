@@ -26,6 +26,10 @@ The app installs into your menu bar — no Dock icon. Left-click the tray glyph 
 
 After every dev rebuild, run `./scripts/macos-resign-dev.sh` so macOS TCC keeps your Screen Recording grant across binaries.
 
+Voice command mode compiles whisper.cpp from source, which needs **CMake**: `brew install cmake` on macOS (on Windows, install CMake + MSVC via the Visual Studio installer).
+
+**Dev-mode microphone gotcha:** under `npm run tauri dev`, macOS may attribute the microphone permission to your **terminal app** (Terminal/iTerm/VS Code) rather than Screenie AI — the prompt names the terminal, and the grant lands on it. If the mic "silently produces nothing" in dev, check System Settings → Privacy & Security → Microphone for your terminal before suspecting a bug. To re-test the prompt: `tccutil reset Microphone`.
+
 ## Permissions
 
 | OS | Permission | Why | When prompted |
@@ -34,6 +38,7 @@ After every dev rebuild, run `./scripts/macos-resign-dev.sh` so macOS TCC keeps 
 | macOS | **Accessibility** | Inspect visible app controls for agentic mode, consume Esc while the overlay is up, and return focus to the previously-frontmost app after capture | First overlay session or first agentic task |
 | macOS | **Input control / PostEvent** | Let agentic mode post approved mouse, keyboard, and scroll actions | First agentic task |
 | macOS | **Automation** | Let agentic mode inspect Safari page controls through Apple Events when Safari is active | First Safari agentic task |
+| macOS | **Microphone** | Voice command mode: spoken commands are transcribed on-device (whisper.cpp) and run as agent tasks; audio never leaves the machine | First mic toggle |
 | Windows | — | None; capture works out of the box via GDI / WinRT OCR | n/a |
 
 To re-prompt on macOS:

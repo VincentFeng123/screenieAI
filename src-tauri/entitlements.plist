@@ -27,5 +27,14 @@
 
     Add entitlements here only with concrete justification.
   -->
+  <!--
+    Voice command mode records the microphone (src/voice/capture.rs via cpal/
+    CoreAudio). Under hardened runtime, audio input is blocked without this
+    entitlement and fails SILENTLY — cpal delivers zeros, no error, no TCC
+    prompt — so signed release builds would ship a dead mic. Dev builds work
+    without it (no hardened runtime), which makes the omission easy to miss.
+  -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
 </dict>
 </plist>

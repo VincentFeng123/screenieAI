@@ -298,6 +298,12 @@ where
         self.base.read_page_text()
     }
 
+    // Change notifications come from the platform AX layer regardless of
+    // which fallback produced the current observation.
+    fn change_signal(&self) -> Option<Box<dyn super::types::UiChangeSignal>> {
+        self.base.change_signal()
+    }
+
     fn observe(&self) -> Result<Vec<Element>, ObservationError> {
         let ax = match self.base.observe() {
             Ok(ax) => ax,
@@ -1456,6 +1462,7 @@ impl VisionWindowCapturer for XcapWindowCapturer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::types::{ChangeWait, UiChangeSignal};
     use std::cell::Cell;
 
     #[test]
@@ -1996,15 +2003,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn change_signal_forwards_to_the_base_observer() {
+        let observer = VisionFallbackObserver::new(
+            FakeBaseObserver::new(Vec::new()).with_change_signal(),
+            FakeCapturer::large(),
+            FakeDetector::new(Vec::new()),
+            VisionFallbackState::new(),
+            VisionFallbackOptions::default(),
+        );
+
+        assert!(observer.change_signal().is_some());
+
+        let without_signal = VisionFallbackObserver::new(
+            FakeBaseObserver::new(Vec::new()),
+            FakeCapturer::large(),
+            FakeDetector::new(Vec::new()),
+            VisionFallbackState::new(),
+            VisionFallbackOptions::default(),
+        );
+
+        assert!(without_signal.change_signal().is_none());
+    }
+
+    struct NeverChangeSignal;
+
+    impl UiChangeSignal for NeverChangeSignal {
+        fn wait_for_change(&mut self, _timeout: std::time::Duration) -> ChangeWait {
+            ChangeWait::TimedOut
+        }
+    }
+
     struct FakeBaseObserver {
         observations: RefCell<VecDeque<Result<Vec<Element>, ObservationError>>>,
+        offers_change_signal: bool,
     }
 
     impl FakeBaseObserver {
         fn new(observations: Vec<Result<Vec<Element>, ObservationError>>) -> Self {
             Self {
                 observations: RefCell::new(observations.into()),
+                offers_change_signal: false,
             }
+        }
+
+        fn with_change_signal(mut self) -> Self {
+            self.offers_change_signal = true;
+            self
         }
     }
 
@@ -2014,6 +2059,11 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        fn change_signal(&self) -> Option<Box<dyn UiChangeSignal>> {
+            self.offers_change_signal
+                .then(|| Box::new(NeverChangeSignal) as Box<dyn UiChangeSignal>)
         }
     }
 

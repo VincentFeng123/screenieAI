@@ -63,10 +63,20 @@ type SectionId =
   | "overlay"
   | "ai-output"
   | "agent"
+  | "voice"
   | "appearance"
   | "templates"
   | "history"
   | "maintenance";
+
+// Mirrors Rust's VoiceConfig (src-tauri/src/voice/mod.rs). Persisted in
+// voice.json on the Rust side — NOT localStorage — because the segmenter
+// consumes these values at runtime; the UI just round-trips them.
+type VoiceSettings = {
+  silenceMs: number;
+  model: string;
+  autoStopS: number;
+};
 
 type AgentAutonomy = "ask" | "confirm" | "auto";
 
@@ -88,6 +98,7 @@ const settingsSections: { id: SectionId; label: string }[] = [
   { id: "overlay", label: "Overlay" },
   { id: "ai-output", label: "AI Output" },
   { id: "agent", label: "Agent" },
+  { id: "voice", label: "Voice" },
   { id: "templates", label: "Templates" },
   { id: "history", label: "History" },
   { id: "appearance", label: "Appearance" },
@@ -169,6 +180,22 @@ export default function SettingsPanel({
   const saveAgentScripting = (enabled: boolean) => {
     localStorage.setItem("agent_scripting_enabled", enabled ? "true" : "false");
     setAgentScriptingState(enabled);
+  };
+  const [voiceSettings, setVoiceSettings] = useState<VoiceSettings | null>(null);
+  useEffect(() => {
+    // Read-only and idempotent, so the StrictMode double-invoke is harmless.
+    invoke<{ config: VoiceSettings }>("voice_get_status")
+      .then((payload) => setVoiceSettings(payload.config))
+      .catch((e) => console.error("voice_get_status failed:", e));
+  }, []);
+  const saveVoiceSetting = (patch: Partial<VoiceSettings>) => {
+    invoke<VoiceSettings>("voice_set_config", {
+      silenceMs: patch.silenceMs,
+      model: patch.model,
+      autoStopS: patch.autoStopS,
+    })
+      .then(setVoiceSettings)
+      .catch((e) => console.error("voice_set_config failed:", e));
   };
   // Default ON: the lookup sends only app + feature names (never screen
   // content) to the same provider that already sees every observation.
@@ -913,6 +940,61 @@ export default function SettingsPanel({
               help="The agent never reads password fields and always asks before typing into one. Never give the agent real passwords — type them yourself."
             >
               <span className="settings-muted">Always guarded</span>
+            </PreferenceRow>
+          </SettingsCard>
+        </SettingsSection>
+
+        <SettingsSection
+          id="voice"
+          active={activeSection === "voice"}
+          title="Voice"
+          description="Hands-free agent commands. Speech is transcribed on this Mac — audio never leaves the device."
+        >
+          <SettingsCard>
+            <PreferenceRow
+              title="Model"
+              help="Larger models hear better but are slower to download and run. Switching prompts a one-time download on next mic use."
+            >
+              <SegmentedControl
+                value={voiceSettings?.model ?? "base.en"}
+                options={[
+                  { value: "tiny.en", label: "Tiny · 75 MB" },
+                  { value: "base.en", label: "Base · 142 MB" },
+                  { value: "small.en", label: "Small · 466 MB" },
+                ]}
+                onChange={(value) => saveVoiceSetting({ model: value })}
+                ariaLabel="Voice model"
+              />
+            </PreferenceRow>
+            <PreferenceRow
+              title="Pause detection"
+              help="How long a pause ends a spoken command. Applies to the next listening session."
+            >
+              <SegmentedControl
+                value={String(voiceSettings?.silenceMs ?? 700)}
+                options={[
+                  { value: "400", label: "Fast" },
+                  { value: "700", label: "Balanced" },
+                  { value: "1000", label: "Relaxed" },
+                ]}
+                onChange={(value) => saveVoiceSetting({ silenceMs: Number(value) })}
+                ariaLabel="Pause detection"
+              />
+            </PreferenceRow>
+            <PreferenceRow
+              title="Auto-stop"
+              help="Turns the mic off after this long without detected speech."
+            >
+              <SegmentedControl
+                value={String(voiceSettings?.autoStopS ?? 90)}
+                options={[
+                  { value: "30", label: "30 s" },
+                  { value: "90", label: "90 s" },
+                  { value: "300", label: "5 min" },
+                ]}
+                onChange={(value) => saveVoiceSetting({ autoStopS: Number(value) })}
+                ariaLabel="Voice auto-stop"
+              />
             </PreferenceRow>
           </SettingsCard>
         </SettingsSection>

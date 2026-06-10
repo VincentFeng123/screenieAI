@@ -13,7 +13,7 @@ use super::types::{
     PlannerHistoryEntry, Rect, ScreenObserver,
 };
 #[cfg(test)]
-use super::types::MenuMatch;
+use super::types::{ChangeWait, MenuMatch, UiChangeSignal};
 use super::vision::{
     click_point_from_rect, coordinate_element, CaptureSize, ObservationMetadata,
     ObservationMetadataProvider, ObservationSource, VisionFallbackContext, VisionFallbackMode,
@@ -55,6 +55,8 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_VISION_FALLBACK_MIN_ELEMENTS: u32 = 3;
 const DEFAULT_VISION_FALLBACK_MIN_WINDOW_AREA_POINTS: f64 = 120_000.0;
 const CLICK_PREFLIGHT_CURSOR_TOLERANCE_POINTS: f64 = 3.0;
+const CLICK_PREFLIGHT_MAX_ATTEMPTS: u32 = 3;
+const CLICK_PREFLIGHT_RETRY_SETTLE_MS: u64 = 150;
 // Confirmation is reserved for genuinely destructive/financial controls.
 // Generic words like "confirm", "approve", "submit", or "discard" used to
 // over-trigger on ordinary dialogs and forms; they are intentionally absent.
@@ -93,7 +95,7 @@ const DEFAULT_EXCLUDED_BUNDLE_IDS: &[&str] = &[
     "com.robinhood.desktop",
     "com.coinbase.coinbase",
 ];
-const MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP: u8 = 4;
+const MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP: u8 = 2;
 const MAX_TARGET_SUMMARY_VALUE_CHARS: usize = 240;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +486,7 @@ pub struct ClickPreflightReport {
     pub actual_point: Option<ClickPoint>,
     pub status: ClickPreflightStatus,
     pub failure_reason: Option<String>,
+    pub failure_kind: Option<ClickPreflightFailureKind>,
 }
 
 impl ClickPreflightReport {
@@ -493,6 +496,7 @@ impl ClickPreflightReport {
             actual_point: Some(actual_point),
             status: ClickPreflightStatus::Passed,
             failure_reason: None,
+            failure_kind: None,
         }
     }
 
@@ -506,6 +510,22 @@ impl ClickPreflightReport {
             actual_point,
             status: ClickPreflightStatus::Failed,
             failure_reason: Some(failure_reason.into()),
+            failure_kind: None,
+        }
+    }
+
+    fn failed_with_kind(
+        expected_point: ClickPoint,
+        actual_point: Option<ClickPoint>,
+        failure_reason: impl Into<String>,
+        failure_kind: ClickPreflightFailureKind,
+    ) -> Self {
+        Self {
+            expected_point,
+            actual_point,
+            status: ClickPreflightStatus::Failed,
+            failure_reason: Some(failure_reason.into()),
+            failure_kind: Some(failure_kind),
         }
     }
 }
@@ -515,6 +535,21 @@ impl ClickPreflightReport {
 pub enum ClickPreflightStatus {
     Passed,
     Failed,
+    /// Hit-testing kept disagreeing while the target kept resolving at
+    /// stable bounds; the click proceeded on coordinates alone.
+    BypassedHitTest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClickPreflightFailureKind {
+    TargetRefresh,
+    MissingPoint,
+    DisallowedSource,
+    CursorMove,
+    CursorMismatch,
+    AxHitTest,
+    BoundsCheck,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1040,6 +1075,15 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
         }
         self.backend()?
             .move_mouse_abs(point)
+            .map_err(ExecutionError::Input)
+    }
+
+    fn reactivate_app(&mut self, app: &str) -> Result<(), ExecutionError> {
+        if self.is_dry_run() {
+            return Ok(());
+        }
+        self.backend()?
+            .activate_app(app)
             .map_err(ExecutionError::Input)
     }
 
@@ -1647,6 +1691,9 @@ where
     let mut force_visual_replan_next: Option<String> = None;
     let wall_clock_budget = Duration::from_millis(options.wall_clock_budget_ms);
     let run_started = Instant::now();
+    // Time spent blocked on the user (confirmations, questions) is excluded
+    // from the wall-clock budget — user think-time is not agent time.
+    let mut user_wait_time = Duration::ZERO;
     let milestones = planner.plan_milestones(&options.goal).await;
     if !milestones.is_empty() {
         eprintln!("[screenie] agent milestones: {milestones:?}");
@@ -1676,7 +1723,7 @@ where
     let mut last_step_clean = true;
 
     'steps: while step_index < step_budget {
-        if run_started.elapsed() >= wall_clock_budget {
+        if run_started.elapsed().saturating_sub(user_wait_time) >= wall_clock_budget {
             terminal_status = Some(AgentRunStatus::MaxStepsReached);
             failure_reason = Some(format!(
                 "time budget ({}s) exhausted after {} step(s)",
@@ -1689,6 +1736,8 @@ where
         // before failing the run. "Keep trying" (or any guidance) resets the
         // loop window but keeps banned actions; anything else stops.
         if let Some(context) = stuck_recovery.pending_question.take() {
+            let focus_before_question = observer.focused_app().ok();
+            let wait_started = Instant::now();
             let outcome = confirmations
                 .request_user_input(
                     AgentQuestionRequest {
@@ -1701,6 +1750,7 @@ where
                     abort,
                 )
                 .await;
+            user_wait_time += wait_started.elapsed();
             match outcome.status {
                 UserAnswerStatus::Answered => {
                     let answer = outcome.answer.unwrap_or_default();
@@ -1710,6 +1760,15 @@ where
                         break;
                     }
                     push_agent_note(&mut notes, &format!("user said: {answer}"));
+                    if let Some(previous) = focus_before_question.as_ref() {
+                        restore_focus_after_dialog(
+                            observer,
+                            &mut executor,
+                            previous,
+                            step_index.saturating_add(1),
+                            Duration::from_millis(options.settle_ms.min(250)),
+                        );
+                    }
                     recent_no_progress.clear();
                     stuck_recovery.notice = Some(format!(
                         "You were stuck ({context}). The user said: \"{answer}\". Previously banned actions stay banned; follow the user's guidance or try a different approach."
@@ -1823,6 +1882,7 @@ where
 
         let known_hints =
             known_hints_line(&hint_store, &focused_before_observation, &options.goal);
+        let banned_summary = stuck_recovery.banned_summary();
         let planner_goal = compose_planner_goal(
             &options.goal,
             &GoalContext {
@@ -1833,11 +1893,14 @@ where
                 page_excerpt: page_excerpt.as_deref(),
                 recovery_notice: stuck_recovery.notice(),
                 known_hints: known_hints.as_deref(),
+                banned_actions: banned_summary.as_deref(),
             },
         );
         let mut planning_history = history.clone();
         let mut duplicate_rejections = 0_u8;
-        let mut milestone_advanced_this_step = false;
+        // A milestone_done claim is held here until the step actually
+        // succeeds; rejected, failed, and NoOp steps cannot advance the plan.
+        let mut pending_milestone_done = false;
         let initial_grounding_mode = if options.grounder_coarse_to_fine {
             GroundingMode::CoarseToFine
         } else {
@@ -1868,9 +1931,14 @@ where
                 false,
             )
         } else {
+            // Rejections within this step are appended directly to the goal
+            // the next attempt sees: recency beats a history entry buried
+            // above the observation block.
+            let mut step_rejection_lines: Vec<String> = Vec::new();
+            let mut attempt_goal = planner_goal.clone();
             loop {
                 let decision = planner
-                    .next_action(&planner_goal, &before, &planning_history)
+                    .next_action(&attempt_goal, &before, &planning_history)
                     .await;
                 decision_followups = decision.followups.clone();
 
@@ -1893,6 +1961,8 @@ where
                                 "your last reply was invalid and nothing was executed: {reason}. Reply with exactly ONE JSON object matching the action schema."
                             ),
                         ));
+                        step_rejection_lines.push(format!("- invalid reply: {reason}"));
+                        attempt_goal = compose_attempt_goal(&planner_goal, &step_rejection_lines);
                         duplicate_rejections = duplicate_rejections.saturating_add(1);
                         continue;
                     }
@@ -1900,19 +1970,6 @@ where
 
                 if let Some(note) = decision.note.as_deref() {
                     push_agent_note(&mut notes, note);
-                }
-                if decision.milestone_done
-                    && !milestone_advanced_this_step
-                    && current_milestone < milestones.len()
-                {
-                    milestone_advanced_this_step = true;
-                    current_milestone += 1;
-                    eprintln!(
-                        "[screenie] agent step {} milestone {}/{} complete",
-                        step_number,
-                        current_milestone,
-                        milestones.len()
-                    );
                 }
                 let decision_expect = decision.expect.clone();
                 let mut action = decision.action.clone();
@@ -2026,8 +2083,10 @@ where
                     action.clone()
                 };
 
-                if let Some(reason) = stuck_recovery
-                    .rejection_for(&normalized_progress_action(&display_action, &prepared))
+                let proposal_key = normalized_progress_action(&display_action, &prepared);
+                let banned_rejection = stuck_recovery.rejection_for(&proposal_key);
+                let was_banned = banned_rejection.is_some();
+                if let Some(reason) = banned_rejection
                     .or_else(|| {
                         planner_action_rejection_reason(
                             &action,
@@ -2046,9 +2105,20 @@ where
                         )
                     })
                 {
-                    if duplicate_rejections >= MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP {
-                        let normalized = normalized_progress_action(&display_action, &prepared);
-                        let stage = stuck_recovery.escalate_rejection(&normalized, &reason);
+                    // Re-proposing an already-banned action escalates after a
+                    // single planner call instead of re-burning the in-step
+                    // rejection cap: the ban list is rendered into the goal,
+                    // so the model already had its warning.
+                    if was_banned
+                        || duplicate_rejections >= MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP
+                    {
+                        let proposal_display =
+                            display_progress_action(&display_action, &prepared);
+                        let stage = stuck_recovery.escalate_rejection(
+                            &proposal_key,
+                            &proposal_display,
+                            &reason,
+                        );
                         let exhausted = stage == StuckRecoveryStage::Exhausted;
                         if stage == StuckRecoveryStage::VisionReplan {
                             force_visual_replan_next = Some("after-rejection-cap".into());
@@ -2060,7 +2130,7 @@ where
                         );
                         } else {
                             eprintln!(
-                            "[screenie] agent step {} rejection cap hit; banning '{normalized}' and escalating recovery stage={stage:?}",
+                            "[screenie] agent step {} rejection cap hit; banning '{proposal_key}' and escalating recovery stage={stage:?}",
                             step_number
                         );
                         }
@@ -2106,6 +2176,7 @@ where
                         "[screenie] agent step {} rejected planner action: {}",
                         step_number, reason
                     );
+                    let proposal_display = display_progress_action(&display_action, &prepared);
                     planning_history.push(PlannerHistoryEntry::new(
                     display_action,
                     planner_reason,
@@ -2113,10 +2184,15 @@ where
                         "rejected without execution: {reason}. Do not repeat this action; choose a different action for the next unfinished step."
                     ),
                 ));
+                    step_rejection_lines.push(format!("- {proposal_display}: {reason}"));
+                    attempt_goal = compose_attempt_goal(&planner_goal, &step_rejection_lines);
                     duplicate_rejections = duplicate_rejections.saturating_add(1);
                     continue;
                 }
 
+                // Only the accepted decision's milestone claim survives;
+                // claims on rejected proposals above never reach this point.
+                pending_milestone_done = decision.milestone_done;
                 break (
                     display_action,
                     planner_reason,
@@ -2214,6 +2290,14 @@ where
                     planner_reason.clone(),
                     result_text,
                 ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
                 commit_step(confirmations, &mut steps, step, step_started);
                 continue 'steps;
             }
@@ -2262,6 +2346,14 @@ where
                     planner_reason.clone(),
                     result_text,
                 ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
                 commit_step(confirmations, &mut steps, step, step_started);
                 continue 'steps;
             }
@@ -2316,6 +2408,7 @@ where
                 // Ask-Everything confirms every action; show exactly what
                 // leaves the machine. Never cached.
                 if options.execution_policy == ExecutionPolicy::AskEverything {
+                    let wait_started = Instant::now();
                     let outcome = confirmations
                         .request_confirmation(
                             AgentConfirmationRequest {
@@ -2330,6 +2423,7 @@ where
                             abort,
                         )
                         .await;
+                    user_wait_time += wait_started.elapsed();
                     step.confirmation = Some(outcome.clone());
                     match outcome.status {
                         ConfirmationStatus::Approved => {}
@@ -2380,6 +2474,14 @@ where
                     planner_reason.clone(),
                     result_text,
                 ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
                 commit_step(confirmations, &mut steps, step, step_started);
                 continue 'steps;
             }
@@ -2391,6 +2493,7 @@ where
                 let result_text = if options.execution_policy.is_dry_run() {
                     "dry-run: ask skipped".to_string()
                 } else {
+                    let wait_started = Instant::now();
                     let outcome = confirmations
                         .request_user_input(
                             AgentQuestionRequest {
@@ -2401,11 +2504,19 @@ where
                             abort,
                         )
                         .await;
+                    user_wait_time += wait_started.elapsed();
                     match outcome.status {
                         UserAnswerStatus::Answered => {
                             let answer = outcome.answer.unwrap_or_default();
                             step.executed = true;
                             push_agent_note(&mut notes, &format!("user said: {answer}"));
+                            restore_focus_after_dialog(
+                                observer,
+                                &mut executor,
+                                &focused_before_observation,
+                                step_number,
+                                Duration::from_millis(options.settle_ms.min(250)),
+                            );
                             format!("user answered: \"{answer}\"")
                         }
                         UserAnswerStatus::Aborted => {
@@ -2426,6 +2537,14 @@ where
                     planner_reason.clone(),
                     result_text,
                 ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
                 commit_step(confirmations, &mut steps, step, step_started);
                 continue 'steps;
             }
@@ -2435,6 +2554,7 @@ where
         let mut action = action;
         let mut prepared = prepared;
         let mut normalized_action = normalized_progress_action(&action, &prepared);
+        let mut action_display = display_progress_action(&action, &prepared);
         let mut max_attempts = max_attempts_for_no_op_retry(&prepared, options.max_action_retries);
         if grounding_plan.is_some()
             && step
@@ -2472,6 +2592,10 @@ where
                     } else {
                         reason
                     };
+                    eprintln!(
+                        "[screenie] agent step {} phase=refresh-before-attempt-failed reason={}",
+                        step_number, note
+                    );
                     step.verification = VerificationReport::skipped_no_change_expected()
                         .with_attempts(attempt.min(u8::MAX as u32) as u8);
                     update_step_target(&mut step, &prepared);
@@ -2491,6 +2615,7 @@ where
                         options.progress_loop_window,
                         options.progress_loop_threshold,
                         &mut force_visual_replan_next,
+                        &action_display,
                     ) {
                         NoProgressOutcome::Exhausted(reason) => {
                             step.failure_reason = Some(reason.clone());
@@ -2618,6 +2743,7 @@ where
                     break 'steps;
                 }
                 SafetyDecision::RequireConfirm => {
+                    let wait_started = Instant::now();
                     let outcome = confirmations
                         .request_confirmation(
                             AgentConfirmationRequest {
@@ -2629,6 +2755,7 @@ where
                             abort,
                         )
                         .await;
+                    user_wait_time += wait_started.elapsed();
                     log_confirmation_outcome(step_number, &outcome);
                     let status = outcome.status;
                     step.confirmation = Some(outcome);
@@ -2637,6 +2764,13 @@ where
                             if let Some(key) = confirmation_key {
                                 approved_confirmations.insert(key);
                             }
+                            restore_focus_after_dialog(
+                                observer,
+                                &mut executor,
+                                &focused_before_execution,
+                                step_number,
+                                Duration::from_millis(options.settle_ms.min(250)),
+                            );
                         }
                         ConfirmationStatus::Aborted => {
                             executor.release_held_inputs();
@@ -2702,6 +2836,10 @@ where
                     } else {
                         reason
                     };
+                    eprintln!(
+                        "[screenie] agent step {} phase=refresh-after-safety-failed reason={}",
+                        step_number, note
+                    );
                     step.verification = VerificationReport::skipped_no_change_expected()
                         .with_attempts(attempt.min(u8::MAX as u32) as u8);
                     update_step_target(&mut step, &prepared);
@@ -2721,6 +2859,7 @@ where
                         options.progress_loop_window,
                         options.progress_loop_threshold,
                         &mut force_visual_replan_next,
+                        &action_display,
                     ) {
                         NoProgressOutcome::Exhausted(reason) => {
                             step.failure_reason = Some(reason.clone());
@@ -2844,14 +2983,16 @@ where
                     &action,
                     prepared.target.as_ref(),
                 );
-                match run_click_preflight(
+                match run_click_preflight_with_retry(
                     &mut executor,
                     observer,
                     calibration_probe,
                     &prepared,
                     options.refresh_move_tolerance_points,
+                    step_number,
+                    Duration::from_millis(options.settle_ms.min(CLICK_PREFLIGHT_RETRY_SETTLE_MS)),
                 ) {
-                    Ok((preflighted, report)) => {
+                    PreflightOutcome::Passed(preflighted, report) => {
                         prepared = preflighted;
                         step.click_preflight = Some(report);
                         update_step_target(&mut step, &prepared);
@@ -2863,7 +3004,20 @@ where
                             prepared.target.as_ref(),
                         );
                     }
-                    Err(report) => {
+                    PreflightOutcome::BypassHitTest(refreshed, report) => {
+                        prepared = refreshed;
+                        step.click_preflight = Some(report);
+                        update_step_target(&mut step, &prepared);
+                        // click_target_preflighted stays false so execution
+                        // takes the move+click path on the refreshed point.
+                        log_agent_phase(
+                            step_number,
+                            "click-preflight-bypass",
+                            &action,
+                            prepared.target.as_ref(),
+                        );
+                    }
+                    PreflightOutcome::Failed(report) => {
                         let note = report.failure_reason.clone().unwrap_or_else(|| {
                             "click preflight failed before execution".to_string()
                         });
@@ -2890,6 +3044,7 @@ where
                             options.progress_loop_window,
                             options.progress_loop_threshold,
                             &mut force_visual_replan_next,
+                            &action_display,
                         ) {
                             NoProgressOutcome::Exhausted(reason) => {
                                 step.failure_reason = Some(reason.clone());
@@ -3027,6 +3182,7 @@ where
                     options.progress_loop_window,
                     options.progress_loop_threshold,
                     &mut force_visual_replan_next,
+                    &action_display,
                 ) {
                     NoProgressOutcome::Exhausted(reason) => {
                         step.failure_reason = Some(reason.clone());
@@ -3066,6 +3222,12 @@ where
                     planner_reason.clone(),
                     result,
                 ));
+                apply_pending_milestone(
+                    &mut pending_milestone_done,
+                    &mut current_milestone,
+                    &milestones,
+                    step_number,
+                );
                 commit_step(confirmations, &mut steps, step, step_started);
                 continue 'steps;
             }
@@ -3091,6 +3253,16 @@ where
                     }
                     report.reason = Some(detail);
                     carried_observation = Some((post, Instant::now()));
+                }
+                if report.status == VerificationStatus::NoOp && step.executed {
+                    if let Some(reason) = type_noop_override(observer, &prepared) {
+                        eprintln!(
+                            "[screenie] agent step {} type-readback-override: {}",
+                            step_number, reason
+                        );
+                        report.status = VerificationStatus::Progressed;
+                        report.reason = Some(reason);
+                    }
                 }
                 report.with_attempts(attempt.min(u8::MAX as u32) as u8)
             } else {
@@ -3127,6 +3299,12 @@ where
                         planner_reason,
                         history_result,
                     ));
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
                     commit_step(confirmations, &mut steps, step, step_started);
                     extend_adaptive_step_budget(
                         adaptive_step_budget,
@@ -3145,6 +3323,12 @@ where
                         planner_reason,
                         history_result,
                     ));
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
                     commit_step(confirmations, &mut steps, step, step_started);
                     continue 'steps;
                 }
@@ -3190,6 +3374,8 @@ where
                                             update_step_target(&mut step, &prepared);
                                             normalized_action =
                                                 normalized_progress_action(&action, &prepared);
+                                            action_display =
+                                                display_progress_action(&action, &prepared);
                                             eprintln!(
                                                 "[screenie] agent step {} no-op after one-pass grounding; retrying with coarse-to-fine",
                                                 step_number
@@ -3248,6 +3434,7 @@ where
                         options.progress_loop_window,
                         options.progress_loop_threshold,
                         &mut force_visual_replan_next,
+                        &action_display,
                     ) {
                         NoProgressOutcome::Exhausted(reason) => {
                             step.failure_reason = Some(reason.clone());
@@ -3451,6 +3638,9 @@ struct GoalContext<'a> {
     /// Previously verified navigation paths for this app that match the
     /// goal; rendered template-driven from the hint cache.
     known_hints: Option<&'a str>,
+    /// Bullet list of currently banned actions; rendered last so the model
+    /// sees it right before acting.
+    banned_actions: Option<&'a str>,
 }
 
 fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
@@ -3515,7 +3705,27 @@ fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
         composed.push_str("\n\nRecovery:\n");
         composed.push_str(notice);
     }
+
+    if let Some(banned) = context.banned_actions {
+        composed.push_str(
+            "\n\nBanned actions — do NOT propose these (each was already tried and failed or was rejected):\n",
+        );
+        composed.push_str(banned);
+        composed.push_str(
+            "\nAny banned action you propose will be rejected without execution and waste a step.",
+        );
+    }
     composed
+}
+
+/// Goal shown to retry attempts within a single step: the base goal plus the
+/// rejections this step has already produced, appended at the end where the
+/// model attends to them.
+fn compose_attempt_goal(planner_goal: &str, rejection_lines: &[String]) -> String {
+    format!(
+        "{planner_goal}\n\nRejected on THIS step (nothing was executed — do NOT repeat):\n{}\nPropose a DIFFERENT action that advances the CURRENT milestone.",
+        rejection_lines.join("\n")
+    )
 }
 
 const MAX_PAGE_EXCERPT_CHARS: usize = 4_000;
@@ -4514,10 +4724,10 @@ fn planner_action_rejection_reason(
                             .into(),
                     );
                 }
-                return Some(
-                    "that text field already contains your text. Do NOT type it again. To submit, emit {\"action\":\"key\",\"combo\":\"Return\"} or click a visible Search/Go/Submit button"
-                        .into(),
-                );
+                return Some(format!(
+                    "that text field already contains your text. Do NOT type it again. {}",
+                    type_submit_hint(target)
+                ));
             }
 
             if !goal_allows_repeated_action(goal) {
@@ -4608,6 +4818,26 @@ fn goal_explicitly_requests_close_or_quit(goal: &str) -> bool {
     lower.contains("close") || lower.contains("quit") || lower.contains("exit")
 }
 
+/// Heuristic for targets where Return-after-typing is the natural submit
+/// (search/address/url fields). In free-form fields (document bodies,
+/// message composers) Return just inserts a newline, so "press Return to
+/// submit" is the wrong advice there.
+fn is_searchish_target(target: &TargetSummary) -> bool {
+    let name = normalize_text_for_match(&target.name);
+    target.role == "AXComboBox"
+        || ["search", "address", "location", "url", "find"]
+            .iter()
+            .any(|kw| name.contains(kw))
+}
+
+fn type_submit_hint(target: &TargetSummary) -> &'static str {
+    if is_searchish_target(target) {
+        "To see results, emit {\"action\":\"key\",\"combo\":\"Return\"} now, or click a visible Search/Go/Submit button"
+    } else {
+        "Continue with the next part of the task instead"
+    }
+}
+
 fn repeated_type_action_reason(
     text: &str,
     target: &TargetSummary,
@@ -4633,11 +4863,25 @@ fn repeated_type_action_reason(
             }
     })?;
 
+    if previous.verification.status == VerificationStatus::NoOp {
+        // The earlier type verified as NoOp: the text demonstrably did NOT
+        // land. Claiming it is "already in" the field would contradict the
+        // verifier and steer the planner toward submitting unverified text.
+        return Some(format!(
+            "typing '{}' into '{}' at step {} had no visible effect; do NOT retype the same text. Try clicking '{}' first to focus it, then type into that id, or move focus with key tab",
+            compact_history_text(text),
+            target.name,
+            previous.step,
+            target.name
+        ));
+    }
+
     Some(format!(
-        "text '{}' is already in '{}' (typed at step {}). Do NOT type it again. To see results, emit {{\"action\":\"key\",\"combo\":\"Return\"}} now, or click a visible Search/Go/Submit button",
+        "text '{}' is already in '{}' (typed at step {}). Do NOT type it again. {}",
         compact_history_text(text),
         target.name,
-        previous.step
+        previous.step,
+        type_submit_hint(target)
     ))
 }
 
@@ -5038,10 +5282,31 @@ enum StuckRecoveryStage {
     Exhausted,
 }
 
+/// A banned action: `key` matches `normalized_progress_action` output (an
+/// opaque signature hash), while `display`/`reason` are rendered into the
+/// planner prompt so the model can actually recognize what is banned.
+#[derive(Clone, Debug)]
+struct BannedAction {
+    key: String,
+    display: String,
+    reason: String,
+}
+
+/// Extra steering when the looping/banned action was typing: generic
+/// "press Return to submit" advice misleads here, because the typing itself
+/// verified as NoOp — there is no typed text to submit.
+fn typing_stuck_hint(normalized_action: &str) -> &'static str {
+    if normalized_action.starts_with("type:") || normalized_action.starts_with("typeFocused:") {
+        " Typing produced NO UI change here. Click the target field, confirm it shows (focused) in the next observation, then type into that id; verify the text landed with readPage — do NOT press Return to 'submit' unverified text."
+    } else {
+        ""
+    }
+}
+
 #[derive(Debug, Default)]
 struct StuckRecovery {
     stage: StuckRecoveryStage,
-    banned_actions: Vec<String>,
+    banned_actions: Vec<BannedAction>,
     notice: Option<String>,
     /// Set when the ladder reaches AskUser; the run loop pops it and blocks
     /// on a question to the user before the next step.
@@ -5063,18 +5328,39 @@ impl StuckRecovery {
         self.notice.as_deref()
     }
 
-    fn ban(&mut self, normalized_action: &str) {
-        if !self
-            .banned_actions
-            .iter()
-            .any(|banned| banned == normalized_action)
-        {
-            self.banned_actions.push(normalized_action.to_string());
+    fn ban(&mut self, key: &str, display: &str, reason: &str) {
+        if !self.banned_actions.iter().any(|banned| banned.key == key) {
+            self.banned_actions.push(BannedAction {
+                key: key.to_string(),
+                display: display.to_string(),
+                reason: reason.to_string(),
+            });
         }
     }
 
-    fn escalate(&mut self, entry: &ProgressLoopEntry, threshold: u32) -> StuckRecoveryStage {
-        self.ban(&entry.normalized_action);
+    /// Bullet list of active bans for the planner prompt, or None when
+    /// nothing is banned.
+    fn banned_summary(&self) -> Option<String> {
+        (!self.banned_actions.is_empty()).then(|| {
+            self.banned_actions
+                .iter()
+                .map(|banned| format!("- {}: {}", banned.display, banned.reason))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
+    fn escalate(
+        &mut self,
+        entry: &ProgressLoopEntry,
+        threshold: u32,
+        display: &str,
+    ) -> StuckRecoveryStage {
+        self.ban(
+            &entry.normalized_action,
+            display,
+            &format!("repeated {threshold} times with no UI change"),
+        );
         self.stage = match self.stage {
             StuckRecoveryStage::Normal => StuckRecoveryStage::StuckNotice,
             StuckRecoveryStage::StuckNotice => StuckRecoveryStage::VisionReplan,
@@ -5086,15 +5372,18 @@ impl StuckRecovery {
         };
         self.notice = match self.stage {
             StuckRecoveryStage::StuckNotice => Some(format!(
-                "STUCK: you repeated '{}' {} times with no UI change. That action is now banned for this task. Choose a DIFFERENT strategy: emit findUi with a short feature query to locate the control, or try a different element id, a keyboard shortcut (key), scroll to reveal new targets, or activateApp.",
-                entry.normalized_action, threshold
+                "STUCK: you repeated '{}' {} times with no UI change. That action is now banned for this task. Choose a DIFFERENT strategy: emit findUi with a short feature query to locate the control, or try a different element id, a keyboard shortcut (key), scroll to reveal new targets, or activateApp.{}",
+                display,
+                threshold,
+                typing_stuck_hint(&entry.normalized_action)
             )),
             StuckRecoveryStage::VisionReplan => Some(format!(
-                "STUCK: '{}' and earlier banned actions keep failing. Re-inspect the fresh observation before acting and pick a target you have not tried yet. If the target may live in a menu or in settings, emit findUi before clicking again.",
-                entry.normalized_action
+                "STUCK: '{}' and earlier banned actions keep failing. Re-inspect the fresh observation before acting and pick a target you have not tried yet. If the target may live in a menu or in settings, emit findUi before clicking again.{}",
+                display,
+                typing_stuck_hint(&entry.normalized_action)
             )),
             StuckRecoveryStage::KeyboardHint => Some(format!(
-                "Mouse actions are not working here. Use the keyboard only: key cmd+l focuses the browser address bar, key tab moves focus, key Return submits, and typeFocused types into whatever is focused.{}",
+                "Mouse actions are not working here. Switch to the keyboard: key tab or shift+tab moves focus between controls; the focused control is marked (focused) in the observation and accepts the type action on its id. Prefer menu or findUi for app commands. key Return only activates the focused control's default action — do not assume it submits anything.{}",
                 if self.web_lookup_available {
                     " If you still cannot find the control, emit webLookup with the feature name before asking the user."
                 } else {
@@ -5113,9 +5402,10 @@ impl StuckRecovery {
     fn escalate_rejection(
         &mut self,
         normalized_action: &str,
+        display: &str,
         rejection_reason: &str,
     ) -> StuckRecoveryStage {
-        self.ban(normalized_action);
+        self.ban(normalized_action, display, rejection_reason);
         self.stage = match self.stage {
             StuckRecoveryStage::Normal => StuckRecoveryStage::StuckNotice,
             StuckRecoveryStage::StuckNotice => StuckRecoveryStage::VisionReplan,
@@ -5127,19 +5417,21 @@ impl StuckRecovery {
         };
         self.notice = match self.stage {
             StuckRecoveryStage::StuckNotice => Some(format!(
-                "STUCK: '{normalized_action}' keeps getting rejected and is now banned for this task. Do exactly this instead: {rejection_reason}. If you cannot locate the control, emit findUi with a feature query."
+                "STUCK: '{display}' keeps getting rejected and is now banned for this task. Do exactly this instead: {rejection_reason}. If you cannot locate the control, emit findUi with a feature query.{}",
+                typing_stuck_hint(normalized_action)
             )),
             StuckRecoveryStage::VisionReplan => Some(format!(
-                "STILL STUCK: re-read the annotated screenshot, then act. The fix is: {rejection_reason}"
+                "STILL STUCK: re-read the annotated screenshot, then act. The fix is: {rejection_reason}{}",
+                typing_stuck_hint(normalized_action)
             )),
             StuckRecoveryStage::KeyboardHint => Some(format!(
-                "Use the keyboard. After typing into a field, emit {{\"action\":\"key\",\"combo\":\"Return\"}} to submit. The fix is: {rejection_reason}"
+                "Try the keyboard instead of repeating the rejected action: key tab moves focus; then type into the element marked (focused). The fix is: {rejection_reason}"
             )),
             _ => None,
         };
         if self.stage == StuckRecoveryStage::AskUser {
             self.pending_question = Some(format!(
-                "'{normalized_action}' keeps being rejected ({rejection_reason})"
+                "'{display}' keeps being rejected ({rejection_reason})"
             ));
         }
         self.stage
@@ -5148,10 +5440,11 @@ impl StuckRecovery {
     fn rejection_for(&self, normalized_action: &str) -> Option<String> {
         self.banned_actions
             .iter()
-            .any(|banned| banned == normalized_action)
-            .then(|| {
+            .find(|banned| banned.key == normalized_action)
+            .map(|banned| {
                 format!(
-                    "action '{normalized_action}' is banned after repeating without UI progress; choose a different element id, key combo, scroll, or activateApp"
+                    "action '{}' is banned after repeating without UI progress; it is listed under 'Banned actions' in your goal — choose a different element id, key combo, scroll, or activateApp",
+                    banned.display
                 )
             })
     }
@@ -5170,13 +5463,14 @@ fn handle_no_progress_entry(
     window: u32,
     threshold: u32,
     force_visual_replan_next: &mut Option<String>,
+    display: &str,
 ) -> NoProgressOutcome {
     let looped = record_no_progress_and_detect_loop(recent, entry.clone(), window, threshold);
     if !looped {
         return NoProgressOutcome::Recorded;
     }
 
-    let stage = recovery.escalate(&entry, threshold);
+    let stage = recovery.escalate(&entry, threshold, display);
     match stage {
         StuckRecoveryStage::StuckNotice | StuckRecoveryStage::KeyboardHint => {
             recent.clear();
@@ -5461,45 +5755,71 @@ where
     C: CalibrationProbe,
 {
     let fallback_point = prepared.click_point.unwrap_or(ClickPoint { x: 0, y: 0 });
-    let refreshed = refresh_prepared_target(observer, prepared, Some(move_tolerance))
-        .map_err(|reason| ClickPreflightReport::failed(fallback_point, None, reason))?;
+    let refreshed = refresh_prepared_target(observer, prepared, Some(move_tolerance)).map_err(
+        |reason| {
+            ClickPreflightReport::failed_with_kind(
+                fallback_point,
+                None,
+                reason,
+                ClickPreflightFailureKind::TargetRefresh,
+            )
+        },
+    )?;
     let expected_point = refreshed.click_point.ok_or_else(|| {
-        ClickPreflightReport::failed(
+        ClickPreflightReport::failed_with_kind(
             fallback_point,
             None,
             "click preflight requires a target point",
+            ClickPreflightFailureKind::MissingPoint,
         )
     })?;
     let target = refreshed.target.as_ref().ok_or_else(|| {
-        ClickPreflightReport::failed(
+        ClickPreflightReport::failed_with_kind(
             expected_point,
             None,
             "click preflight requires a refreshed target",
+            ClickPreflightFailureKind::MissingPoint,
         )
     })?;
 
     if target.source == ElementSource::VisionCoordinate {
-        return Err(ClickPreflightReport::failed(
+        return Err(ClickPreflightReport::failed_with_kind(
             expected_point,
             None,
             "direct vision-coordinate targets are not allowed by strict click preflight",
+            ClickPreflightFailureKind::DisallowedSource,
         ));
     }
 
     let actual_point = executor
         .move_mouse_and_read_location(expected_point)
-        .map_err(|err| ClickPreflightReport::failed(expected_point, None, err.to_string()))?;
+        .map_err(|err| {
+            ClickPreflightReport::failed_with_kind(
+                expected_point,
+                None,
+                err.to_string(),
+                ClickPreflightFailureKind::CursorMove,
+            )
+        })?;
     let distance = click_point_distance(expected_point, actual_point);
     if distance > CLICK_PREFLIGHT_CURSOR_TOLERANCE_POINTS {
-        return Err(ClickPreflightReport::failed(
+        return Err(ClickPreflightReport::failed_with_kind(
             expected_point,
             Some(actual_point),
             format!(
                 "cursor landed {distance:.1} points from expected target center, tolerance is {CLICK_PREFLIGHT_CURSOR_TOLERANCE_POINTS:.1}"
             ),
+            ClickPreflightFailureKind::CursorMismatch,
         ));
     }
 
+    let validation_kind = match target.source {
+        ElementSource::Ax => ClickPreflightFailureKind::AxHitTest,
+        ElementSource::Web | ElementSource::VisionDetected => {
+            ClickPreflightFailureKind::BoundsCheck
+        }
+        ElementSource::VisionCoordinate => ClickPreflightFailureKind::DisallowedSource,
+    };
     match target.source {
         ElementSource::Ax => validate_ax_preflight(calibration_probe, target, actual_point),
         ElementSource::Web => validate_web_preflight(target, actual_point),
@@ -5508,12 +5828,89 @@ where
             Err("direct vision-coordinate targets are not allowed by strict click preflight".into())
         }
     }
-    .map_err(|reason| ClickPreflightReport::failed(expected_point, Some(actual_point), reason))?;
+    .map_err(|reason| {
+        ClickPreflightReport::failed_with_kind(
+            expected_point,
+            Some(actual_point),
+            reason,
+            validation_kind,
+        )
+    })?;
 
     Ok((
         refreshed,
         ClickPreflightReport::passed(expected_point, actual_point),
     ))
+}
+
+enum PreflightOutcome {
+    Passed(PreparedAction, ClickPreflightReport),
+    BypassHitTest(PreparedAction, ClickPreflightReport),
+    Failed(ClickPreflightReport),
+}
+
+/// Run the click preflight up to CLICK_PREFLIGHT_MAX_ATTEMPTS times within
+/// the same step, so a transiently stale tree or lagging cursor warp does not
+/// hand the step back to the planner (a wasted LLM round trip re-proposing
+/// the identical action). When every failure was an AX hit-test disagreement
+/// while the target itself kept resolving at stable bounds, fall back to a
+/// plain coordinate click instead of dead-ending.
+fn run_click_preflight_with_retry<O, F, C>(
+    executor: &mut ActionExecutor<F>,
+    observer: &O,
+    calibration_probe: &C,
+    prepared: &PreparedAction,
+    move_tolerance: f64,
+    step_number: u32,
+    retry_settle: Duration,
+) -> PreflightOutcome
+where
+    O: ScreenObserver,
+    F: InputBackendFactory,
+    C: CalibrationProbe,
+{
+    let mut last_report: Option<ClickPreflightReport> = None;
+    let mut all_ax_hit_test = true;
+    for attempt in 1..=CLICK_PREFLIGHT_MAX_ATTEMPTS {
+        match run_click_preflight(executor, observer, calibration_probe, prepared, move_tolerance)
+        {
+            Ok((preflighted, report)) => {
+                return PreflightOutcome::Passed(preflighted, report);
+            }
+            Err(report) => {
+                eprintln!(
+                    "[screenie] agent step {} phase=click-preflight-failed attempt={}/{} kind={:?} reason={}",
+                    step_number,
+                    attempt,
+                    CLICK_PREFLIGHT_MAX_ATTEMPTS,
+                    report.failure_kind,
+                    report.failure_reason.as_deref().unwrap_or("unknown"),
+                );
+                all_ax_hit_test &=
+                    report.failure_kind == Some(ClickPreflightFailureKind::AxHitTest);
+                last_report = Some(report);
+                if attempt < CLICK_PREFLIGHT_MAX_ATTEMPTS && !retry_settle.is_zero() {
+                    thread::sleep(retry_settle);
+                }
+            }
+        }
+    }
+    let mut report = last_report.unwrap_or_else(|| {
+        ClickPreflightReport::failed(
+            prepared.click_point.unwrap_or(ClickPoint { x: 0, y: 0 }),
+            None,
+            "click preflight failed before execution",
+        )
+    });
+    if all_ax_hit_test {
+        if let Ok(refreshed) = refresh_prepared_target(observer, prepared, Some(move_tolerance)) {
+            if refreshed.click_point.is_some() {
+                report.status = ClickPreflightStatus::BypassedHitTest;
+                return PreflightOutcome::BypassHitTest(refreshed, report);
+            }
+        }
+    }
+    PreflightOutcome::Failed(report)
 }
 
 fn validate_ax_preflight<C: CalibrationProbe>(
@@ -5655,6 +6052,59 @@ fn update_step_target(step: &mut AgentStepReport, prepared: &PreparedAction) {
     step.click_point = prepared.click_point;
 }
 
+/// Short human-readable label for a planned action. The matching key from
+/// `normalized_progress_action` embeds an opaque signature hash the model
+/// cannot act on; prompts (ban lists, stuck notices) render this instead.
+/// Callers must pass the already-redacted action so secure text never leaks.
+fn display_progress_action(action: &Action, prepared: &PreparedAction) -> String {
+    let target_name = prepared
+        .target
+        .as_ref()
+        .map(|target| target.name.trim())
+        .filter(|name| !name.is_empty());
+    let with_target = |verb: &str| match target_name {
+        Some(name) => format!("{verb} '{name}'"),
+        None => verb.to_string(),
+    };
+    match action {
+        Action::Click { .. } | Action::ClickTarget { .. } => with_target("click"),
+        Action::DoubleClick { .. } | Action::DoubleClickTarget { .. } => {
+            with_target("double-click")
+        }
+        Action::RightClick { .. } => with_target("right-click"),
+        Action::Move { .. } => with_target("move to"),
+        Action::Drag { .. } => with_target("drag"),
+        Action::Type { text, .. } | Action::TypeTarget { text, .. } => match target_name {
+            Some(name) => format!("type \"{}\" into '{}'", compact_history_text(text), name),
+            None => format!("type \"{}\"", compact_history_text(text)),
+        },
+        Action::TypeFocused { text } => format!(
+            "type \"{}\" into the focused control",
+            compact_history_text(text)
+        ),
+        Action::Key { combo } => format!("key {}", combo.trim()),
+        Action::Menu { path } => format!("menu {}", path.join(" > ")),
+        Action::Scroll { dx, dy } => format!("scroll by ({dx}, {dy})"),
+        Action::ScrollAt { dx, dy, .. } => match target_name {
+            Some(name) => format!("scroll '{name}' by ({dx}, {dy})"),
+            None => format!("scroll by ({dx}, {dy})"),
+        },
+        Action::ActivateApp { app } => format!("activateApp {}", app.trim()),
+        Action::OpenUrl { url } => format!("openUrl {}", url.trim()),
+        Action::WebSearch { query } => format!("webSearch \"{}\"", compact_history_text(query)),
+        Action::FindUi { query } => format!("findUi \"{}\"", compact_history_text(query)),
+        Action::WebLookup { query } => format!("webLookup \"{}\"", compact_history_text(query)),
+        Action::Ask { question, .. } => format!("ask \"{}\"", compact_history_text(question)),
+        Action::AppleScript { .. } => "run AppleScript".into(),
+        Action::RunShortcut { name, .. } => format!("run shortcut '{}'", name.trim()),
+        Action::MoveToTrash { path } => format!("move '{}' to trash", path.trim()),
+        Action::ReadPage => "readPage".into(),
+        Action::Wait { ms } => format!("wait {ms}ms"),
+        Action::Done => "done".into(),
+        Action::Fail { .. } => "fail".into(),
+    }
+}
+
 fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> String {
     match action {
         Action::ActivateApp { app } => format!("activateApp:{}", app.trim()),
@@ -5745,6 +6195,67 @@ fn record_no_progress_and_detect_loop(
     }
 
     recent.iter().filter(|item| **item == entry).count() as u32 >= threshold
+}
+
+/// Our confirmation/question panels are non-activating, but answering one
+/// can still leave this process frontmost. Re-activate the app the agent was
+/// driving before resuming, otherwise the next refresh/observation runs
+/// against our own UI and the step is wasted on an ActivateApp detour.
+fn restore_focus_after_dialog<O, F>(
+    observer: &O,
+    executor: &mut ActionExecutor<F>,
+    previous: &FocusedApp,
+    step_number: u32,
+    settle: Duration,
+) where
+    O: FocusedAppProvider,
+    F: InputBackendFactory,
+{
+    let own_pid = std::process::id() as i32;
+    if previous.pid == Some(own_pid) || previous.name.trim().is_empty() {
+        return;
+    }
+    let Ok(current) = observer.focused_app() else {
+        return;
+    };
+    if current.pid != Some(own_pid) {
+        return;
+    }
+    eprintln!(
+        "[screenie] agent step {} focus-restore app='{}'",
+        step_number, previous.name
+    );
+    if let Err(err) = executor.reactivate_app(&previous.name) {
+        eprintln!(
+            "[screenie] agent step {} focus-restore failed: {err}",
+            step_number
+        );
+        return;
+    }
+    if !settle.is_zero() {
+        thread::sleep(settle);
+    }
+}
+
+/// Apply a deferred milestone_done claim at a step's success commit point.
+/// Called only where the step verifiably succeeded, so a planner claiming
+/// "milestone complete" on a step that then gets rejected or verifies NoOp
+/// cannot advance the plan.
+fn apply_pending_milestone(
+    pending: &mut bool,
+    current_milestone: &mut usize,
+    milestones: &[String],
+    step_number: u32,
+) {
+    if std::mem::take(pending) && *current_milestone < milestones.len() {
+        *current_milestone += 1;
+        eprintln!(
+            "[screenie] agent step {} milestone {}/{} complete",
+            step_number,
+            current_milestone,
+            milestones.len()
+        );
+    }
 }
 
 fn extend_adaptive_step_budget(
@@ -6030,12 +6541,23 @@ struct StableObservation {
     semantic_hash: String,
 }
 
+/// Settle by re-observing until two consecutive snapshots hash the same.
+/// When the observer offers a UI-change signal, each inter-observation pause
+/// blocks on notification-or-poll-timeout — a change wakes the loop
+/// immediately, while a quiet poll interval confirms stability. Without a
+/// signal (no Accessibility observer, non-mac platform) the pause is a plain
+/// sleep, i.e. the original fixed-interval polling.
 fn observe_until_stable<O: ScreenObserver + ObservationMetadataProvider>(
     observer: &O,
     timeout: Duration,
     poll: Duration,
 ) -> Result<StableObservation, ObservationError> {
-    observe_until_stable_with_sleep(observer, timeout, poll, thread::sleep)
+    match observer.change_signal() {
+        Some(mut signal) => observe_until_stable_with_sleep(observer, timeout, poll, move |interval| {
+            let _ = signal.wait_for_change(interval);
+        }),
+        None => observe_until_stable_with_sleep(observer, timeout, poll, thread::sleep),
+    }
 }
 
 fn observe_until_stable_with_sleep<O, S>(
@@ -6152,13 +6674,60 @@ fn fnv1a_64_hex(value: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// After a Type verifies as NoOp via the state hash, read the target back
+/// directly. Contenteditable-style controls often expose no AX value, so the
+/// hash misses real text changes and the planner spirals on a false
+/// negative. Returns Some(reason) when the type should count as progress.
+fn type_noop_override<O: ScreenObserver>(
+    observer: &O,
+    prepared: &PreparedAction,
+) -> Option<String> {
+    let PreparedKind::Type { .. } = &prepared.kind else {
+        return None;
+    };
+    let element = prepared.target_element.as_ref()?;
+    let refreshed = observer.refresh_element(element)?;
+    if refreshed.value != element.value {
+        return Some(format!(
+            "read-back: value of '{}' changed after typing",
+            refreshed.name
+        ));
+    }
+    if refreshed.selected_text != element.selected_text {
+        return Some(format!(
+            "read-back: selection in '{}' changed after typing",
+            refreshed.name
+        ));
+    }
+    if refreshed.value.is_none() && refreshed.focused {
+        return Some(format!(
+            "typed text was delivered to focused '{}'; this control exposes no readable value, treating as success (weak verification)",
+            refreshed.name
+        ));
+    }
+    None
+}
+
 fn verify_expected_effect<O: ScreenObserver + ObservationMetadataProvider>(
     observer: &O,
     pre_state_hash: &str,
     timeout: Duration,
     poll: Duration,
 ) -> (VerificationReport, Option<StableObservation>) {
-    verify_expected_effect_with_sleep(observer, pre_state_hash, timeout, poll, thread::sleep)
+    match observer.change_signal() {
+        Some(mut signal) => verify_expected_effect_with_sleep(
+            observer,
+            pre_state_hash,
+            timeout,
+            poll,
+            move |interval| {
+                let _ = signal.wait_for_change(interval);
+            },
+        ),
+        None => {
+            verify_expected_effect_with_sleep(observer, pre_state_hash, timeout, poll, thread::sleep)
+        }
+    }
 }
 
 fn verify_expected_effect_with_sleep<O, S>(
@@ -6690,6 +7259,69 @@ mod tests {
         assert_eq!(sleeps.get(), 2);
     }
 
+    struct ScriptedChangeSignal {
+        script: VecDeque<ChangeWait>,
+        recorded: Rc<RefCell<Vec<Duration>>>,
+    }
+
+    impl UiChangeSignal for ScriptedChangeSignal {
+        fn wait_for_change(&mut self, timeout: Duration) -> ChangeWait {
+            self.recorded.borrow_mut().push(timeout);
+            self.script.pop_front().unwrap_or(ChangeWait::TimedOut)
+        }
+    }
+
+    #[test]
+    fn stable_observation_settles_event_driven_when_signal_available() {
+        let first = vec![element(1, "Loading")];
+        let stable = vec![element(2, "Ask")];
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let observer =
+            FakeObserver::new(vec![Ok(first), Ok(stable.clone()), Ok(stable.clone())])
+                .with_change_signals(vec![Box::new(ScriptedChangeSignal {
+                    script: vec![ChangeWait::Notified, ChangeWait::TimedOut].into(),
+                    recorded: Rc::clone(&recorded),
+                })]);
+
+        // Poll is longer than the timeout: the polling fallback would sleep
+        // through the whole budget and time out, so only an event-driven
+        // wait can reach a stable result here.
+        let observed = observe_until_stable(
+            &observer,
+            Duration::from_millis(200),
+            Duration::from_millis(600),
+        )
+        .unwrap();
+
+        assert_eq!(observed.status, SettleStatus::Stable);
+        assert_eq!(observed.semantic_hash, semantic_state_hash(&stable));
+        assert_eq!(*recorded.borrow(), vec![Duration::from_millis(600); 2]);
+    }
+
+    #[test]
+    fn verifier_settles_event_driven_when_signal_available() {
+        let before = vec![element(1, "Ask")];
+        let before_hash = semantic_state_hash(&before);
+        let after = vec![element(2, "Settings")];
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let observer = FakeObserver::new(vec![Ok(after.clone()), Ok(after)])
+            .with_change_signals(vec![Box::new(ScriptedChangeSignal {
+                script: vec![ChangeWait::TimedOut].into(),
+                recorded: Rc::clone(&recorded),
+            })]);
+
+        let (report, post) = verify_expected_effect(
+            &observer,
+            &before_hash,
+            Duration::from_secs(5),
+            Duration::from_millis(600),
+        );
+
+        assert_eq!(report.status, VerificationStatus::Progressed);
+        assert_eq!(recorded.borrow().len(), 1);
+        assert!(post.is_some());
+    }
+
     #[test]
     fn stable_observation_times_out_to_last_successful_snapshot() {
         let last = vec![element(1, "Ask")];
@@ -6868,6 +7500,107 @@ mod tests {
     }
 
     #[test]
+    fn type_noop_override_upgrades_on_value_change() {
+        let field = text_field(7, "Body");
+        let prepared = prepare_action(
+            &Action::Type {
+                id: 7,
+                text: "hello".into(),
+            },
+            &[field.clone()],
+        )
+        .unwrap();
+        let mut refreshed = field;
+        refreshed.value = Some("hello".into());
+        let observer = FakeObserver::new(vec![]).with_refreshes(vec![Some(refreshed)]);
+
+        let reason = type_noop_override(&observer, &prepared).unwrap();
+        assert!(reason.contains("read-back"));
+    }
+
+    #[test]
+    fn type_noop_override_weak_success_for_focused_unreadable_field() {
+        let field = text_field(7, "Message Body");
+        let prepared = prepare_action(
+            &Action::Type {
+                id: 7,
+                text: "hello".into(),
+            },
+            &[field.clone()],
+        )
+        .unwrap();
+        // Refresh returns the same value-less element, still focused.
+        let observer = FakeObserver::new(vec![]).with_refreshes(vec![Some(field)]);
+
+        let reason = type_noop_override(&observer, &prepared).unwrap();
+        assert!(reason.contains("weak verification"));
+    }
+
+    #[test]
+    fn type_noop_override_declines_when_target_not_focused() {
+        let field = text_field(7, "Message Body");
+        let prepared = prepare_action(
+            &Action::Type {
+                id: 7,
+                text: "hello".into(),
+            },
+            &[field.clone()],
+        )
+        .unwrap();
+        let mut refreshed = field;
+        refreshed.focused = false;
+        let observer = FakeObserver::new(vec![]).with_refreshes(vec![Some(refreshed)]);
+
+        assert!(type_noop_override(&observer, &prepared).is_none());
+    }
+
+    #[test]
+    fn type_into_unreadable_field_counts_as_weak_progress() {
+        let field = text_field(7, "Message Body");
+        // Identical pre/post observations hash the same, so the state-hash
+        // verifier alone would report NoOp.
+        let observer = FakeObserver::new(vec![
+            Ok(vec![field.clone()]),
+            Ok(vec![field.clone()]),
+            Ok(vec![field.clone()]),
+        ]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Type {
+                id: 7,
+                text: "hello".into(),
+            }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(report.steps[0].executed);
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::Progressed
+        );
+        assert!(report.steps[0]
+            .verification
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("weak verification"));
+    }
+
+    #[test]
     fn click_preflight_moves_reads_cursor_then_clicks_after_validation() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let clicks = Rc::new(Cell::new(0));
@@ -6939,18 +7672,26 @@ mod tests {
 
         assert_eq!(clicks.get(), 0);
         assert!(!report.steps[0].executed);
+        let preflight = report.steps[0].click_preflight.as_ref().unwrap();
+        assert_eq!(preflight.status, ClickPreflightStatus::Failed);
         assert_eq!(
-            report.steps[0].click_preflight.as_ref().unwrap().status,
-            ClickPreflightStatus::Failed
+            preflight.failure_kind,
+            Some(ClickPreflightFailureKind::CursorMismatch)
         );
         assert!(report.steps[0]
             .failure_reason
             .as_deref()
             .unwrap_or("")
             .contains("cursor landed"));
+        // One move+read per preflight attempt; a permanent cursor mismatch
+        // exhausts all attempts and never bypasses.
         assert_eq!(
             *events.borrow(),
             vec![
+                RecordedInput::Move(ClickPoint { x: 50, y: 22 }),
+                RecordedInput::MouseLocation,
+                RecordedInput::Move(ClickPoint { x: 50, y: 22 }),
+                RecordedInput::MouseLocation,
                 RecordedInput::Move(ClickPoint { x: 50, y: 22 }),
                 RecordedInput::MouseLocation,
             ]
@@ -6958,7 +7699,7 @@ mod tests {
     }
 
     #[test]
-    fn ax_hit_test_mismatch_prevents_click() {
+    fn persistent_ax_hit_test_failure_falls_back_to_coordinate_click() {
         let clicks = Rc::new(Cell::new(0));
         let target = element(1, "Ask");
         let wrong_hit = element_with_bounds(
@@ -6994,13 +7735,67 @@ mod tests {
             &AgentAbortState::default(),
         ));
 
-        assert_eq!(clicks.get(), 0);
-        assert!(!report.steps[0].executed);
-        assert!(report.steps[0]
-            .failure_reason
-            .as_deref()
-            .unwrap_or("")
-            .contains("AX hit-test landed"));
+        // The hit-test disagreed on every attempt while the target kept
+        // resolving at stable bounds, so the click proceeds on coordinates.
+        assert_eq!(clicks.get(), 1);
+        assert!(report.steps[0].executed);
+        let preflight = report.steps[0].click_preflight.as_ref().unwrap();
+        assert_eq!(preflight.status, ClickPreflightStatus::BypassedHitTest);
+        assert_eq!(
+            preflight.failure_kind,
+            Some(ClickPreflightFailureKind::AxHitTest)
+        );
+    }
+
+    #[test]
+    fn ax_hit_test_recovers_within_step_after_transient_miss() {
+        let clicks = Rc::new(Cell::new(0));
+        let target = element(1, "Ask");
+        let wrong_hit = element_with_bounds(
+            99,
+            "Other",
+            Rect {
+                x: 200.0,
+                y: 200.0,
+                width: 80.0,
+                height: 24.0,
+            },
+        );
+        let observer = FakeObserver::new(vec![Ok(vec![target.clone()])]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            PreflightFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+                clicks: clicks.clone(),
+                location_offset: ClickPoint { x: 0, y: 0 },
+            },
+            &FakeCalibrationProbe::hit_sequence(vec![
+                Some(TargetSummary::from(&wrong_hit)),
+                Some(TargetSummary::from(&target)),
+            ]),
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        // A transient hit-test miss retries within the same step instead of
+        // handing the step back to the planner.
+        assert_eq!(clicks.get(), 1);
+        assert_eq!(report.steps.len(), 1);
+        assert!(report.steps[0].executed);
+        assert_eq!(
+            report.steps[0].click_preflight.as_ref().unwrap().status,
+            ClickPreflightStatus::Passed
+        );
     }
 
     #[test]
@@ -7054,9 +7849,13 @@ mod tests {
     fn visual_target_disappearing_before_preflight_prevents_click() {
         let clicks = Rc::new(Cell::new(0));
         let visual = vision_detected_element(4);
+        // Two refreshes succeed (attempt loop + after-safety), then the
+        // target stays gone for every in-step preflight retry.
         let observer = FakeObserver::new(vec![Ok(vec![visual.clone()])]).with_refreshes(vec![
             Some(visual.clone()),
             Some(visual.clone()),
+            None,
+            None,
             None,
         ]);
         let report = block_on(run_stub_agent_loop(
@@ -7632,6 +8431,89 @@ mod tests {
         assert!(reason.contains("open a new tab first"));
     }
 
+    fn typed_step(
+        step: u32,
+        target: &Element,
+        text: &str,
+        verification: VerificationReport,
+    ) -> AgentStepReport {
+        AgentStepReport {
+            step,
+            action: Action::Type {
+                id: target.id,
+                text: text.into(),
+            },
+            planner_reason: Some("type text".into()),
+            target: Some(TargetSummary::from(target)),
+            click_point: Some(ClickPoint { x: 50, y: 22 }),
+            click_preflight: None,
+            execution_policy: ExecutionPolicy::Auto,
+            executed: true,
+            mechanism: None,
+            duration_ms: None,
+            safety_gate: None,
+            confirmation: None,
+            verification,
+            settle_status: SettleStatus::Stable,
+            calibration: None,
+            observation_source: ObservationSource::Ax,
+            vision_candidate_count: None,
+            vision_trigger_reason: None,
+            vision_capture_size: None,
+            vision_detector_kind: None,
+            grounding: None,
+            failure_reason: None,
+        }
+    }
+
+    #[test]
+    fn repeated_type_after_noop_reports_no_effect_instead_of_submit_advice() {
+        let field = text_field(7, "Message Body");
+        let steps = vec![typed_step(3, &field, "hello", VerificationReport::no_op(1))];
+
+        let reason =
+            repeated_type_action_reason("hello", &TargetSummary::from(&field), &steps).unwrap();
+
+        assert!(reason.contains("had no visible effect"));
+        assert!(!reason.contains("Search/Go/Submit"));
+        assert!(!reason.contains("already in"));
+    }
+
+    #[test]
+    fn repeated_type_into_plain_field_omits_search_submit_boilerplate() {
+        let field = text_field(7, "Message Body");
+        let steps = vec![typed_step(
+            3,
+            &field,
+            "hello",
+            VerificationReport::progressed(1),
+        )];
+
+        let reason =
+            repeated_type_action_reason("hello", &TargetSummary::from(&field), &steps).unwrap();
+
+        assert!(reason.contains("already in"));
+        assert!(reason.contains("Continue with the next part of the task"));
+        assert!(!reason.contains("Search/Go/Submit"));
+    }
+
+    #[test]
+    fn repeated_type_into_search_field_keeps_submit_advice() {
+        let field = text_field(7, "Search");
+        let steps = vec![typed_step(
+            3,
+            &field,
+            "hello",
+            VerificationReport::progressed(1),
+        )];
+
+        let reason =
+            repeated_type_action_reason("hello", &TargetSummary::from(&field), &steps).unwrap();
+
+        assert!(reason.contains("already in"));
+        assert!(reason.contains("Search/Go/Submit"));
+    }
+
     #[test]
     fn typing_url_over_stale_address_bar_suggests_open_url() {
         assert!(text_is_bare_url_or_domain("amazon.com"));
@@ -7690,8 +8572,12 @@ mod tests {
             planner_action_rejection_reason(&action, &prepared, &[field], &steps, "text mom hi")
                 .unwrap();
 
-        assert!(reason.contains("already in"));
-        assert!(reason.contains("Return"));
+        // The earlier type verified NoOp, so the guard must NOT claim the
+        // text landed (or advise submitting it with Return).
+        assert!(reason.contains("had no visible effect"));
+        assert!(reason.contains("do NOT retype"));
+        assert!(!reason.contains("already in"));
+        assert!(!reason.contains("Return"));
     }
 
     #[test]
@@ -7879,6 +8765,15 @@ mod tests {
             .borrow()
             .iter()
             .any(|goal| goal.contains("Recovery:") && goal.contains("STUCK")));
+        // Once banned, the action is listed in every subsequent goal in
+        // human-readable form...
+        assert!(goals.borrow().iter().any(|goal| {
+            goal.contains("Banned actions — do NOT propose these")
+                && goal.contains("scroll by (0, 300)")
+        }));
+        // ...and each banned re-proposal escalates after a single planner
+        // call instead of re-burning the in-step rejection cap.
+        assert!(goals.borrow().len() <= report.steps.len() + 1);
     }
 
     #[test]
@@ -7890,7 +8785,7 @@ mod tests {
         };
 
         assert_eq!(
-            recovery.escalate(&entry, 3),
+            recovery.escalate(&entry, 3, "click 'Ask'"),
             StuckRecoveryStage::StuckNotice
         );
         assert!(recovery.notice().unwrap().contains("STUCK"));
@@ -7898,16 +8793,22 @@ mod tests {
         assert!(recovery.rejection_for("click:other").is_none());
 
         assert_eq!(
-            recovery.escalate(&entry, 3),
+            recovery.escalate(&entry, 3, "click 'Ask'"),
             StuckRecoveryStage::VisionReplan
         );
         assert_eq!(
-            recovery.escalate(&entry, 3),
+            recovery.escalate(&entry, 3, "click 'Ask'"),
             StuckRecoveryStage::KeyboardHint
         );
         assert!(recovery.notice().unwrap().contains("keyboard"));
-        assert_eq!(recovery.escalate(&entry, 3), StuckRecoveryStage::AskUser);
-        assert_eq!(recovery.escalate(&entry, 3), StuckRecoveryStage::Exhausted);
+        assert_eq!(
+            recovery.escalate(&entry, 3, "click 'Ask'"),
+            StuckRecoveryStage::AskUser
+        );
+        assert_eq!(
+            recovery.escalate(&entry, 3, "click 'Ask'"),
+            StuckRecoveryStage::Exhausted
+        );
 
         recovery.on_progress();
         assert_eq!(recovery.stage, StuckRecoveryStage::Normal);
@@ -7924,11 +8825,11 @@ mod tests {
         };
 
         let mut without_lookup = StuckRecovery::default();
-        without_lookup.escalate(&entry, 3);
+        without_lookup.escalate(&entry, 3, "click 'Ask'");
         assert!(without_lookup.notice().unwrap().contains("emit findUi"));
-        without_lookup.escalate(&entry, 3);
+        without_lookup.escalate(&entry, 3, "click 'Ask'");
         assert!(without_lookup.notice().unwrap().contains("findUi"));
-        without_lookup.escalate(&entry, 3);
+        without_lookup.escalate(&entry, 3, "click 'Ask'");
         let keyboard = without_lookup.notice().unwrap();
         assert!(keyboard.contains("keyboard"));
         assert!(!keyboard.contains("webLookup"));
@@ -7937,23 +8838,52 @@ mod tests {
             web_lookup_available: true,
             ..StuckRecovery::default()
         };
-        with_lookup.escalate(&entry, 3);
-        with_lookup.escalate(&entry, 3);
-        with_lookup.escalate(&entry, 3);
+        with_lookup.escalate(&entry, 3, "click 'Ask'");
+        with_lookup.escalate(&entry, 3, "click 'Ask'");
+        with_lookup.escalate(&entry, 3, "click 'Ask'");
         assert!(with_lookup.notice().unwrap().contains("emit webLookup"));
 
         let mut rejection = StuckRecovery::default();
-        rejection.escalate_rejection("type:abc", "emit key Return to submit");
+        rejection.escalate_rejection(
+            "type:abc",
+            "type \"hi\" into 'Search'",
+            "emit key Return to submit",
+        );
         assert!(rejection.notice().unwrap().contains("emit findUi"));
+    }
+
+    #[test]
+    fn typing_stuck_notices_steer_away_from_blind_return() {
+        let type_entry = ProgressLoopEntry {
+            pre_state_hash: "hash".into(),
+            normalized_action: "type:abc".into(),
+        };
+        let mut recovery = StuckRecovery::default();
+        recovery.escalate(&type_entry, 3, "type \"hi\" into 'Body'");
+        let notice = recovery.notice().unwrap();
+        assert!(notice.contains("Typing produced NO UI change"));
+        assert!(notice.contains("readPage"));
+
+        let click_entry = ProgressLoopEntry {
+            pre_state_hash: "hash".into(),
+            normalized_action: "click:abc".into(),
+        };
+        let mut click_recovery = StuckRecovery::default();
+        click_recovery.escalate(&click_entry, 3, "click 'Send'");
+        assert!(!click_recovery
+            .notice()
+            .unwrap()
+            .contains("Typing produced"));
     }
 
     #[test]
     fn rejection_escalation_bans_action_and_walks_ladder_before_exhausting() {
         let mut recovery = StuckRecovery::default();
+        let display = "type \"hi\" into 'Search'";
         let hint = "emit key Return to submit";
 
         assert_eq!(
-            recovery.escalate_rejection("type:abc", hint),
+            recovery.escalate_rejection("type:abc", display, hint),
             StuckRecoveryStage::StuckNotice
         );
         // The repeated action is banned and the concrete hint is surfaced.
@@ -7961,25 +8891,21 @@ mod tests {
         assert!(recovery.notice().unwrap().contains("Return"));
 
         assert_eq!(
-            recovery.escalate_rejection("type:abc", hint),
+            recovery.escalate_rejection("type:abc", display, hint),
             StuckRecoveryStage::VisionReplan
         );
         assert_eq!(
-            recovery.escalate_rejection("type:abc", hint),
+            recovery.escalate_rejection("type:abc", display, hint),
             StuckRecoveryStage::KeyboardHint
         );
         // The last stop before exhaustion queues a question for the user.
         assert_eq!(
-            recovery.escalate_rejection("type:abc", hint),
+            recovery.escalate_rejection("type:abc", display, hint),
             StuckRecoveryStage::AskUser
         );
-        assert!(recovery
-            .pending_question
-            .as_deref()
-            .unwrap()
-            .contains("type:abc"));
+        assert!(recovery.pending_question.as_deref().unwrap().contains(display));
         assert_eq!(
-            recovery.escalate_rejection("type:abc", hint),
+            recovery.escalate_rejection("type:abc", display, hint),
             StuckRecoveryStage::Exhausted
         );
 
@@ -7999,7 +8925,15 @@ mod tests {
         let feed = |recent: &mut VecDeque<ProgressLoopEntry>,
                     recovery: &mut StuckRecovery,
                     force_replan: &mut Option<String>| {
-            handle_no_progress_entry(recent, recovery, entry.clone(), 8, 3, force_replan)
+            handle_no_progress_entry(
+                recent,
+                recovery,
+                entry.clone(),
+                8,
+                3,
+                force_replan,
+                "click 'Ask'",
+            )
         };
 
         let expected_stages = [
@@ -8137,6 +9071,9 @@ mod tests {
                 known_hints: Some(
                     "Known paths in this app (learned earlier; verify on screen): web inspector = menu Develop > Show Web Inspector (verified today)",
                 ),
+                banned_actions: Some(
+                    "- click 'Send': repeated 3 times with no UI change",
+                ),
             },
         );
 
@@ -8150,6 +9087,8 @@ mod tests {
         assert!(goal.contains("Page text"));
         assert!(goal.contains("Mac mini M2 $429 at B&H"));
         assert!(goal.contains("Recovery:\nSTUCK: stop clicking that"));
+        assert!(goal.contains("Banned actions — do NOT propose these"));
+        assert!(goal.contains("- click 'Send': repeated 3 times with no UI change"));
 
         let bare = compose_planner_goal(
             "find a fairly priced mac mini",
@@ -8161,6 +9100,7 @@ mod tests {
                 page_excerpt: None,
                 recovery_notice: None,
                 known_hints: None,
+                banned_actions: None,
             },
         );
         assert!(!bare.contains("Plan:"));
@@ -8168,6 +9108,83 @@ mod tests {
         assert!(!bare.contains("Page text"));
         assert!(!bare.contains("Recovery:"));
         assert!(!bare.contains("Known paths"));
+        assert!(!bare.contains("Banned actions"));
+    }
+
+    #[test]
+    fn milestone_claim_on_noop_step_does_not_advance_plan() {
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        // Identical observations: every click verifies NoOp, so the claimed
+        // milestone must never land.
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+        let _report = block_on(run_stub_agent_loop(
+            &observer,
+            &MilestoneClaimingPlanner {
+                action: Action::Click { id: 1 },
+                goals: goals.clone(),
+            },
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(2),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(goals.borrow().iter().all(|goal| !goal.contains("[done]")));
+        assert!(goals
+            .borrow()
+            .iter()
+            .all(|goal| goal.contains("1. [CURRENT] first milestone")));
+    }
+
+    #[test]
+    fn milestone_claim_on_progressed_step_advances_plan() {
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        // The observation changes after the click, so step 1 progresses and
+        // its milestone claim lands before step 2's goal is composed.
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(2, "Other")]),
+            Ok(vec![element(2, "Other")]),
+        ]);
+        let _report = block_on(run_stub_agent_loop(
+            &observer,
+            &MilestoneClaimingPlanner {
+                action: Action::Click { id: 1 },
+                goals: goals.clone(),
+            },
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(2),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(goals
+            .borrow()
+            .last()
+            .is_some_and(|goal| goal.contains("1. [done] first milestone")
+                && goal.contains("2. [CURRENT] second milestone")));
     }
 
     #[test]
@@ -8199,6 +9216,126 @@ mod tests {
             .unwrap_or("")
             .contains("time budget"));
         assert!(report.steps.len() < 50);
+    }
+
+    #[test]
+    fn wall_clock_budget_excludes_user_confirmation_wait() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }).with_fallback(Action::Done),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::AskEverything),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                wall_clock_budget_ms: Some(200),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+            },
+            &NoCalibrationProbe,
+            &SlowApprovingRequester {
+                delay: Duration::from_millis(300),
+            },
+            &AgentAbortState::default(),
+        ));
+
+        // The 300 ms spent waiting on the user exceeds the entire 200 ms
+        // budget; only agent time may count against the wall clock.
+        assert!(!report
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("time budget"));
+        assert_eq!(report.status, AgentRunStatus::Done);
+    }
+
+    #[test]
+    fn confirmation_approval_restores_focus_to_driven_app() {
+        let own_app = FocusedApp {
+            bundle_id: Some("com.screenieai.app".into()),
+            name: "screenieai".into(),
+            pid: Some(std::process::id() as i32),
+        };
+        let other = focused_app("com.example.app", "Example");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        // Third focused-app read is the post-confirmation check: our own
+        // process became frontmost while the user answered the dialog.
+        let observer = FakeObserver::with_apps(
+            vec![Ok(vec![element(1, "Ask")]); 6],
+            vec![Ok(other.clone()), Ok(other), Ok(own_app)],
+        );
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::AskEverything),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &FakeConfirmationRequester::single(ConfirmationStatus::Approved),
+            &AgentAbortState::default(),
+        ));
+
+        assert!(report.steps[0].executed);
+        let events = events.borrow();
+        let activate_pos = events
+            .iter()
+            .position(|event| matches!(event, RecordedInput::ActivateApp(app) if app == "Example"));
+        let move_pos = events
+            .iter()
+            .position(|event| matches!(event, RecordedInput::Move(_)));
+        assert!(activate_pos.is_some(), "expected a focus-restore activation");
+        assert!(
+            activate_pos.unwrap() < move_pos.unwrap(),
+            "focus restore must happen before the approved click"
+        );
+    }
+
+    #[test]
+    fn no_focus_restore_when_target_app_kept_focus() {
+        let other = focused_app("com.example.app", "Example");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observer = FakeObserver::with_apps(
+            vec![Ok(vec![element(1, "Ask")]); 6],
+            vec![Ok(other.clone()), Ok(other.clone()), Ok(other)],
+        );
+        let _report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::AskEverything),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &FakeConfirmationRequester::single(ConfirmationStatus::Approved),
+            &AgentAbortState::default(),
+        ));
+
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, RecordedInput::ActivateApp(_))));
     }
 
     #[test]
@@ -10593,6 +11730,97 @@ mod tests {
     }
 
     #[test]
+    fn three_field_form_fill_batches_on_one_model_call() {
+        let planner_calls = Rc::new(Cell::new(0));
+        let planner = BatchingPlanner {
+            primary: Action::Type {
+                id: 3,
+                text: "ana@example.com".into(),
+            },
+            followups: vec![
+                Action::Type {
+                    id: 5,
+                    text: "Quarterly report".into(),
+                },
+                Action::Type {
+                    id: 7,
+                    text: "Draft attached.".into(),
+                },
+            ],
+            calls: planner_calls.clone(),
+        };
+        let to = text_field(3, "To");
+        let subject = text_field(5, "Subject");
+        let body = text_field(7, "Body");
+        let mut to_filled = to.clone();
+        to_filled.value = Some("ana@example.com".into());
+        to_filled.refresh_signature();
+        let mut subject_filled = subject.clone();
+        subject_filled.value = Some("Quarterly report".into());
+        subject_filled.refresh_signature();
+        let mut body_filled = body.clone();
+        body_filled.value = Some("Draft attached.".into());
+        body_filled.refresh_signature();
+        let observer = FakeObserver::new(vec![
+            Ok(vec![to.clone(), subject.clone(), body.clone()]),
+            Ok(vec![to_filled.clone(), subject.clone(), body.clone()]),
+            Ok(vec![to_filled.clone(), subject_filled.clone(), body.clone()]),
+            Ok(vec![
+                to_filled.clone(),
+                subject_filled.clone(),
+                body_filled.clone(),
+            ]),
+            Ok(vec![
+                to_filled.clone(),
+                subject_filled.clone(),
+                body_filled.clone(),
+            ]),
+            Ok(vec![to_filled, subject_filled, body_filled]),
+        ])
+        .with_set_values(vec![Ok(true), Ok(true), Ok(true)]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(5),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(
+            planner_calls.get(),
+            2,
+            "all three field fills ride on one decision; only Done needs another"
+        );
+        assert_eq!(report.steps.len(), 4);
+        assert!(report.steps[1]
+            .planner_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("batched:"));
+        assert!(report.steps[2]
+            .planner_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("batched:"));
+        for step in &report.steps[..3] {
+            assert_eq!(step.verification.status, VerificationStatus::Progressed);
+        }
+    }
+
+    #[test]
     fn batch_drains_when_a_step_does_not_verify() {
         let planner_calls = Rc::new(Cell::new(0));
         let planner = BatchingPlanner {
@@ -10932,6 +12160,7 @@ mod tests {
         menu_results: RefCell<VecDeque<Result<MenuPressOutcome, String>>>,
         menu_paths: Rc<RefCell<Vec<Vec<String>>>>,
         menu_tree_paths: RefCell<Vec<Vec<String>>>,
+        change_signals: RefCell<VecDeque<Box<dyn UiChangeSignal>>>,
     }
 
     impl FakeObserver {
@@ -10958,7 +12187,13 @@ mod tests {
                 menu_results: RefCell::new(VecDeque::new()),
                 menu_paths: Rc::new(RefCell::new(Vec::new())),
                 menu_tree_paths: RefCell::new(Vec::new()),
+                change_signals: RefCell::new(VecDeque::new()),
             }
+        }
+
+        fn with_change_signals(self, signals: Vec<Box<dyn UiChangeSignal>>) -> Self {
+            *self.change_signals.borrow_mut() = signals.into();
+            self
         }
 
         fn with_refreshes(mut self, refreshes: Vec<Option<Element>>) -> Self {
@@ -11028,6 +12263,10 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or_else(|| Err("page reading is not supported by this observer".into()))
+        }
+
+        fn change_signal(&self) -> Option<Box<dyn UiChangeSignal>> {
+            self.change_signals.borrow_mut().pop_front()
         }
 
         fn refresh_element(&self, el: &Element) -> Option<Element> {
@@ -11180,6 +12419,30 @@ mod tests {
         goals: Rc<RefCell<Vec<String>>>,
     }
 
+    /// Claims `milestone_done` on every decision while recording the goals it
+    /// is shown — the lens for asserting when milestone claims actually land.
+    struct MilestoneClaimingPlanner {
+        action: Action,
+        goals: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for MilestoneClaimingPlanner {
+        async fn next_action(
+            &self,
+            goal: &str,
+            _obs: &[Element],
+            _history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            self.goals.borrow_mut().push(goal.to_string());
+            PlannerDecision::new("claim milestone", self.action.clone()).with_milestone_done(true)
+        }
+
+        async fn plan_milestones(&self, _goal: &str) -> Vec<String> {
+            vec!["first milestone".into(), "second milestone".into()]
+        }
+    }
+
     /// Plays a fixed action sequence while capturing every history result it
     /// is shown — the lens for asserting what feedback the planner receives.
     struct HistoryRecordingActionPlanner {
@@ -11299,6 +12562,28 @@ mod tests {
         }
     }
 
+    /// Approves every confirmation after a real-time delay — simulates the
+    /// user thinking before clicking Approve.
+    struct SlowApprovingRequester {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ConfirmationRequester for SlowApprovingRequester {
+        async fn request_confirmation(
+            &self,
+            _request: AgentConfirmationRequest,
+            _timeout: Duration,
+            _abort: &AgentAbortState,
+        ) -> ConfirmationOutcome {
+            thread::sleep(self.delay);
+            ConfirmationOutcome {
+                request_id: Some("slow-fake".into()),
+                status: ConfirmationStatus::Approved,
+            }
+        }
+    }
+
     struct FakeConfirmationRequester {
         outcomes: RefCell<VecDeque<ConfirmationStatus>>,
         calls: Rc<Cell<u32>>,
@@ -11374,14 +12659,21 @@ mod tests {
     }
 
     struct FakeCalibrationProbe {
-        hit: Option<TargetSummary>,
+        hits: RefCell<VecDeque<Option<TargetSummary>>>,
         available: bool,
     }
 
     impl FakeCalibrationProbe {
         fn hit(hit: TargetSummary) -> Self {
             Self {
-                hit: Some(hit),
+                hits: RefCell::new(VecDeque::from(vec![Some(hit)])),
+                available: true,
+            }
+        }
+
+        fn hit_sequence(hits: Vec<Option<TargetSummary>>) -> Self {
+            Self {
+                hits: RefCell::new(VecDeque::from(hits)),
                 available: true,
             }
         }
@@ -11389,7 +12681,11 @@ mod tests {
 
     impl CalibrationProbe for FakeCalibrationProbe {
         fn hit_test(&self, _point: ClickPoint) -> Result<Option<TargetSummary>, String> {
-            Ok(self.hit.clone())
+            let mut hits = self.hits.borrow_mut();
+            if hits.len() > 1 {
+                return Ok(hits.pop_front().flatten());
+            }
+            Ok(hits.front().cloned().flatten())
         }
 
         fn hit_test_available(&self) -> bool {

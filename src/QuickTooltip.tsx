@@ -55,6 +55,11 @@ import { SvgInsetBorder } from "./components/Frosted";
 import CustomDropdown, {
   type CustomDropdownOption,
 } from "./components/CustomDropdown";
+import { useVoiceSession } from "./voice/useVoiceSession";
+import VoiceMicButton, { type VoiceMicState } from "./voice/VoiceMicButton";
+import VoiceLevelMeter from "./voice/VoiceLevelMeter";
+import VoiceTranscriptFeed from "./voice/VoiceTranscriptFeed";
+import VoiceModelDownloadCard from "./voice/VoiceModelDownloadCard";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -191,6 +196,9 @@ const QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR =
   ".quick-tooltip-error, .quick-tooltip-confirmation, .quick-tooltip-question, .quick-tooltip-agent-progress";
 const QUICK_TOOLTIP_STATUS_MIN_HEIGHT = 82;
 const QUICK_TOOLTIP_STATUS_MAX_HEIGHT = 420;
+// Must match QUICK_TOOLTIP_AGENT_CARD_H / _MAX_H in src-tauri/src/lib.rs.
+const QUICK_TOOLTIP_AGENT_CARD_MIN_HEIGHT = 88;
+const QUICK_TOOLTIP_AGENT_CARD_MAX_HEIGHT = 300;
 
 const QUICK_TOOLTIP_DRAG_BLOCKERS =
   'button, input, textarea, select, a, [role="button"], [role="listbox"], .screenie-select, .screenie-select-menu-portal, .quick-tooltip-agent-card';
@@ -473,9 +481,33 @@ export default function QuickTooltip() {
   const agentInputRef = useRef<HTMLInputElement>(null);
   const statusCardRef = useRef<HTMLElement>(null);
   const agentInputOpenRef = useRef(false);
+  const agentFormRef = useRef<HTMLDivElement>(null);
   const [statusHeight, setStatusHeight] = useState(
     QUICK_TOOLTIP_STATUS_MIN_HEIGHT,
   );
+  const [agentCardHeight, setAgentCardHeight] = useState(
+    QUICK_TOOLTIP_AGENT_CARD_MIN_HEIGHT,
+  );
+  const voice = useVoiceSession({
+    getStartArgs: () => {
+      const info = readProviderInfo();
+      return {
+        provider: info.provider,
+        model: info.model,
+        visionProvider: info.provider,
+        visionModel: info.model,
+        autonomy: readAgentAutonomy(),
+        scriptingEnabled: readAgentScriptingEnabled(),
+        webLookupEnabled: readAgentWebLookupEnabled(),
+      };
+    },
+  });
+  // Refs for the mount-once listeners and DOM handlers that must observe
+  // the live voice state without re-registering.
+  const voiceActiveRef = useRef(false);
+  voiceActiveRef.current = voice.active;
+  const voiceBusyRef = useRef(false);
+  voiceBusyRef.current = voice.busy;
   const modelOptions = useMemo(
     () => modelOptionsForProvider(providerInfo.provider, providerInfo.model),
     [providerInfo.provider, providerInfo.model],
@@ -486,14 +518,24 @@ export default function QuickTooltip() {
   );
   const hasStatus = Boolean(error || confirmation || question || agentRunning);
   const chatVisible = expanded && !hasStatus;
+  const voiceMicState: VoiceMicState = voice.micDenied
+    ? "denied"
+    : voice.modelMissing
+      ? "model-missing"
+      : voice.status === "transcribing"
+        ? "transcribing"
+        : voice.status === "listening"
+          ? "listening"
+          : "idle";
   const canStartNewChat =
     messages.length > 0 || prompt.trim().length > 0 || streaming !== null || error !== null;
   const rootStyle = useMemo(
     () =>
       ({
         "--quick-tooltip-status-h": `${Math.round(statusHeight)}px`,
+        "--quick-tooltip-agent-card-h": `${Math.round(agentCardHeight)}px`,
       }) as CSSProperties,
-    [statusHeight],
+    [statusHeight, agentCardHeight],
   );
 
   useQuickTooltipFrostRegions(true);
@@ -595,8 +637,14 @@ export default function QuickTooltip() {
         const status = event.payload?.status;
         const failure = event.payload?.failureReason?.trim();
         if ((status === "failed" || status === "maxStepsReached") && failure) {
-          setError(failure);
-          setExpanded(false);
+          // Voice runs report failure on their chip; the error card would
+          // overlap the open agent card.
+          if (!voiceBusyRef.current && !voiceActiveRef.current) {
+            setError(failure);
+            setExpanded(false);
+          } else {
+            console.warn("voice agent task failed:", failure);
+          }
         }
       })
       .then((off) => {
@@ -727,6 +775,71 @@ export default function QuickTooltip() {
     return () => window.clearTimeout(id);
   }, [confirmation]);
 
+  // The agent card grows with the voice feed (statusHeight pattern): the
+  // form is content-sized, the measurement drives both the CSS var and the
+  // native window height.
+  const measureAgentCard = useCallback(() => {
+    const form = agentFormRef.current;
+    if (!form) return;
+    const next = clamp(
+      Math.ceil(form.scrollHeight),
+      QUICK_TOOLTIP_AGENT_CARD_MIN_HEIGHT,
+      QUICK_TOOLTIP_AGENT_CARD_MAX_HEIGHT,
+    );
+    setAgentCardHeight((current) =>
+      Math.abs(current - next) < 1 ? current : next,
+    );
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!agentInputOpen) {
+      setAgentCardHeight(QUICK_TOOLTIP_AGENT_CARD_MIN_HEIGHT);
+      return;
+    }
+    measureAgentCard();
+    const form = agentFormRef.current;
+    if (!form) return;
+    const ro = new ResizeObserver(measureAgentCard);
+    ro.observe(form);
+    const raf = window.requestAnimationFrame(measureAgentCard);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [agentInputOpen, measureAgentCard]);
+
+  // Reopen the agent card (chips, mic state) once a confirmation/question/
+  // error card resolves during a hands-free session — those listeners close
+  // it to make room for the status card.
+  const hadStatusRef = useRef(hasStatus);
+  useEffect(() => {
+    const had = hadStatusRef.current;
+    hadStatusRef.current = hasStatus;
+    if (had && !hasStatus && voiceActiveRef.current && !agentInputOpenRef.current) {
+      openAgentInput();
+    }
+  }, [hasStatus, openAgentInput]);
+
+  const toggleVoice = useCallback(async () => {
+    if (voiceActiveRef.current) {
+      await voice.stop();
+      // Restore the card-open invariant (open card = keyboard mode on) that
+      // the voice session suspended — unless voice tasks are still running,
+      // in which case keys must stay with the app the agent is driving.
+      if (agentInputOpenRef.current && !voiceBusyRef.current) {
+        setQuickTooltipKeyboardMode(true).catch(() => {});
+      }
+      return;
+    }
+    const started = await voice.start();
+    if (started) {
+      // Hands-free: keystrokes stay with the previously-active app so the
+      // agent types into it, not the tooltip. Clicking the goal input
+      // re-enables keyboard mode via its onFocus handler.
+      restoreQuickTooltipKeyboardMode();
+    }
+  }, [voice, restoreQuickTooltipKeyboardMode, setQuickTooltipKeyboardMode]);
+
   useEffect(() => {
     invoke("resize_quick_tooltip", {
       expanded: chatVisible,
@@ -734,10 +847,11 @@ export default function QuickTooltip() {
       agentModelMenuOpen,
       statusOpen: hasStatus,
       statusHeight: hasStatus ? statusHeight : undefined,
+      agentCardHeight: agentInputOpen ? agentCardHeight : undefined,
     }).catch((e) => {
         console.error("resize_quick_tooltip failed:", e);
     });
-  }, [agentInputOpen, agentModelMenuOpen, chatVisible, hasStatus, statusHeight]);
+  }, [agentCardHeight, agentInputOpen, agentModelMenuOpen, chatVisible, hasStatus, statusHeight]);
 
   useEffect(() => {
     if (!chatVisible) return;
@@ -759,6 +873,10 @@ export default function QuickTooltip() {
 
   useEffect(() => {
     if (!agentInputOpen) return;
+    // Hands-free reopen (voice active): leave keystrokes with the target
+    // app and don't steal focus — the agent may be mid-task. Clicking the
+    // input still enables keyboard mode via its onFocus handler.
+    if (voiceActiveRef.current) return;
     let cancelled = false;
     let keyboardModeEnabled = false;
     let focusTimer: number | null = null;
@@ -803,6 +921,9 @@ export default function QuickTooltip() {
       ) {
         return;
       }
+      // Hands-free sessions keep the card (and its chips) up while the user
+      // works elsewhere; the Bot button still closes it explicitly.
+      if (voiceActiveRef.current) return;
       closeAgentInput();
     };
     document.addEventListener("pointerdown", onPointerDown, true);
@@ -1069,7 +1190,7 @@ export default function QuickTooltip() {
               type="button"
               className="quick-tooltip-icon-btn"
               data-active={agentInputOpen}
-              data-running={agentRunning}
+              data-running={agentRunning || voice.active}
               onClick={toggleAgentInput}
               aria-label="Agent task"
               title="Agent task"
@@ -1098,6 +1219,7 @@ export default function QuickTooltip() {
           aria-label="Agent task command"
         >
           <div
+            ref={agentFormRef}
             className="quick-tooltip-agent-form"
             onMouseDown={(e) => e.stopPropagation()}
           >
@@ -1115,8 +1237,25 @@ export default function QuickTooltip() {
                     void submitAgentGoal();
                   }
                 }}
+                onFocus={() => {
+                  // Clicking into the field always reclaims keystrokes —
+                  // covers both hands-free sessions (keys defaulted to the
+                  // target app) and the just-stopped-voice state.
+                  setQuickTooltipKeyboardMode(true).catch(() => {});
+                }}
+                onBlur={() => {
+                  if (voiceActiveRef.current) {
+                    restoreQuickTooltipKeyboardMode();
+                  }
+                }}
                 placeholder="Tell Screenie what to do"
                 aria-label="Tell Screenie what to do"
+              />
+              <VoiceMicButton
+                state={voiceMicState}
+                onToggle={() => {
+                  void toggleVoice();
+                }}
               />
               <button
                 type="button"
@@ -1126,12 +1265,26 @@ export default function QuickTooltip() {
                 }}
                 aria-label="Start agent task"
                 title="Start agent task"
-                disabled={!agentGoal.trim() || agentRunning}
+                disabled={!agentGoal.trim() || agentRunning || voice.busy}
               >
                 <ArrowUp size={15} strokeWidth={2} aria-hidden />
               </button>
               <SvgInsetBorder radius={999} strokeAlpha={0.2} />
             </div>
+            {voice.active && <VoiceLevelMeter fillRef={voice.meterFillRef} />}
+            {voice.notice && (
+              <div className="quick-tooltip-voice-notice">{voice.notice}</div>
+            )}
+            {voice.modelMissing ? (
+              <VoiceModelDownloadCard
+                pct={voice.downloadPct}
+                onDownload={() => {
+                  void voice.downloadModel();
+                }}
+              />
+            ) : (
+              <VoiceTranscriptFeed chips={voice.chips} />
+            )}
             <div className="quick-tooltip-agent-model-row">
               <div className="screenie-chat-model-select quick-tooltip-agent-model-select">
                 <CustomDropdown

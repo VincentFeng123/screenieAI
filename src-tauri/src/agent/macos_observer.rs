@@ -6,9 +6,9 @@ use super::observer::{
 use super::safari_dom;
 use super::search::score_match;
 use super::types::{
-    is_secure_text_role, normalize_signature_name, CoordinateSpace, Element, ElementSource,
-    FocusedApp, FocusedAppProvider, MenuMatch, MenuPressOutcome, MenuScanResult, ObservationError,
-    PlatformElementHandle, Rect, ScreenObserver,
+    is_secure_text_role, normalize_signature_name, ChangeCounter, CoordinateSpace, Element,
+    ElementSource, FocusedApp, FocusedAppProvider, MenuMatch, MenuPressOutcome, MenuScanResult,
+    ObservationError, PlatformElementHandle, Rect, ScreenObserver, UiChangeSignal,
 };
 use super::vision::{ObservationMetadata, ObservationMetadataProvider};
 use core_foundation::base::TCFType;
@@ -23,6 +23,11 @@ use core_foundation_sys::base::{
 };
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::number::{CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef};
+use core_foundation_sys::runloop::{
+    kCFRunLoopDefaultMode, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRef,
+    CFRunLoopRemoveSource, CFRunLoopRun, CFRunLoopSourceContext, CFRunLoopSourceCreate,
+    CFRunLoopSourceRef, CFRunLoopWakeUp,
+};
 use core_foundation_sys::string::{CFStringGetTypeID, CFStringRef};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +36,8 @@ use std::fmt;
 use std::mem;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_AX_DEPTH: usize = 8;
@@ -89,6 +96,7 @@ extern "C" {
         y: f32,
         element: *mut AXUIElementRef,
     ) -> i32;
+    fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut Pid) -> i32;
     fn AXValueGetType(value: AXValueRef) -> i32;
     fn AXValueGetTypeID() -> CFTypeID;
     fn AXValueGetValue(value: AXValueRef, value_type: i32, value_ptr: *mut c_void) -> Boolean;
@@ -99,6 +107,230 @@ extern "C" {
     fn objc_getClass(name: *const c_char) -> ObjcId;
     fn sel_registerName(name: *const c_char) -> Sel;
     fn objc_msgSend();
+}
+
+type AXObserverRef = CFTypeRef;
+type AXObserverCallback = unsafe extern "C" fn(
+    observer: AXObserverRef,
+    element: AXUIElementRef,
+    notification: CFStringRef,
+    refcon: *mut c_void,
+);
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXObserverCreate(
+        application: Pid,
+        callback: AXObserverCallback,
+        out_observer: *mut AXObserverRef,
+    ) -> i32;
+    fn AXObserverAddNotification(
+        observer: AXObserverRef,
+        element: AXUIElementRef,
+        notification: CFStringRef,
+        refcon: *mut c_void,
+    ) -> i32;
+    fn AXObserverRemoveNotification(
+        observer: AXObserverRef,
+        element: AXUIElementRef,
+        notification: CFStringRef,
+    ) -> i32;
+    fn AXObserverGetRunLoopSource(observer: AXObserverRef) -> CFRunLoopSourceRef;
+}
+
+/// Notifications whose arrival means "the frontmost app's UI changed" for
+/// settle purposes. Names are the values of the corresponding kAX…
+/// Notification constants in AXNotificationConstants.h.
+const AX_CHANGE_NOTIFICATIONS: &[&str] = &[
+    "AXFocusedUIElementChanged",
+    "AXWindowCreated",
+    "AXValueChanged",
+    "AXUIElementDestroyed",
+];
+
+/// Process-wide bridge from AXObserver callbacks (delivered on the dedicated
+/// signal run-loop thread) to settle-path waiters on the agent thread. One
+/// registration follows the frontmost app and is replaced when focus moves
+/// to a different pid.
+struct AxChangeSignalHub {
+    counter: Arc<ChangeCounter>,
+    slot: Mutex<AxRegistrationSlot>,
+}
+
+#[derive(Default)]
+struct AxRegistrationSlot {
+    active: Option<AxChangeRegistration>,
+    /// Registration is retried only when the frontmost pid changes, so an
+    /// app without AX notification support doesn't pay the failed AX
+    /// round-trips on every settle call.
+    failed_pid: Option<Pid>,
+}
+
+static AX_CHANGE_HUB: OnceLock<AxChangeSignalHub> = OnceLock::new();
+
+fn ax_change_hub() -> &'static AxChangeSignalHub {
+    AX_CHANGE_HUB.get_or_init(|| AxChangeSignalHub {
+        counter: Arc::new(ChangeCounter::default()),
+        slot: Mutex::new(AxRegistrationSlot::default()),
+    })
+}
+
+/// Runs on the signal run-loop thread. Kept trivial on purpose: waiters
+/// re-observe and work out what changed, so the callback carries no payload.
+unsafe extern "C" fn ax_change_callback(
+    _observer: AXObserverRef,
+    _element: AXUIElementRef,
+    _notification: CFStringRef,
+    _refcon: *mut c_void,
+) {
+    if let Some(hub) = AX_CHANGE_HUB.get() {
+        hub.counter.bump();
+    }
+}
+
+struct AxChangeRegistration {
+    pid: Pid,
+    observer: AXObserverRef,
+    app: AXUIElementRef,
+    registered: Vec<&'static str>,
+    runloop: CFRunLoopRef,
+}
+
+// The raw refs are only touched from whichever thread holds the hub mutex;
+// the run-loop thread only drives the scheduled source and never sees the
+// registration itself.
+unsafe impl Send for AxChangeRegistration {}
+
+impl Drop for AxChangeRegistration {
+    fn drop(&mut self) {
+        unsafe {
+            // Stop the AX server sending first, then unschedule local
+            // delivery, then release. Errors are ignored — the observed app
+            // may already be gone.
+            for name in &self.registered {
+                let notification = CFString::new(name);
+                let _ = AXObserverRemoveNotification(
+                    self.observer,
+                    self.app,
+                    notification.as_concrete_TypeRef(),
+                );
+            }
+            let source = AXObserverGetRunLoopSource(self.observer);
+            if !source.is_null() {
+                // No-op when the source was never added (failed registration
+                // paths drop the struct before scheduling).
+                CFRunLoopRemoveSource(self.runloop, source, kCFRunLoopDefaultMode);
+            }
+            CFRelease(self.observer);
+            CFRelease(self.app);
+        }
+    }
+}
+
+extern "C" fn ax_signal_keep_alive_noop(_info: *const c_void) {}
+
+/// The dedicated CFRunLoop thread AXObserver sources are scheduled on. A
+/// permanent no-op source keeps `CFRunLoopRun` from returning while no
+/// AXObserver is registered. `None` when the thread failed to start; settle
+/// paths then stay on polling.
+fn ax_signal_runloop() -> Option<CFRunLoopRef> {
+    struct SendCFRunLoop(CFRunLoopRef);
+    // CFRunLoop is one of the explicitly thread-safe CF types; the ref is
+    // only used with CFRunLoopAddSource/RemoveSource/WakeUp.
+    unsafe impl Send for SendCFRunLoop {}
+    unsafe impl Sync for SendCFRunLoop {}
+
+    static RUNLOOP: OnceLock<Option<SendCFRunLoop>> = OnceLock::new();
+    RUNLOOP
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            let spawned = thread::Builder::new()
+                .name("ax-change-signal".into())
+                .spawn(move || unsafe {
+                    let runloop = CFRunLoopGetCurrent();
+                    let mut context = CFRunLoopSourceContext {
+                        version: 0,
+                        info: ptr::null_mut(),
+                        retain: None,
+                        release: None,
+                        copyDescription: None,
+                        equal: None,
+                        hash: None,
+                        schedule: None,
+                        cancel: None,
+                        perform: ax_signal_keep_alive_noop,
+                    };
+                    let keep_alive = CFRunLoopSourceCreate(ptr::null(), 0, &mut context);
+                    if !keep_alive.is_null() {
+                        CFRunLoopAddSource(runloop, keep_alive, kCFRunLoopDefaultMode);
+                    }
+                    if tx.send(SendCFRunLoop(runloop)).is_err() {
+                        return;
+                    }
+                    loop {
+                        CFRunLoopRun();
+                        // Only reachable without the keep-alive source; pace
+                        // the retry instead of spinning.
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                });
+            if spawned.is_err() {
+                return None;
+            }
+            rx.recv_timeout(Duration::from_secs(2)).ok()
+        })
+        .as_ref()
+        .map(|handle| handle.0)
+}
+
+fn register_ax_change_observer(pid: Pid) -> Option<AxChangeRegistration> {
+    let runloop = ax_signal_runloop()?;
+    let mut observer: AXObserverRef = ptr::null();
+    let err = unsafe { AXObserverCreate(pid, ax_change_callback, &mut observer) };
+    if err != AX_ERROR_SUCCESS || observer.is_null() {
+        return None;
+    }
+    let app = unsafe { AXUIElementCreateApplication(pid) };
+    if app.is_null() {
+        unsafe { CFRelease(observer) };
+        return None;
+    }
+
+    // From here the registration owns both refs; early returns clean up
+    // through its Drop.
+    let mut registration = AxChangeRegistration {
+        pid,
+        observer,
+        app,
+        registered: Vec::new(),
+        runloop,
+    };
+    for name in AX_CHANGE_NOTIFICATIONS {
+        let notification = CFString::new(name);
+        let err = unsafe {
+            AXObserverAddNotification(
+                observer,
+                app,
+                notification.as_concrete_TypeRef(),
+                ptr::null_mut(),
+            )
+        };
+        if err == AX_ERROR_SUCCESS {
+            registration.registered.push(*name);
+        }
+    }
+    if registration.registered.is_empty() {
+        return None;
+    }
+    let source = unsafe { AXObserverGetRunLoopSource(observer) };
+    if source.is_null() {
+        return None;
+    }
+    unsafe {
+        CFRunLoopAddSource(runloop, source, kCFRunLoopDefaultMode);
+        CFRunLoopWakeUp(runloop);
+    }
+    Some(registration)
 }
 
 /// macOS Accessibility observer.
@@ -201,24 +433,37 @@ impl MacObserver {
         }
         let _system_wide_ref = OwnedCf::new(system_wide);
 
-        let mut hit = ptr::null();
-        let err = unsafe {
-            AXUIElementCopyElementAtPosition(system_wide, point.x as f32, point.y as f32, &mut hit)
+        let Some(hit) = copy_element_at_position(system_wide, point)? else {
+            return Ok(None);
         };
-        match err {
-            AX_ERROR_SUCCESS if hit.is_null() => Ok(None),
-            AX_ERROR_SUCCESS => {
-                let _hit_ref = OwnedCf::new(hit);
-                Ok(Some(copy_target_summary(hit)?))
-            }
-            other if ax_error_means_missing_or_stale(other) => Ok(None),
-            AX_ERROR_CANNOT_COMPLETE => Err(ObservationError::AxReadFailed(
-                "AX hit-test could not complete the request".into(),
-            )),
-            other => Err(ObservationError::AxReadFailed(format!(
-                "AXUIElementCopyElementAtPosition({}, {}) returned {}",
-                point.x, point.y, other
-            ))),
+
+        let own_pid = std::process::id() as Pid;
+        if element_pid(hit.as_type_ref()) != Some(own_pid) {
+            return Ok(Some(copy_target_summary(hit.as_type_ref())?));
+        }
+
+        // The topmost element here belongs to this process (HUD/confirmation
+        // panel), which is click-through for real input. Re-run the hit-test
+        // scoped to the frontmost app so preflight validates against what a
+        // click would actually reach.
+        eprintln!(
+            "[screenie] agent hit-test skipped own window at ({}, {})",
+            point.x, point.y
+        );
+        let Some(app) = frontmost_application_info()? else {
+            return Ok(None);
+        };
+        let Some(app_pid) = app.pid.filter(|pid| *pid != own_pid) else {
+            return Ok(None);
+        };
+        let app_element = unsafe { AXUIElementCreateApplication(app_pid) };
+        if app_element.is_null() {
+            return Ok(None);
+        }
+        let app_element = OwnedCf::new(app_element);
+        match copy_element_at_position(app_element.as_type_ref(), point) {
+            Ok(Some(app_hit)) => Ok(Some(copy_target_summary(app_hit.as_type_ref())?)),
+            Ok(None) | Err(_) => Ok(None),
         }
     }
 
@@ -329,6 +574,41 @@ impl MacObserver {
 impl ScreenObserver for MacObserver {
     fn observe(&self) -> Result<Vec<Element>, ObservationError> {
         self.observe_frontmost_app()
+    }
+
+    /// Event-driven settle support: ensure an AXObserver is registered on
+    /// the frontmost app and hand out a waiter on the shared change counter.
+    /// Never prompts for Accessibility; any unavailability returns `None`
+    /// and the caller polls instead.
+    fn change_signal(&self) -> Option<Box<dyn UiChangeSignal>> {
+        if !system_accessibility_trusted() {
+            return None;
+        }
+        let pid = frontmost_application_info().ok().flatten()?.pid?;
+        let hub = ax_change_hub();
+        let mut slot = hub.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.active.as_ref().map(|reg| reg.pid) != Some(pid) {
+            if slot.failed_pid == Some(pid) {
+                return None;
+            }
+            // Drop the previous app's registration before creating the new
+            // one so at most one AXObserver source is ever scheduled.
+            slot.active = None;
+            match register_ax_change_observer(pid) {
+                Some(registration) => {
+                    slot.active = Some(registration);
+                    slot.failed_pid = None;
+                }
+                None => {
+                    eprintln!(
+                        "[screenie] agent ax-signal registration failed pid={pid}; settle falls back to polling"
+                    );
+                    slot.failed_pid = Some(pid);
+                    return None;
+                }
+            }
+        }
+        Some(Box::new(hub.counter.waiter()))
     }
 
     fn read_page_text(&self) -> Result<String, String> {
@@ -514,12 +794,44 @@ impl ScreenObserver for MacObserver {
                 if let Some(PlatformElementHandle::SafariDom { agent_id }) =
                     el.platform_handle.as_ref()
                 {
-                    let web_area = self.current_safari_web_area().ok().flatten()?;
-                    if let Ok(Some(refreshed)) =
-                        safari_dom::refresh_safari_dom_element(agent_id, web_area, el.id)
-                    {
-                        if element_identity_matches(el, &refreshed) {
-                            return Some(refreshed);
+                    let web_area = match self.current_safari_web_area() {
+                        Ok(Some(area)) => area,
+                        Ok(None) => {
+                            eprintln!(
+                                "[screenie] agent safari-dom refresh: no web area while refreshing '{}'",
+                                el.name
+                            );
+                            return None;
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[screenie] agent safari-dom refresh: web area lookup failed while refreshing '{}': {err}",
+                                el.name
+                            );
+                            return None;
+                        }
+                    };
+                    match safari_dom::refresh_safari_dom_element(agent_id, web_area, el.id) {
+                        Ok(Some(refreshed)) => {
+                            if element_identity_matches(el, &refreshed) {
+                                return Some(refreshed);
+                            }
+                            eprintln!(
+                                "[screenie] agent safari-dom refresh: identity mismatch for '{}' (role '{}' -> '{}', name '{}' -> '{}')",
+                                el.name, el.role, refreshed.role, el.name, refreshed.name
+                            );
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "[screenie] agent safari-dom refresh: element '{}' no longer found",
+                                el.name
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[screenie] agent safari-dom refresh failed for '{}': {err}",
+                                el.name
+                            );
                         }
                     }
                     return None;
@@ -1152,6 +1464,33 @@ fn copy_target_summary(element: AXUIElementRef) -> Result<TargetSummary, Observa
     Ok(TargetSummary::from(&snapshot))
 }
 
+fn copy_element_at_position(
+    root: AXUIElementRef,
+    point: ClickPoint,
+) -> Result<Option<OwnedCf>, ObservationError> {
+    let mut hit = ptr::null();
+    let err =
+        unsafe { AXUIElementCopyElementAtPosition(root, point.x as f32, point.y as f32, &mut hit) };
+    match err {
+        AX_ERROR_SUCCESS if hit.is_null() => Ok(None),
+        AX_ERROR_SUCCESS => Ok(Some(OwnedCf::new(hit))),
+        other if ax_error_means_missing_or_stale(other) => Ok(None),
+        AX_ERROR_CANNOT_COMPLETE => Err(ObservationError::AxReadFailed(
+            "AX hit-test could not complete the request".into(),
+        )),
+        other => Err(ObservationError::AxReadFailed(format!(
+            "AXUIElementCopyElementAtPosition({}, {}) returned {}",
+            point.x, point.y, other
+        ))),
+    }
+}
+
+fn element_pid(element: AXUIElementRef) -> Option<Pid> {
+    let mut pid: Pid = 0;
+    let err = unsafe { AXUIElementGetPid(element, &mut pid) };
+    (err == AX_ERROR_SUCCESS && pid > 0).then_some(pid)
+}
+
 fn copy_element_snapshot(
     element: AXUIElementRef,
     id: u32,
@@ -1277,6 +1616,14 @@ fn cf_value_to_string(value: &OwnedCf) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ax_signal_runloop_is_created_once_and_reused() {
+        let first = ax_signal_runloop();
+        let second = ax_signal_runloop();
+        assert!(first.is_some());
+        assert_eq!(first, second);
+    }
 
     #[test]
     fn invalid_ui_element_is_treated_as_missing_or_stale() {

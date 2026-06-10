@@ -1,4 +1,5 @@
 pub mod agent;
+mod voice;
 mod ai;
 mod capture;
 mod history;
@@ -57,9 +58,8 @@ const QUICK_TOOLTIP_EXPANDED_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_EXPANDED_H: f64 = 540.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_GAP: f64 = 12.0;
 const QUICK_TOOLTIP_AGENT_CARD_H: f64 = 88.0;
-// COMPACT_H already carries the gutter, so no extra EDGE_PAD term here.
-const QUICK_TOOLTIP_AGENT_INPUT_H: f64 =
-    QUICK_TOOLTIP_COMPACT_H + QUICK_TOOLTIP_GAP + QUICK_TOOLTIP_AGENT_CARD_H;
+/// Upper bound for the voice-feed-grown agent card (level meter + chips).
+const QUICK_TOOLTIP_AGENT_CARD_MAX_H: f64 = 300.0;
 const QUICK_TOOLTIP_AGENT_INPUT_WITH_MENU_H: f64 = 380.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_STATUS_H: f64 = 178.0;
 const QUICK_TOOLTIP_STATUS_MIN_H: f64 = 82.0;
@@ -499,6 +499,22 @@ struct AppState {
     /// Shared grounding runtime manager. It warms each configured local
     /// endpoint once and hands runs cheap configured grounder handles.
     grounder: agent::GrounderManager,
+    /// Live voice listening session (None when the mic is off). A stored
+    /// handle can be stale after an idle auto-stop; `is_active` on the
+    /// handle distinguishes, so commands never trust mere presence.
+    voice_session: Mutex<Option<voice::VoiceSessionHandle>>,
+    /// Voice settings override; lazily seeded from voice.json on first read.
+    voice_config: Mutex<Option<voice::VoiceConfig>>,
+    /// In-flight whisper-model download cancel flag; replaced (and the
+    /// predecessor tripped) when a new download starts.
+    voice_download_cancel: Mutex<Option<CancelFlag>>,
+    /// Voice task queue + dispatcher-thread handle state. Spawned at first
+    /// mic-on, then process-lifetime; strictly one agent run at a time.
+    voice_dispatch: Mutex<Option<Arc<voice::dispatcher::DispatchShared>>>,
+    /// Latch closing the gap between `voice_start_listening`'s is-active
+    /// check and the (blocking) session start — prevents two concurrent
+    /// invokes from double-opening the microphone.
+    voice_starting: AtomicBool,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -626,17 +642,24 @@ impl QuickTooltipSize {
         }
     }
 
-    fn agent_input() -> Self {
+    /// `card_height` lets the voice transcript feed grow the agent card
+    /// (React measures the card content, mirroring the status-card pattern);
+    /// None or anything out of range falls back to the base 88 px card.
+    fn agent_input(card_height: Option<f64>) -> Self {
+        let card = quick_tooltip_agent_card_height(card_height);
         Self {
             width: QUICK_TOOLTIP_AGENT_INPUT_W,
-            height: QUICK_TOOLTIP_AGENT_INPUT_H,
+            height: QUICK_TOOLTIP_COMPACT_H + QUICK_TOOLTIP_GAP + card,
         }
     }
 
-    fn agent_input_with_menu() -> Self {
+    fn agent_input_with_menu(card_height: Option<f64>) -> Self {
+        // The dropdown needs its fixed tall window; a chip-grown card may
+        // need even more.
+        let base = Self::agent_input(card_height);
         Self {
             width: QUICK_TOOLTIP_AGENT_INPUT_W,
-            height: QUICK_TOOLTIP_AGENT_INPUT_WITH_MENU_H,
+            height: base.height.max(QUICK_TOOLTIP_AGENT_INPUT_WITH_MENU_H),
         }
     }
 
@@ -669,6 +692,13 @@ fn quick_tooltip_status_height(status_height: Option<f64>) -> f64 {
         .filter(|height| height.is_finite() && *height > 0.0)
         .map(|height| height.clamp(QUICK_TOOLTIP_STATUS_MIN_H, QUICK_TOOLTIP_STATUS_MAX_H))
         .unwrap_or(QUICK_TOOLTIP_STATUS_H)
+}
+
+fn quick_tooltip_agent_card_height(card_height: Option<f64>) -> f64 {
+    card_height
+        .filter(|height| height.is_finite() && *height > 0.0)
+        .map(|height| height.clamp(QUICK_TOOLTIP_AGENT_CARD_H, QUICK_TOOLTIP_AGENT_CARD_MAX_H))
+        .unwrap_or(QUICK_TOOLTIP_AGENT_CARD_H)
 }
 
 fn constrain_quick_tooltip_size_to_monitor(
@@ -3683,6 +3713,7 @@ fn resize_quick_tooltip(
     agent_model_menu_open: Option<bool>,
     status_open: Option<bool>,
     status_height: Option<f64>,
+    agent_card_height: Option<f64>,
 ) -> Result<(), String> {
     require_window(&window, "quick_tooltip")?;
     let status_open = status_open.unwrap_or(false);
@@ -3693,9 +3724,9 @@ fn resize_quick_tooltip(
     } else if expanded {
         QuickTooltipSize::expanded()
     } else if agent_input_open && agent_model_menu_open {
-        QuickTooltipSize::agent_input_with_menu()
+        QuickTooltipSize::agent_input_with_menu(agent_card_height)
     } else if agent_input_open {
-        QuickTooltipSize::agent_input()
+        QuickTooltipSize::agent_input(agent_card_height)
     } else if status_open {
         QuickTooltipSize::status(status_height)
     } else {
@@ -4350,7 +4381,12 @@ pub fn run() {
         get_hotkey_config,
         set_hotkey_config,
         open_chat_window,
-        take_chat_seed
+        take_chat_seed,
+        voice::voice_start_listening,
+        voice::voice_stop_listening,
+        voice::voice_get_status,
+        voice::voice_download_model,
+        voice::voice_set_config
     ]);
 
     #[cfg(desktop)]
@@ -4410,6 +4446,28 @@ pub fn run() {
             if let Err(e) = setup_tray(handle) {
                 eprintln!("[screenie] tray setup FAILED: {}", e);
                 return Err(Box::new(e));
+            }
+
+            // Milestone demo hook: SCREENIE_VOICE_AUTOSTART=1 starts a
+            // listening session at launch so the capture/VAD/STT pipeline can
+            // be exercised from the console before the mic UI exists (M4).
+            if std::env::var("SCREENIE_VOICE_AUTOSTART").is_ok() {
+                let app_handle = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    match voice::start_session(
+                        &app_handle,
+                        voice::VoiceConfig::default(),
+                        voice::AgentRunSettings::default(),
+                    ) {
+                        Ok(session) => {
+                            let state = app_handle.state::<AppState>();
+                            *lock_poison_safe(&state.voice_session) = Some(session);
+                            eprintln!("[screenie] voice autostart: listening");
+                        }
+                        Err(e) => eprintln!("[screenie] voice autostart failed: {e}"),
+                    }
+                });
             }
 
             #[cfg(target_os = "macos")]

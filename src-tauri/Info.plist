@@ -36,6 +36,8 @@
   <string>Screenie AI uses Accessibility to inspect visible app controls, perform approved agent actions, capture Esc while the overlay is visible, and return focus to the app you were using before the capture.</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>Screenie AI uses Apple Events to inspect Safari page controls for agentic mode when Safari is the active app.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Screenie AI uses the microphone for voice command mode: spoken commands are transcribed on-device and run as agent tasks. Audio never leaves your Mac.</string>
   <key>LSUIElement</key>
   <true/>
 </dict>

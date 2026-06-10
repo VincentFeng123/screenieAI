@@ -1,5 +1,7 @@
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 const SIGNATURE_RECT_BUCKET_SIZE: f64 = 24.0;
 const FNV_1A_64_OFFSET: u64 = 0xcbf29ce484222325;
@@ -259,8 +261,97 @@ pub struct MenuScanResult {
     pub truncated: bool,
 }
 
+/// How a blocking wait for a UI-change notification ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeWait {
+    /// A change notification arrived before the deadline.
+    Notified,
+    /// The deadline passed without a notification — a quiet UI.
+    TimedOut,
+}
+
+/// Blocking source of "the frontmost app's UI changed" notifications. The
+/// executor's settle/verify paths use one to wake as soon as a change lands
+/// instead of sleeping a full poll interval; `TimedOut` after a quiet poll
+/// interval is what confirms stability.
+pub trait UiChangeSignal {
+    fn wait_for_change(&mut self, timeout: Duration) -> ChangeWait;
+}
+
+/// Monotonic change counter bridging a notification callback thread and
+/// settle-path waiters. The callback side calls `bump`; each waiter wakes
+/// when the count moves past what it last saw, so bumps are never lost even
+/// while the waiter is busy observing rather than waiting.
+#[derive(Debug, Default)]
+pub struct ChangeCounter {
+    count: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl ChangeCounter {
+    pub fn bump(&self) {
+        // The counter is always valid; a panicked bumper can't corrupt it,
+        // so poisoning is ignored rather than propagated into settle paths.
+        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        *count = count.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    pub fn waiter(self: &Arc<Self>) -> ChangeCounterWaiter {
+        let seen = *self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        ChangeCounterWaiter {
+            counter: Arc::clone(self),
+            seen,
+        }
+    }
+}
+
+/// One settle path's view onto a [`ChangeCounter`]: it only reports bumps
+/// that happen after its creation, and consumes everything pending on each
+/// `Notified`.
+pub struct ChangeCounterWaiter {
+    counter: Arc<ChangeCounter>,
+    seen: u64,
+}
+
+impl UiChangeSignal for ChangeCounterWaiter {
+    fn wait_for_change(&mut self, timeout: Duration) -> ChangeWait {
+        let deadline = Instant::now() + timeout;
+        let mut count = self
+            .counter
+            .count
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if *count != self.seen {
+                self.seen = *count;
+                return ChangeWait::Notified;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return ChangeWait::TimedOut;
+            }
+            count = self
+                .counter
+                .changed
+                .wait_timeout(count, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
 pub trait ScreenObserver {
     fn observe(&self) -> Result<Vec<Element>, ObservationError>;
+
+    /// Subscribe to UI-change notifications for the frontmost app, letting
+    /// the executor settle event-driven instead of polling blind. `None`
+    /// (the default) means no notification source is available — platform
+    /// observer registration failed, or the platform has none — and callers
+    /// fall back to interval polling.
+    fn change_signal(&self) -> Option<Box<dyn UiChangeSignal>> {
+        None
+    }
 
     /// Extract readable text from the focused page/window for the agent's
     /// readPage action. Platform observers override this; the default keeps
@@ -990,9 +1081,78 @@ pub trait Planner {
 #[cfg(test)]
 mod tests {
     use super::{
-        element_signature, Action, CoordinateSpace, Element, ElementSource, PlatformElementHandle,
-        Rect, ScreenObserver,
+        element_signature, Action, ChangeCounter, ChangeWait, CoordinateSpace, Element,
+        ElementSource, PlatformElementHandle, Rect, ScreenObserver, UiChangeSignal,
     };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn change_signal_is_unavailable_by_default() {
+        let observer = StaticObserver(Vec::new());
+        assert!(observer.change_signal().is_none());
+    }
+
+    #[test]
+    fn change_counter_waiter_times_out_without_a_bump() {
+        let counter = Arc::new(ChangeCounter::default());
+        let mut waiter = counter.waiter();
+        assert_eq!(
+            waiter.wait_for_change(Duration::from_millis(5)),
+            ChangeWait::TimedOut
+        );
+    }
+
+    #[test]
+    fn change_counter_waiter_returns_pending_bump_without_blocking() {
+        let counter = Arc::new(ChangeCounter::default());
+        let mut waiter = counter.waiter();
+        counter.bump();
+        counter.bump();
+
+        let started = Instant::now();
+        assert_eq!(
+            waiter.wait_for_change(Duration::from_secs(5)),
+            ChangeWait::Notified
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // All pending bumps were consumed by the one Notified.
+        assert_eq!(
+            waiter.wait_for_change(Duration::from_millis(5)),
+            ChangeWait::TimedOut
+        );
+    }
+
+    #[test]
+    fn change_counter_waiter_wakes_on_bump_from_another_thread() {
+        let counter = Arc::new(ChangeCounter::default());
+        let mut waiter = counter.waiter();
+        let bumper = Arc::clone(&counter);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            bumper.bump();
+        });
+
+        let started = Instant::now();
+        assert_eq!(
+            waiter.wait_for_change(Duration::from_secs(10)),
+            ChangeWait::Notified
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn change_counter_waiters_snapshot_independently() {
+        let counter = Arc::new(ChangeCounter::default());
+        counter.bump();
+        // A waiter created after a bump must not see that bump.
+        let mut waiter = counter.waiter();
+        assert_eq!(
+            waiter.wait_for_change(Duration::from_millis(5)),
+            ChangeWait::TimedOut
+        );
+    }
 
     #[test]
     fn action_json_contract_uses_action_tag() {

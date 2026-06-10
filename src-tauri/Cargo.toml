@@ -38,6 +38,9 @@ ab_glyph = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = "0.3"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
+cpal = "0.18"
+voice_activity_detector = "0.2"
+rubato = "0.16"
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-global-shortcut = "~2.3"
@@ -56,6 +59,7 @@ tauri-plugin-global-shortcut = "~2.3"
 #
 # Everything is built into Windows 10+ — no extra runtime to bundle.
 [target."cfg(target_os = \"windows\")".dependencies]
+whisper-rs = "0.16"
 windows = { version = "0.58", features = [
     "Foundation",
     "Globalization",
@@ -77,4 +81,5 @@ windows = { version = "0.58", features = [
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 enigo = "0.6"
+whisper-rs = { version = "0.16", features = ["metal"] }
 xcap = "=0.9.6"
