@@ -119,6 +119,11 @@ function readAgentScriptingEnabled(): boolean {
   return localStorage.getItem("agent_scripting_enabled") === "true";
 }
 
+// Default ON, unlike scripting: the lookup sends only app + feature names.
+function readAgentWebLookupEnabled(): boolean {
+  return localStorage.getItem("agent_web_lookup_enabled") !== "false";
+}
+
 type AgentTaskFinished = {
   status?: string;
   failureReason?: string | null;
@@ -1007,6 +1012,7 @@ export default function QuickTooltip() {
         visionModel: info.model,
         autonomy: readAgentAutonomy(),
         scriptingEnabled: readAgentScriptingEnabled(),
+        webLookupEnabled: readAgentWebLookupEnabled(),
       });
     } catch (e) {
       setAgentRunning(false);

@@ -170,6 +170,18 @@ export default function SettingsPanel({
     localStorage.setItem("agent_scripting_enabled", enabled ? "true" : "false");
     setAgentScriptingState(enabled);
   };
+  // Default ON: the lookup sends only app + feature names (never screen
+  // content) to the same provider that already sees every observation.
+  const [agentWebLookup, setAgentWebLookupState] = useState(
+    () => localStorage.getItem("agent_web_lookup_enabled") !== "false",
+  );
+  const saveAgentWebLookup = (enabled: boolean) => {
+    localStorage.setItem(
+      "agent_web_lookup_enabled",
+      enabled ? "true" : "false",
+    );
+    setAgentWebLookupState(enabled);
+  };
   // The frosted-glass effect is now provided by the macOS native sidebar
   // window effect + CSS `backdrop-filter` on `.settings-shell` (settings.css).
   // Both update LIVE — the desktop content visible through the window
@@ -884,6 +896,16 @@ export default function SettingsPanel({
                 checked={agentScripting}
                 onChange={saveAgentScripting}
                 ariaLabel="Allow agent scripting"
+              />
+            </PreferenceRow>
+            <PreferenceRow
+              title="Web lookup"
+              help="When the agent can't find a control, it may search the web (via your Anthropic key) for where the feature lives. Only the app name and feature name are sent — never screen content — and answers are verified on screen before use. Anthropic provider only."
+            >
+              <ToggleControl
+                checked={agentWebLookup}
+                onChange={saveAgentWebLookup}
+                ariaLabel="Allow agent web lookup"
               />
             </PreferenceRow>
             <PreferenceRow

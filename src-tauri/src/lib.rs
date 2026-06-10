@@ -1298,6 +1298,7 @@ fn execution_policy_from_autonomy(autonomy: Option<&str>) -> Option<agent::Execu
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn agent_task_options_from_goal(
     goal: &str,
     provider: Option<String>,
@@ -1306,6 +1307,7 @@ fn agent_task_options_from_goal(
     vision_model: Option<String>,
     autonomy: Option<String>,
     scripting_enabled: Option<bool>,
+    web_lookup_enabled: Option<bool>,
 ) -> Option<agent::StubAgentOptions> {
     let goal = goal.trim();
     if goal.is_empty() {
@@ -1319,6 +1321,7 @@ fn agent_task_options_from_goal(
         vision_model,
         execution_policy: execution_policy_from_autonomy(autonomy.as_deref()),
         scripting_enabled,
+        web_lookup_enabled,
         ..Default::default()
     })
 }
@@ -1335,6 +1338,7 @@ fn start_agent_task(
     vision_model: Option<String>,
     autonomy: Option<String>,
     scripting_enabled: Option<bool>,
+    web_lookup_enabled: Option<bool>,
 ) -> Result<(), String> {
     require_window(&window, "quick_tooltip")?;
     let Some(mut options) = agent_task_options_from_goal(
@@ -1345,6 +1349,7 @@ fn start_agent_task(
         vision_model,
         autonomy,
         scripting_enabled,
+        web_lookup_enabled,
     ) else {
         return Ok(());
     };
@@ -1470,7 +1475,7 @@ async fn run_prepared_stub_agent(
         vision_config,
         fallback_state,
         resolved.scripting_enabled,
-        false, // web lookup ships in a later commit; never advertise before then
+        resolved.web_lookup_enabled,
     );
     let confirmations = TauriConfirmationRequester { app, window };
     agent::run_stub_agent_loop_with_grounder(
@@ -4653,14 +4658,14 @@ mod tests {
 
     #[test]
     fn agent_task_options_empty_goal_is_noop() {
-        assert!(agent_task_options_from_goal("", None, None, None, None, None, None).is_none());
-        assert!(agent_task_options_from_goal(" \n\t ", None, None, None, None, None, None).is_none());
+        assert!(agent_task_options_from_goal("", None, None, None, None, None, None, None).is_none());
+        assert!(agent_task_options_from_goal(" \n\t ", None, None, None, None, None, None, None).is_none());
     }
 
     #[test]
     fn agent_task_options_trim_goal() {
         let options =
-            agent_task_options_from_goal("  open settings  ", None, None, None, None, None, None)
+            agent_task_options_from_goal("  open settings  ", None, None, None, None, None, None, None)
                 .unwrap();
         assert_eq!(options.goal.as_deref(), Some("open settings"));
     }
@@ -4673,6 +4678,7 @@ mod tests {
             Some("gemini-2.5-flash".into()),
             Some("gemini".into()),
             Some("gemini-2.5-flash".into()),
+            None,
             None,
             None,
         )
@@ -4693,6 +4699,7 @@ mod tests {
             None,
             Some("ask".into()),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4708,6 +4715,7 @@ mod tests {
             None,
             Some("auto".into()),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(auto.execution_policy, Some(agent::ExecutionPolicy::Auto));
@@ -4719,6 +4727,7 @@ mod tests {
             None,
             None,
             Some("bogus".into()),
+            None,
             None,
         )
         .unwrap();

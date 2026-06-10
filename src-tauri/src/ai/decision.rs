@@ -11,6 +11,11 @@ const MAX_DECISION_TOKENS: u32 = 512;
 const GEMINI_MIN_THINKING_BUDGET: i32 = 128;
 const DECISION_REQUEST_MAX_ATTEMPTS: u8 = 3;
 const DECISION_RETRY_BASE_DELAY_MS: u64 = 350;
+/// Web-lookup research calls: server-side searches per call, answer budget,
+/// and how many `pause_turn` continuations to follow before giving up.
+const MAX_WEB_LOOKUP_SEARCHES: u8 = 2;
+const MAX_WEB_LOOKUP_TOKENS: u32 = 1024;
+const MAX_WEB_LOOKUP_CONTINUATIONS: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DecisionPrompt {
@@ -59,6 +64,54 @@ impl DecisionClient {
             "ollama" => complete_ollama(&self.config, &prompt).await,
             other => Err(AiError::InvalidProvider(other.to_string())),
         }
+    }
+
+    /// Research call with the Anthropic server-side web search tool — used
+    /// by the agent's webLookup action to learn where a feature lives in an
+    /// app's UI. Anthropic-only; other providers report unsupported.
+    pub(crate) async fn web_lookup(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<String, AiError> {
+        if self.config.provider.as_str() != "anthropic" {
+            return Err(AiError::InvalidProvider(format!(
+                "web lookup requires the anthropic provider, got {}",
+                self.config.provider
+            )));
+        }
+        if self.config.api_key.is_empty() {
+            return Err(AiError::NoKey);
+        }
+
+        let client = super::cloud_client()?;
+        let mut messages = vec![json!({ "role": "user", "content": user_prompt })];
+        // The server runs its own search loop and may pause mid-turn
+        // (stop_reason "pause_turn"); re-sending the assistant content
+        // resumes it. Bounded so a wedged loop can't run away.
+        for _ in 0..=MAX_WEB_LOOKUP_CONTINUATIONS {
+            let body = anthropic_web_lookup_body(&self.config.model, system_prompt, &messages);
+            let request = client
+                .post(ANTHROPIC_API_URL)
+                .header("x-api-key", &self.config.api_key)
+                .header("anthropic-version", ANTHROPIC_API_VERSION)
+                .header("content-type", "application/json")
+                .json(&body);
+            let value = post_json(request, "anthropic").await?;
+
+            if value.get("stop_reason").and_then(Value::as_str) == Some("pause_turn") {
+                if let Some(content) = value.get("content") {
+                    messages.push(json!({ "role": "assistant", "content": content }));
+                    continue;
+                }
+            }
+            return extract_anthropic_text(&value).ok_or_else(|| AiError::EmptyResponse {
+                provider: "anthropic".into(),
+            });
+        }
+        Err(AiError::EmptyResponse {
+            provider: "anthropic".into(),
+        })
     }
 
     pub(crate) async fn complete_vision(
@@ -309,6 +362,34 @@ fn anthropic_cached_system(prompt: &DecisionPrompt) -> Value {
             "cache_control": { "type": "ephemeral" }
         }
     ])
+}
+
+/// Body for the webLookup research call. Plain text out — the web_search
+/// server tool is incompatible with json_schema output, and the caller
+/// post-filters the answer anyway. No sampling params (removed on newer
+/// models) and no cache_control (the prompt is tiny and rarely repeated).
+/// `web_search_20250305` is the broadly compatible tool version; the newer
+/// `web_search_20260209` requires 4.6-family models and adds nothing needed
+/// for a ≤3-line navigation answer.
+pub(crate) fn anthropic_web_lookup_body(
+    model: &str,
+    system_prompt: &str,
+    messages: &[Value],
+) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": MAX_WEB_LOOKUP_TOKENS,
+        "stream": false,
+        "system": system_prompt,
+        "messages": messages,
+        "tools": [
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": MAX_WEB_LOOKUP_SEARCHES
+            }
+        ]
+    })
 }
 
 pub(crate) fn anthropic_decision_body(prompt: &DecisionPrompt, model: &str) -> Value {
@@ -1229,5 +1310,27 @@ mod tests {
                 "required": ["action"]
             }),
         }
+    }
+
+    #[test]
+    fn anthropic_web_lookup_body_declares_search_tool_and_no_schema_or_sampling() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": "App: Safari (com.apple.Safari). Feature: enable develop menu."
+        })];
+        let body = anthropic_web_lookup_body("claude-sonnet-4-6", "lookup system", &messages);
+
+        assert_eq!(body["tools"][0]["type"], "web_search_20250305");
+        assert_eq!(body["tools"][0]["name"], "web_search");
+        assert_eq!(
+            body["tools"][0]["max_uses"],
+            u64::from(MAX_WEB_LOOKUP_SEARCHES)
+        );
+        assert_eq!(body["system"], "lookup system");
+        assert_eq!(body["messages"], json!(messages));
+        // web_search is incompatible with json_schema output, and sampling
+        // params are removed on newer models.
+        assert!(body.get("output_config").is_none());
+        assert!(body.get("temperature").is_none());
     }
 }

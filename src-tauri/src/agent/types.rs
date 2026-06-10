@@ -970,6 +970,21 @@ pub trait Planner {
     async fn plan_milestones(&self, _goal: &str) -> Vec<String> {
         Vec::new()
     }
+
+    /// Whether the webLookup action can actually run this turn: the user's
+    /// toggle is on AND the text provider supports server-side web search.
+    /// The executor uses this for graceful rung descent.
+    fn web_lookup_available(&self) -> bool {
+        false
+    }
+
+    /// Research where a feature lives in the app's UI via a web-search
+    /// enabled model call. The outbound prompt carries only app identity and
+    /// the validated query — never observation text. Returns raw answer
+    /// text; the executor post-filters it before anything reaches history.
+    async fn web_lookup(&self, _app: &FocusedApp, _query: &str) -> Result<String, String> {
+        Err("web lookup is not supported by this planner".into())
+    }
 }
 
 #[cfg(test)]
