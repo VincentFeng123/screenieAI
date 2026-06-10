@@ -4,6 +4,7 @@ use super::grounding::{
     DEFAULT_GROUNDER_MODEL,
 };
 use super::hints::{now_ms, HintStore, UiHint, UiHintKind};
+use super::matching;
 use super::search::score_match;
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
@@ -1721,6 +1722,10 @@ where
     // the planning observation, executed without another model call.
     let mut queued: VecDeque<(PreparedAction, Action, String)> = VecDeque::new();
     let mut last_step_clean = true;
+    // Monotonic id for each perception snapshot handed to the planner;
+    // element ids are only meaningful within their epoch (logged with every
+    // resolve so id-vs-intent drift is attributable to a specific snapshot).
+    let mut observation_epoch: u64 = 0;
 
     'steps: while step_index < step_budget {
         if run_started.elapsed().saturating_sub(user_wait_time) >= wall_clock_budget {
@@ -1850,6 +1855,7 @@ where
         let settle_status = stable.status;
         let mut before = pre_elements.clone();
         let mut observation_metadata = observer.observation_metadata();
+        observation_epoch = observation_epoch.wrapping_add(1);
 
         if let Some(trigger_reason) = force_visual_replan_next.take() {
             eprintln!(
@@ -1860,9 +1866,13 @@ where
                 Ok(Some(visual_before)) => {
                     before = visual_before;
                     observation_metadata = observer.observation_metadata();
+                    observation_epoch = observation_epoch.wrapping_add(1);
                     eprintln!(
-                        "[screenie] agent step {} visual-replan-ok source={:?} capture={:?}",
-                        step_number, observation_metadata.source, observation_metadata.capture_size
+                        "[screenie] agent step {} visual-replan-ok source={:?} capture={:?} epoch={}",
+                        step_number,
+                        observation_metadata.source,
+                        observation_metadata.capture_size,
+                        observation_epoch
                     );
                 }
                 Ok(None) => {
@@ -2086,7 +2096,28 @@ where
                 let proposal_key = normalized_progress_action(&display_action, &prepared);
                 let banned_rejection = stuck_recovery.rejection_for(&proposal_key);
                 let was_banned = banned_rejection.is_some();
-                if let Some(reason) = banned_rejection
+                // The target-intent gate runs first: a planner that names one
+                // element and ids another never reaches execution, and the
+                // structured notice teaches it which element the id really is.
+                let intent_mismatch = target_intent_mismatch_reason(
+                    decision.target_name.as_deref(),
+                    decision.target_role.as_deref(),
+                    &prepared,
+                );
+                if let (Some(expected), Some(target)) =
+                    (decision.target_name.as_deref(), prepared.target.as_ref())
+                {
+                    eprintln!(
+                        "[screenie] agent step {} resolve epoch={} via=id match_score={:.2} expected=\"{}\" resolved=\"{}\"",
+                        step_number,
+                        observation_epoch,
+                        target_intent_match_score(expected, target),
+                        expected,
+                        target.name
+                    );
+                }
+                if let Some(reason) = intent_mismatch
+                    .or(banned_rejection)
                     .or_else(|| {
                         planner_action_rejection_reason(
                             &action,
@@ -4451,6 +4482,48 @@ fn target_element_by_id(obs: &[Element], id: u32) -> Result<Element, ExecutionEr
         .find(|element| element.id == id)
         .cloned()
         .ok_or(ExecutionError::TargetMissing(id))
+}
+
+/// Best fuzzy score between the planner's echoed target_name and a resolved
+/// target's visible labels (name, then value as fallback for fields).
+fn target_intent_match_score(expected_name: &str, target: &TargetSummary) -> f64 {
+    let name_score = matching::label_match_score(expected_name, &target.name);
+    let value_score = target
+        .value
+        .as_deref()
+        .map(|value| matching::label_match_score(expected_name, value))
+        .unwrap_or(0.0);
+    name_score.max(value_score)
+}
+
+/// The target-intent gate (WI-1): when the planner echoed the name of the
+/// element it intends to act on, the resolved element's labels must fuzzy
+/// match it; otherwise the action is rejected before any input is posted and
+/// the planner receives a structured `target_mismatch` notice.
+fn target_intent_mismatch_reason(
+    expected_name: Option<&str>,
+    expected_role: Option<&str>,
+    prepared: &PreparedAction,
+) -> Option<String> {
+    let expected = expected_name?.trim();
+    if expected.is_empty() {
+        return None;
+    }
+    let target = prepared.target.as_ref()?;
+    let score = target_intent_match_score(expected, target);
+    if score >= matching::TARGET_MATCH_ACCEPT_THRESHOLD {
+        return None;
+    }
+    // The role echo is advisory; it only sharpens the feedback when the
+    // name already failed.
+    let role_note = expected_role
+        .filter(|hint| !matching::role_matches_hint(hint, &target.role))
+        .map(|hint| format!("; you also said role '{hint}' but it is a {}", target.role))
+        .unwrap_or_default();
+    Some(format!(
+        "target_mismatch{{requested=\"{expected}\", resolved=\"{}\", actual_role=\"{}\"}} match_score={score:.2}; id {} is not the element you described{role_note}. Copy target_name from the observation entry whose name matches your intent, or scroll/readPage to reveal it",
+        target.name, target.role, target.id
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -7641,6 +7714,141 @@ mod tests {
         let preflight = report.steps[0].click_preflight.as_ref().unwrap();
         assert_eq!(preflight.status, ClickPreflightStatus::Passed);
         assert_eq!(preflight.actual_point, Some(ClickPoint { x: 50, y: 22 }));
+    }
+
+    fn specialist_link() -> Element {
+        // Verbatim from the failing run's step 14: id 29 resolved to the
+        // "Connect with a Specialist" AXLink while the planner described the
+        // Pro Max radio.
+        Element::new(
+            29,
+            "AXLink".into(),
+            "Connect with a Specialist(Opens in a new window)".into(),
+            None,
+            Rect {
+                x: 1330.0,
+                y: 623.0,
+                width: 53.0,
+                height: 53.0,
+            },
+            true,
+            false,
+            CoordinateSpace::AxPoints,
+            ElementSource::Web,
+        )
+    }
+
+    fn pro_max_radio() -> Element {
+        Element::new(
+            30,
+            "AXRadioButton".into(),
+            "iPhone 17 Pro Max 6.9-inch display".into(),
+            None,
+            Rect {
+                x: 100.0,
+                y: 100.0,
+                width: 200.0,
+                height: 40.0,
+            },
+            true,
+            false,
+            CoordinateSpace::AxPoints,
+            ElementSource::Ax,
+        )
+    }
+
+    #[test]
+    fn target_intent_mismatch_reason_rejects_step_14_case() {
+        let obs = vec![specialist_link(), pro_max_radio()];
+        let prepared = prepare_action(&Action::Click { id: 29 }, &obs).unwrap();
+
+        let reason = target_intent_mismatch_reason(
+            Some("iPhone 17 Pro Max 6.9-inch display"),
+            Some("AXRadioButton"),
+            &prepared,
+        )
+        .expect("mismatched intent must be rejected");
+        assert!(reason.contains("target_mismatch{"), "got: {reason}");
+        assert!(
+            reason.contains("requested=\"iPhone 17 Pro Max 6.9-inch display\""),
+            "got: {reason}"
+        );
+        assert!(
+            reason.contains("resolved=\"Connect with a Specialist(Opens in a new window)\""),
+            "got: {reason}"
+        );
+        assert!(reason.contains("actual_role=\"AXLink\""), "got: {reason}");
+
+        // A verbatim echo of the resolved element's name passes the gate.
+        let prepared = prepare_action(&Action::Click { id: 30 }, &obs).unwrap();
+        assert_eq!(
+            target_intent_mismatch_reason(
+                Some("iPhone 17 Pro Max 6.9-inch display"),
+                Some("radio"),
+                &prepared,
+            ),
+            None
+        );
+
+        // No echo (stub planners, grounding paths) or no target: gate is off.
+        assert_eq!(target_intent_mismatch_reason(None, None, &prepared), None);
+        let scroll = prepare_action(&Action::Scroll { dx: 0, dy: 100 }, &obs).unwrap();
+        assert_eq!(
+            target_intent_mismatch_reason(Some("anything"), None, &scroll),
+            None
+        );
+    }
+
+    #[test]
+    fn target_intent_gate_blocks_mismatched_click_and_redirects() {
+        // Step-14 replay: the planner first emits the wrong id (29, the
+        // specialist link) while describing the Pro Max radio, then corrects
+        // itself to id 30 after the structured rejection. The wrong id must
+        // produce ZERO input events; only the radio gets acted on.
+        let intent = "iPhone 17 Pro Max 6.9-inch display";
+        let planner = StubPlanner::decision_sequence(vec![
+            PlannerDecision::new("select largest screen", Action::Click { id: 29 })
+                .with_target_intent(Some(intent.into()), Some("AXRadioButton".into())),
+            PlannerDecision::new("select largest screen", Action::Click { id: 30 })
+                .with_target_intent(Some(intent.into()), Some("AXRadioButton".into())),
+        ]);
+        let observer = FakeObserver::new(vec![
+            Ok(vec![specialist_link(), pro_max_radio()]),
+            Ok(vec![element(2, "Done")]),
+        ])
+        .with_presses(vec![Ok(true)]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        // Exactly one committed step: the AXPress click on the radio.
+        assert_eq!(report.steps.len(), 1);
+        assert!(report.steps[0].executed);
+        assert_eq!(
+            report.steps[0].target.as_ref().map(|t| t.name.as_str()),
+            Some("iPhone 17 Pro Max 6.9-inch display")
+        );
+        // The mismatched proposal posted no synthetic input, and the only
+        // element ever pressed is the radio.
+        assert!(events.borrow().is_empty(), "events: {:?}", events.borrow());
+        assert_eq!(*observer.pressed_element_ids.borrow(), vec![30]);
     }
 
     #[test]

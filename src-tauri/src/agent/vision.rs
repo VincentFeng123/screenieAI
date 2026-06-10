@@ -523,7 +523,15 @@ where
     ) -> Result<Vec<Element>, ObservationError> {
         let detector_kind = self.detector.kind().to_string();
         let boxes = self.detector.detect(&capture);
-        let (elements, mark_bounds) = augment_ax_with_visual_candidates(ax, &boxes, &info);
+        let (elements, mark_bounds, dropped_offscreen) =
+            augment_ax_with_visual_candidates(ax, &boxes, &info);
+        if dropped_offscreen > 0 {
+            eprintln!(
+                "[screenie] agent marks dropped_offscreen={} visible={}",
+                dropped_offscreen,
+                mark_bounds.len()
+            );
+        }
 
         if mark_bounds.is_empty() {
             self.state.clear();
@@ -880,7 +888,7 @@ fn augment_ax_with_visual_candidates(
     ax: Vec<Element>,
     visual_boxes: &[Rect],
     info: &FocusedWindowInfo,
-) -> (Vec<Element>, BTreeMap<u32, Rect>) {
+) -> (Vec<Element>, BTreeMap<u32, Rect>, usize) {
     let mut mark_bounds = ax
         .iter()
         .filter_map(|element| {
@@ -909,9 +917,21 @@ fn augment_ax_with_visual_candidates(
         mark_bounds.insert(element.id, element.bounds);
     }
 
-    let mut elements = ax;
+    // In marks mode the planner grounds ids by reading the numbered chips
+    // off the screenshot; an element outside the capture has no chip, so
+    // offering its id invites the wrong-id clicks of the failing run. Drop
+    // them for this observation — they come back with the next AX snapshot.
+    let mut elements = Vec::with_capacity(ax.len() + visual_elements.len());
+    let mut dropped_offscreen = 0_usize;
+    for element in ax {
+        if mark_bounds.contains_key(&element.id) {
+            elements.push(element);
+        } else {
+            dropped_offscreen += 1;
+        }
+    }
     elements.extend(visual_elements);
-    (elements, mark_bounds)
+    (elements, mark_bounds, dropped_offscreen)
 }
 
 fn ax_points_to_window_pixels(bounds: Rect, info: &FocusedWindowInfo) -> Option<Rect> {
@@ -984,8 +1004,11 @@ fn draw_mark(image: &mut RgbaImage, id: u32, bounds: Rect, font: Option<&FontArc
     let label = id.to_string();
     let chip_w = (label.chars().count() as u32 * 10 + 12).max(22);
     let chip_h = 20;
+    // The chip sits INSIDE the box's top-left corner: a chip floating above
+    // the box reads as the previous element's label on dense pages (and
+    // edge-clamping used to pile chips on top of each other).
     let chip_x = x.max(0);
-    let chip_y = (y - chip_h as i32).max(0);
+    let chip_y = y.max(0);
     draw_filled_rect_mut(
         image,
         ImageProcRect::at(chip_x, chip_y).of_size(chip_w, chip_h),
@@ -1689,7 +1712,7 @@ mod tests {
             scale_factor: 1.0,
         };
         let ax = vec![element(9)];
-        let (elements, marks) = augment_ax_with_visual_candidates(
+        let (elements, marks, dropped) = augment_ax_with_visual_candidates(
             ax,
             &[
                 Rect {
@@ -1715,6 +1738,63 @@ mod tests {
         assert_eq!(elements[1].source, ElementSource::VisionDetected);
         assert!(marks.contains_key(&9));
         assert!(marks.contains_key(&10));
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn augment_ax_drops_offscreen_elements_from_marks_observation() {
+        let info = FocusedWindowInfo {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width_pixels: 800,
+            height_pixels: 600,
+            scale_factor: 1.0,
+        };
+        let visible = element(9);
+        let mut offscreen = element(10);
+        // Scrolled above the viewport: negative AX y, fully outside the
+        // capture — the failing run kept such ids choosable with no mark.
+        offscreen.bounds = Rect {
+            x: 100.0,
+            y: -500.0,
+            width: 80.0,
+            height: 24.0,
+        };
+
+        let (elements, marks, dropped) =
+            augment_ax_with_visual_candidates(vec![visible, offscreen], &[], &info);
+
+        assert_eq!(dropped, 1);
+        assert!(elements.iter().any(|element| element.id == 9));
+        assert!(
+            !elements.iter().any(|element| element.id == 10),
+            "an element with no visible mark must not stay choosable in marks mode"
+        );
+        assert!(marks.contains_key(&9));
+        assert!(!marks.contains_key(&10));
+    }
+
+    #[test]
+    fn draw_mark_places_chip_inside_its_own_box() {
+        let mut image = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        draw_mark(
+            &mut image,
+            7,
+            Rect {
+                x: 40.0,
+                y: 60.0,
+                width: 100.0,
+                height: 30.0,
+            },
+            None,
+        );
+
+        let chip = Rgba([255, 64, 64, 235]);
+        // The chip sits inside the box's top-left corner...
+        assert_eq!(*image.get_pixel(45, 65), chip);
+        // ...not floating above the box, where on dense pages it reads as
+        // the previous element's label.
+        assert_ne!(*image.get_pixel(45, 45), chip);
     }
 
     #[test]

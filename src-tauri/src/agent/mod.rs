@@ -3,6 +3,7 @@ mod grounding;
 mod hints;
 #[cfg(target_os = "macos")]
 mod macos_observer;
+mod matching;
 mod observer;
 #[cfg(target_os = "macos")]
 mod page_reader;

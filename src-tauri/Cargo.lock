@@ -4838,6 +4838,7 @@ dependencies = [
  "rubato",
  "serde",
  "serde_json",
+ "strsim",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",

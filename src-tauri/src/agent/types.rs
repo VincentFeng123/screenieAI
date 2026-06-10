@@ -994,6 +994,13 @@ pub struct PlannerDecision {
     pub expect: Option<String>,
     /// True when the planner judges the current milestone visibly complete.
     pub milestone_done: bool,
+    /// Echo of the targeted element's name as the planner read it in the
+    /// observation. The executor refuses to act when the resolved element's
+    /// name does not fuzzy-match this (the target-intent gate).
+    pub target_name: Option<String>,
+    /// Optional echo of the targeted element's role ("link", "AXButton").
+    /// Advisory: logged alongside the gate, never blocks on its own.
+    pub target_role: Option<String>,
 }
 
 impl PlannerDecision {
@@ -1005,6 +1012,8 @@ impl PlannerDecision {
             note: None,
             expect: None,
             milestone_done: false,
+            target_name: None,
+            target_role: None,
         }
     }
 
@@ -1025,6 +1034,16 @@ impl PlannerDecision {
 
     pub fn with_milestone_done(mut self, milestone_done: bool) -> Self {
         self.milestone_done = milestone_done;
+        self
+    }
+
+    pub fn with_target_intent(
+        mut self,
+        target_name: Option<String>,
+        target_role: Option<String>,
+    ) -> Self {
+        self.target_name = target_name;
+        self.target_role = target_role;
         self
     }
 }
