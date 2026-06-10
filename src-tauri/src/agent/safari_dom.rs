@@ -4,15 +4,23 @@ use super::types::{
 use serde::Deserialize;
 use std::process::Command;
 
-const DOM_EXTRACTION_JS: &str = r#"(function(){const ATTR='data-agent-id';const PREFIX='screenie-';const viewportWidth=window.innerWidth||document.documentElement.clientWidth||0;const viewportHeight=window.innerHeight||document.documentElement.clientHeight||0;const used=new Set();let seq=0;function textOf(el){return (el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();}function byIdList(value){return String(value||'').split(/\s+/).map(id=>document.getElementById(id)).filter(Boolean).map(textOf).filter(Boolean).join(' ');}function labelFor(el){const aria=el.getAttribute('aria-label');if(aria&&aria.trim())return aria.trim();const labelled=byIdList(el.getAttribute('aria-labelledby'));if(labelled)return labelled;const id=el.id;if(id){const label=document.querySelector('label[for="'+CSS.escape(id)+'"]');if(label){const text=textOf(label);if(text)return text;}}if(el.labels&&el.labels.length){const text=Array.from(el.labels).map(textOf).filter(Boolean).join(' ');if(text)return text;}for(const attr of ['title','placeholder','alt','name']){const value=el.getAttribute(attr);if(value&&value.trim())return value.trim();}const text=textOf(el);if(text)return text;return el.id||el.tagName.toLowerCase();}function inputType(el){return (el.getAttribute('type')||'text').toLowerCase();}function isEditable(el){return el.isContentEditable||el.getAttribute('contenteditable')===''||el.getAttribute('contenteditable')==='true';}function disabled(el){return !!el.disabled||String(el.getAttribute('aria-disabled')||'').toLowerCase()==='true';}function roleAttr(el){return (el.getAttribute('role')||'').toLowerCase();}function actionable(el){const tag=el.tagName.toLowerCase();const role=roleAttr(el);if(tag==='input')return inputType(el)!=='hidden';if(['button','select','textarea','summary'].includes(tag))return true;if(tag==='a'&&el.href)return true;if(isEditable(el))return true;if(['button','link','textbox','searchbox','combobox','checkbox','radio','slider','menuitem','tab','switch'].includes(role))return true;if(el.tabIndex>=0&&role)return true;return false;}function visibleStyle(el){const style=window.getComputedStyle(el);return style&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity||'1')!==0;}function clipRect(rect){const left=Math.max(0,Math.min(viewportWidth,rect.left));const top=Math.max(0,Math.min(viewportHeight,rect.top));const right=Math.max(0,Math.min(viewportWidth,rect.right));const bottom=Math.max(0,Math.min(viewportHeight,rect.bottom));return {x:left,y:top,width:right-left,height:bottom-top};}function visibleRect(el){const rects=Array.from(el.getClientRects()).map(clipRect).filter(r=>r.width>=2&&r.height>=2);if(!rects.length)return null;const first=rects[0];let left=first.x,top=first.y,right=first.x+first.width,bottom=first.y+first.height;for(const r of rects.slice(1)){left=Math.min(left,r.x);top=Math.min(top,r.y);right=Math.max(right,r.x+r.width);bottom=Math.max(bottom,r.y+r.height);}return {x:left,y:top,width:right-left,height:bottom-top};}function unobscured(el,rect){const x=Math.max(0,Math.min(viewportWidth-1,rect.x+rect.width/2));const y=Math.max(0,Math.min(viewportHeight-1,rect.y+rect.height/2));const hit=document.elementFromPoint(x,y);return !hit||hit===el||el.contains(hit)||hit.contains(el);}function ensureId(el){let id=el.getAttribute(ATTR);if(id&&used.has(id))id='';if(!id){do{id=PREFIX+Date.now().toString(36)+'-'+(seq++).toString(36);}while(used.has(id));el.setAttribute(ATTR,id);}used.add(id);return id;}function labelProxyRect(el){if(el.tagName.toLowerCase()!=='input')return null;const t=inputType(el);if(t!=='radio'&&t!=='checkbox')return null;if(!el.labels||!el.labels.length)return null;for(const lab of Array.from(el.labels)){if(!visibleStyle(lab))continue;const r=visibleRect(lab);if(!r||r.width<2||r.height<2)continue;if(!unobscured(lab,r))continue;return r;}return null;}const selector='a[href],button,input,textarea,select,summary,[role],[tabindex],[contenteditable=""],[contenteditable="true"]';const elements=[];for(const el of Array.from(document.querySelectorAll(selector))){if(disabled(el)||!actionable(el))continue;let rect=null;if(visibleStyle(el)){rect=visibleRect(el);if(rect&&(rect.width<2||rect.height<2))rect=null;if(rect&&!unobscured(el,rect))rect=null;}if(!rect)rect=labelProxyRect(el);if(!rect)continue;const tag=el.tagName.toLowerCase();const type=tag==='input'?inputType(el):'';let value=null;if(tag==='input'&&(type==='radio'||type==='checkbox'))value=el.checked?'checked':'unchecked';else if((tag==='input'||tag==='textarea')&&type!=='password'&&typeof el.value==='string'&&el.value.trim())value=el.value;elements.push({agentId:ensureId(el),tag,inputType:type,role:roleAttr(el),name:labelFor(el),value,rect,disabled:disabled(el),focused:document.activeElement===el,contentEditable:isEditable(el),multiline:tag==='textarea'||el.getAttribute('aria-multiline')==='true'});}return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,elements});})()"#;
+const DOM_EXTRACTION_JS: &str = r#"(function(){const ATTR='data-agent-id';const PREFIX='screenie-';const viewportWidth=window.innerWidth||document.documentElement.clientWidth||0;const viewportHeight=window.innerHeight||document.documentElement.clientHeight||0;const scrollX=window.scrollX||0;const scrollY=window.scrollY||0;const scroller=document.scrollingElement||document.documentElement;const scrollWidth=(scroller&&scroller.scrollWidth)||0;const scrollHeight=(scroller&&scroller.scrollHeight)||0;const used=new Set();let seq=0;function textOf(el){return (el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();}function byIdList(value){return String(value||'').split(/\s+/).map(id=>document.getElementById(id)).filter(Boolean).map(textOf).filter(Boolean).join(' ');}function labelFor(el){const aria=el.getAttribute('aria-label');if(aria&&aria.trim())return aria.trim();const labelled=byIdList(el.getAttribute('aria-labelledby'));if(labelled)return labelled;const id=el.id;if(id){const label=document.querySelector('label[for="'+CSS.escape(id)+'"]');if(label){const text=textOf(label);if(text)return text;}}if(el.labels&&el.labels.length){const text=Array.from(el.labels).map(textOf).filter(Boolean).join(' ');if(text)return text;}for(const attr of ['title','placeholder','alt','name']){const value=el.getAttribute(attr);if(value&&value.trim())return value.trim();}const text=textOf(el);if(text)return text;return el.id||el.tagName.toLowerCase();}function inputType(el){return (el.getAttribute('type')||'text').toLowerCase();}function isEditable(el){return el.isContentEditable||el.getAttribute('contenteditable')===''||el.getAttribute('contenteditable')==='true';}function disabled(el){return !!el.disabled||String(el.getAttribute('aria-disabled')||'').toLowerCase()==='true';}function roleAttr(el){return (el.getAttribute('role')||'').toLowerCase();}function actionable(el){const tag=el.tagName.toLowerCase();const role=roleAttr(el);if(tag==='input')return inputType(el)!=='hidden';if(['button','select','textarea','summary'].includes(tag))return true;if(tag==='a'&&el.href)return true;if(isEditable(el))return true;if(['button','link','textbox','searchbox','combobox','checkbox','radio','slider','menuitem','tab','switch'].includes(role))return true;if(el.tabIndex>=0&&role)return true;return false;}function visibleStyle(el){const style=window.getComputedStyle(el);return style&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity||'1')!==0;}function clipRect(rect){const left=Math.max(0,Math.min(viewportWidth,rect.left));const top=Math.max(0,Math.min(viewportHeight,rect.top));const right=Math.max(0,Math.min(viewportWidth,rect.right));const bottom=Math.max(0,Math.min(viewportHeight,rect.bottom));return {x:left,y:top,width:right-left,height:bottom-top};}function visibleRect(el){const rects=Array.from(el.getClientRects()).map(clipRect).filter(r=>r.width>=2&&r.height>=2);if(!rects.length)return null;const first=rects[0];let left=first.x,top=first.y,right=first.x+first.width,bottom=first.y+first.height;for(const r of rects.slice(1)){left=Math.min(left,r.x);top=Math.min(top,r.y);right=Math.max(right,r.x+r.width);bottom=Math.max(bottom,r.y+r.height);}return {x:left,y:top,width:right-left,height:bottom-top};}function unobscured(el,rect){const x=Math.max(0,Math.min(viewportWidth-1,rect.x+rect.width/2));const y=Math.max(0,Math.min(viewportHeight-1,rect.y+rect.height/2));const hit=document.elementFromPoint(x,y);return !hit||hit===el||el.contains(hit)||hit.contains(el);}function ensureId(el){let id=el.getAttribute(ATTR);if(id&&used.has(id))id='';if(!id){do{id=PREFIX+Date.now().toString(36)+'-'+(seq++).toString(36);}while(used.has(id));el.setAttribute(ATTR,id);}used.add(id);return id;}function labelProxyRect(el){if(el.tagName.toLowerCase()!=='input')return null;const t=inputType(el);if(t!=='radio'&&t!=='checkbox')return null;if(!el.labels||!el.labels.length)return null;for(const lab of Array.from(el.labels)){if(!visibleStyle(lab))continue;const r=visibleRect(lab);if(!r||r.width<2||r.height<2)continue;if(!unobscured(lab,r))continue;return r;}return null;}const selector='a[href],button,input,textarea,select,summary,[role],[tabindex],[contenteditable=""],[contenteditable="true"]';const elements=[];for(const el of Array.from(document.querySelectorAll(selector))){if(disabled(el)||!actionable(el))continue;let rect=null;if(visibleStyle(el)){rect=visibleRect(el);if(rect&&(rect.width<2||rect.height<2))rect=null;if(rect&&!unobscured(el,rect))rect=null;}if(!rect)rect=labelProxyRect(el);if(!rect)continue;const tag=el.tagName.toLowerCase();const type=tag==='input'?inputType(el):'';let value=null;if(tag==='input'&&(type==='radio'||type==='checkbox'))value=el.checked?'checked':'unchecked';else if((tag==='input'||tag==='textarea')&&type!=='password'&&typeof el.value==='string'&&el.value.trim())value=el.value;elements.push({agentId:ensureId(el),tag,inputType:type,role:roleAttr(el),name:labelFor(el),value,rect,disabled:disabled(el),focused:document.activeElement===el,contentEditable:isEditable(el),multiline:tag==='textarea'||el.getAttribute('aria-multiline')==='true'});}return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,scrollX:scrollX,scrollY:scrollY,scrollWidth:scrollWidth,scrollHeight:scrollHeight,elements});})()"#;
 
-const DOM_REFRESH_JS_PREFIX: &str = r#"(function(agentId){const ATTR='data-agent-id';const viewportWidth=window.innerWidth||document.documentElement.clientWidth||0;const viewportHeight=window.innerHeight||document.documentElement.clientHeight||0;function textOf(el){return (el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();}function byIdList(value){return String(value||'').split(/\s+/).map(id=>document.getElementById(id)).filter(Boolean).map(textOf).filter(Boolean).join(' ');}function labelFor(el){const aria=el.getAttribute('aria-label');if(aria&&aria.trim())return aria.trim();const labelled=byIdList(el.getAttribute('aria-labelledby'));if(labelled)return labelled;const id=el.id;if(id){const label=document.querySelector('label[for="'+CSS.escape(id)+'"]');if(label){const text=textOf(label);if(text)return text;}}if(el.labels&&el.labels.length){const text=Array.from(el.labels).map(textOf).filter(Boolean).join(' ');if(text)return text;}for(const attr of ['title','placeholder','alt','name']){const value=el.getAttribute(attr);if(value&&value.trim())return value.trim();}const text=textOf(el);if(text)return text;return el.id||el.tagName.toLowerCase();}function inputType(el){return (el.getAttribute('type')||'text').toLowerCase();}function isEditable(el){return el.isContentEditable||el.getAttribute('contenteditable')===''||el.getAttribute('contenteditable')==='true';}function disabled(el){return !!el.disabled||String(el.getAttribute('aria-disabled')||'').toLowerCase()==='true';}function roleAttr(el){return (el.getAttribute('role')||'').toLowerCase();}function clipRect(rect){const left=Math.max(0,Math.min(viewportWidth,rect.left));const top=Math.max(0,Math.min(viewportHeight,rect.top));const right=Math.max(0,Math.min(viewportWidth,rect.right));const bottom=Math.max(0,Math.min(viewportHeight,rect.bottom));return {x:left,y:top,width:right-left,height:bottom-top};}function visibleRect(el){const rects=Array.from(el.getClientRects()).map(clipRect).filter(r=>r.width>=2&&r.height>=2);if(!rects.length)return null;const first=rects[0];let left=first.x,top=first.y,right=first.x+first.width,bottom=first.y+first.height;for(const r of rects.slice(1)){left=Math.min(left,r.x);top=Math.min(top,r.y);right=Math.max(right,r.x+r.width);bottom=Math.max(bottom,r.y+r.height);}return {x:left,y:top,width:right-left,height:bottom-top};}function labelProxyRect(el){if(el.tagName.toLowerCase()!=='input')return null;const t=inputType(el);if(t!=='radio'&&t!=='checkbox')return null;if(!el.labels||!el.labels.length)return null;for(const lab of Array.from(el.labels)){const r=visibleRect(lab);if(r&&r.width>=2&&r.height>=2)return r;}return null;}const el=document.querySelector('['+ATTR+'="'+CSS.escape(agentId)+'"]');if(!el)return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,elements:[]});const rect=visibleRect(el)||labelProxyRect(el);if(!rect)return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,elements:[]});const tag=el.tagName.toLowerCase();const type=tag==='input'?inputType(el):'';let value=null;if(tag==='input'&&(type==='radio'||type==='checkbox'))value=el.checked?'checked':'unchecked';else if((tag==='input'||tag==='textarea')&&type!=='password'&&typeof el.value==='string'&&el.value.trim())value=el.value;return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,elements:[{agentId:agentId,tag,inputType:type,role:roleAttr(el),name:labelFor(el),value,rect,disabled:disabled(el),focused:document.activeElement===el,contentEditable:isEditable(el),multiline:tag==='textarea'||el.getAttribute('aria-multiline')==='true'}]});})("#;
+const DOM_REFRESH_JS_PREFIX: &str = r#"(function(agentId){const ATTR='data-agent-id';const viewportWidth=window.innerWidth||document.documentElement.clientWidth||0;const viewportHeight=window.innerHeight||document.documentElement.clientHeight||0;const scrollX=window.scrollX||0;const scrollY=window.scrollY||0;const scroller=document.scrollingElement||document.documentElement;const scrollWidth=(scroller&&scroller.scrollWidth)||0;const scrollHeight=(scroller&&scroller.scrollHeight)||0;function textOf(el){return (el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();}function byIdList(value){return String(value||'').split(/\s+/).map(id=>document.getElementById(id)).filter(Boolean).map(textOf).filter(Boolean).join(' ');}function labelFor(el){const aria=el.getAttribute('aria-label');if(aria&&aria.trim())return aria.trim();const labelled=byIdList(el.getAttribute('aria-labelledby'));if(labelled)return labelled;const id=el.id;if(id){const label=document.querySelector('label[for="'+CSS.escape(id)+'"]');if(label){const text=textOf(label);if(text)return text;}}if(el.labels&&el.labels.length){const text=Array.from(el.labels).map(textOf).filter(Boolean).join(' ');if(text)return text;}for(const attr of ['title','placeholder','alt','name']){const value=el.getAttribute(attr);if(value&&value.trim())return value.trim();}const text=textOf(el);if(text)return text;return el.id||el.tagName.toLowerCase();}function inputType(el){return (el.getAttribute('type')||'text').toLowerCase();}function isEditable(el){return el.isContentEditable||el.getAttribute('contenteditable')===''||el.getAttribute('contenteditable')==='true';}function disabled(el){return !!el.disabled||String(el.getAttribute('aria-disabled')||'').toLowerCase()==='true';}function roleAttr(el){return (el.getAttribute('role')||'').toLowerCase();}function clipRect(rect){const left=Math.max(0,Math.min(viewportWidth,rect.left));const top=Math.max(0,Math.min(viewportHeight,rect.top));const right=Math.max(0,Math.min(viewportWidth,rect.right));const bottom=Math.max(0,Math.min(viewportHeight,rect.bottom));return {x:left,y:top,width:right-left,height:bottom-top};}function visibleRect(el){const rects=Array.from(el.getClientRects()).map(clipRect).filter(r=>r.width>=2&&r.height>=2);if(!rects.length)return null;const first=rects[0];let left=first.x,top=first.y,right=first.x+first.width,bottom=first.y+first.height;for(const r of rects.slice(1)){left=Math.min(left,r.x);top=Math.min(top,r.y);right=Math.max(right,r.x+r.width);bottom=Math.max(bottom,r.y+r.height);}return {x:left,y:top,width:right-left,height:bottom-top};}function labelProxyRect(el){if(el.tagName.toLowerCase()!=='input')return null;const t=inputType(el);if(t!=='radio'&&t!=='checkbox')return null;if(!el.labels||!el.labels.length)return null;for(const lab of Array.from(el.labels)){const r=visibleRect(lab);if(r&&r.width>=2&&r.height>=2)return r;}return null;}const el=document.querySelector('['+ATTR+'="'+CSS.escape(agentId)+'"]');if(!el)return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,scrollX:scrollX,scrollY:scrollY,scrollWidth:scrollWidth,scrollHeight:scrollHeight,elements:[]});const rect=visibleRect(el)||labelProxyRect(el);if(!rect)return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,scrollX:scrollX,scrollY:scrollY,scrollWidth:scrollWidth,scrollHeight:scrollHeight,elements:[]});const tag=el.tagName.toLowerCase();const type=tag==='input'?inputType(el):'';let value=null;if(tag==='input'&&(type==='radio'||type==='checkbox'))value=el.checked?'checked':'unchecked';else if((tag==='input'||tag==='textarea')&&type!=='password'&&typeof el.value==='string'&&el.value.trim())value=el.value;return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,scrollX:scrollX,scrollY:scrollY,scrollWidth:scrollWidth,scrollHeight:scrollHeight,elements:[{agentId:agentId,tag,inputType:type,role:roleAttr(el),name:labelFor(el),value,rect,disabled:disabled(el),focused:document.activeElement===el,contentEditable:isEditable(el),multiline:tag==='textarea'||el.getAttribute('aria-multiline')==='true'}]});})("#;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SafariDomPayload {
     pub inner_width: f64,
     pub inner_height: f64,
+    #[serde(default)]
+    pub scroll_x: f64,
+    #[serde(default)]
+    pub scroll_y: f64,
+    #[serde(default)]
+    pub scroll_width: f64,
+    #[serde(default)]
+    pub scroll_height: f64,
     pub elements: Vec<SafariDomElement>,
 }
 
@@ -181,6 +189,10 @@ pub(crate) fn elements_from_payload(
     let geometry = SafariDomPayload {
         inner_width: payload.inner_width,
         inner_height: payload.inner_height,
+        scroll_x: payload.scroll_x,
+        scroll_y: payload.scroll_y,
+        scroll_width: payload.scroll_width,
+        scroll_height: payload.scroll_height,
         elements: Vec::new(),
     };
 
@@ -255,13 +267,42 @@ pub(crate) fn dom_rect_to_screen_rect(
     } else {
         web_area_bounds.height / scale
     };
+    let ax_height_css = web_area_bounds.height / scale;
+    let (viewport_origin_x, viewport_origin_y) =
+        if web_area_origin_is_scrolled(ax_height_css, payload) {
+            (
+                web_area_bounds.x + payload.scroll_x * scale,
+                web_area_bounds.y + payload.scroll_y * scale,
+            )
+        } else {
+            (web_area_bounds.x, web_area_bounds.y)
+        };
     let clipped = clip_dom_rect(rect, viewport_width, viewport_height)?;
     Some(Rect {
-        x: web_area_bounds.x + clipped.x * scale,
-        y: web_area_bounds.y + clipped.y * scale,
+        x: viewport_origin_x + clipped.x * scale,
+        y: viewport_origin_y + clipped.y * scale,
         width: clipped.width * scale,
         height: clipped.height * scale,
     })
+}
+
+const AX_WEB_AREA_VIEWPORT_EPSILON_CSS_PX: f64 = 4.0;
+
+/// WebKit usually exposes Safari's AXWebArea as a full-document rect whose
+/// origin shifts up/left by the page scroll (origin.y ≈ chrome bottom −
+/// scrollY), so the viewport's screen origin is web_area.origin + scroll ×
+/// scale. Some configurations report a static viewport-sized rect instead;
+/// distinguish them by which document metric the AX height tracks. At
+/// scroll == 0 both branches agree, so misclassifying an unscrolled page is
+/// harmless, and payloads without scroll fields default to zero offset
+/// (legacy behavior).
+fn web_area_origin_is_scrolled(ax_height_css: f64, payload: &SafariDomPayload) -> bool {
+    if (ax_height_css - payload.inner_height).abs() <= AX_WEB_AREA_VIEWPORT_EPSILON_CSS_PX {
+        return false;
+    }
+    payload.scroll_height > payload.inner_height
+        && (ax_height_css - payload.scroll_height).abs()
+            < (ax_height_css - payload.inner_height).abs()
 }
 
 fn clip_dom_rect(rect: DomRect, viewport_width: f64, viewport_height: f64) -> Option<DomRect> {
@@ -354,6 +395,10 @@ mod tests {
         let payload = SafariDomPayload {
             inner_width: 800.0,
             inner_height: 600.0,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            scroll_width: 0.0,
+            scroll_height: 0.0,
             elements: Vec::new(),
         };
         let web_area = Rect {
@@ -421,6 +466,10 @@ mod tests {
         let payload = SafariDomPayload {
             inner_width: 1000.0,
             inner_height: 800.0,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            scroll_width: 0.0,
+            scroll_height: 0.0,
             elements: vec![
                 SafariDomElement {
                     agent_id: "screenie-a".into(),
@@ -493,6 +542,239 @@ mod tests {
         );
         assert_eq!(elements[1].id, 8);
         assert_eq!(elements[1].role, "AXLink");
+    }
+
+    #[test]
+    fn scrolled_full_document_web_area_offsets_origin_by_scroll() {
+        // The field repro: after the page scrolled 853 CSS px, WebKit's
+        // full-document AXWebArea origin sat above the screen and the color
+        // swatch (viewport y 753) was misplaced to screen y -10 instead of
+        // its true on-screen position at y 843.
+        let payload = SafariDomPayload {
+            inner_width: 1440.0,
+            inner_height: 900.0,
+            scroll_x: 0.0,
+            scroll_y: 853.0,
+            scroll_width: 1440.0,
+            scroll_height: 3000.0,
+            elements: Vec::new(),
+        };
+        let web_area = Rect {
+            x: 0.0,
+            y: 90.0 - 853.0,
+            width: 1440.0,
+            height: 3000.0,
+        };
+
+        let converted = dom_rect_to_screen_rect(
+            DomRect {
+                x: 1103.0,
+                y: 753.0,
+                width: 36.0,
+                height: 36.0,
+            },
+            web_area,
+            &payload,
+        )
+        .unwrap();
+
+        assert_eq!(
+            converted,
+            Rect {
+                x: 1103.0,
+                y: 843.0,
+                width: 36.0,
+                height: 36.0,
+            }
+        );
+    }
+
+    #[test]
+    fn static_viewport_web_area_skips_scroll_offset() {
+        // Guard for Safari builds whose AXWebArea is a viewport-sized rect:
+        // its origin is already the viewport origin, so the scroll offset
+        // must not be applied even when the page is scrolled.
+        let payload = SafariDomPayload {
+            inner_width: 1440.0,
+            inner_height: 900.0,
+            scroll_x: 0.0,
+            scroll_y: 853.0,
+            scroll_width: 1440.0,
+            scroll_height: 3000.0,
+            elements: Vec::new(),
+        };
+        let web_area = Rect {
+            x: 0.0,
+            y: 90.0,
+            width: 1440.0,
+            height: 900.0,
+        };
+
+        let converted = dom_rect_to_screen_rect(
+            DomRect {
+                x: 100.0,
+                y: 200.0,
+                width: 50.0,
+                height: 20.0,
+            },
+            web_area,
+            &payload,
+        )
+        .unwrap();
+
+        assert_eq!(
+            converted,
+            Rect {
+                x: 100.0,
+                y: 290.0,
+                width: 50.0,
+                height: 20.0,
+            }
+        );
+    }
+
+    #[test]
+    fn horizontally_scrolled_full_document_offsets_x() {
+        let payload = SafariDomPayload {
+            inner_width: 1000.0,
+            inner_height: 800.0,
+            scroll_x: 120.0,
+            scroll_y: 0.0,
+            scroll_width: 1600.0,
+            scroll_height: 2400.0,
+            elements: Vec::new(),
+        };
+        let web_area = Rect {
+            x: -120.0,
+            y: 80.0,
+            width: 1000.0,
+            height: 2400.0,
+        };
+
+        let converted = dom_rect_to_screen_rect(
+            DomRect {
+                x: 40.0,
+                y: 10.0,
+                width: 60.0,
+                height: 20.0,
+            },
+            web_area,
+            &payload,
+        )
+        .unwrap();
+
+        assert_eq!(
+            converted,
+            Rect {
+                x: 40.0,
+                y: 90.0,
+                width: 60.0,
+                height: 20.0,
+            }
+        );
+    }
+
+    #[test]
+    fn payload_without_scroll_fields_parses_with_zero_defaults() {
+        let payload =
+            parse_payload(r#"{"innerWidth":800,"innerHeight":600,"elements":[]}"#).unwrap();
+        assert_eq!(payload.scroll_x, 0.0);
+        assert_eq!(payload.scroll_y, 0.0);
+        assert_eq!(payload.scroll_width, 0.0);
+        assert_eq!(payload.scroll_height, 0.0);
+
+        // Zero scroll metrics mean zero offset: conversion matches legacy.
+        let converted = dom_rect_to_screen_rect(
+            DomRect {
+                x: 700.0,
+                y: 580.0,
+                width: 200.0,
+                height: 40.0,
+            },
+            Rect {
+                x: 100.0,
+                y: 200.0,
+                width: 400.0,
+                height: 300.0,
+            },
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(
+            converted,
+            Rect {
+                x: 450.0,
+                y: 490.0,
+                width: 50.0,
+                height: 10.0,
+            }
+        );
+    }
+
+    #[test]
+    fn elements_from_payload_applies_scroll_offset() {
+        // Guards the stripped geometry clone inside elements_from_payload:
+        // the scroll fields must survive into the per-element conversion.
+        let payload = SafariDomPayload {
+            inner_width: 1000.0,
+            inner_height: 800.0,
+            scroll_x: 0.0,
+            scroll_y: 500.0,
+            scroll_width: 1000.0,
+            scroll_height: 4000.0,
+            elements: vec![SafariDomElement {
+                agent_id: "screenie-c".into(),
+                tag: "a".into(),
+                input_type: "".into(),
+                role: "".into(),
+                name: "Details".into(),
+                value: None,
+                rect: DomRect {
+                    x: 10.0,
+                    y: 100.0,
+                    width: 100.0,
+                    height: 50.0,
+                },
+                disabled: false,
+                focused: false,
+                content_editable: false,
+                multiline: false,
+            }],
+        };
+        let web_area = Rect {
+            x: 0.0,
+            y: 80.0 - 500.0,
+            width: 1000.0,
+            height: 4000.0,
+        };
+
+        let elements = elements_from_payload(payload, web_area, 1);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(
+            elements[0].bounds,
+            Rect {
+                x: 10.0,
+                y: 180.0,
+                width: 100.0,
+                height: 50.0,
+            }
+        );
+    }
+
+    #[test]
+    fn extraction_and_refresh_js_report_scroll_offsets() {
+        for js in [DOM_EXTRACTION_JS, DOM_REFRESH_JS_PREFIX] {
+            assert!(js.contains("scrollX:scrollX"), "scrollX missing");
+            assert!(js.contains("scrollY:scrollY"), "scrollY missing");
+            assert!(js.contains("scrollWidth:scrollWidth"), "scrollWidth missing");
+            assert!(
+                js.contains("scrollHeight:scrollHeight"),
+                "scrollHeight missing"
+            );
+        }
+        // Every refresh return branch (element missing, rect missing,
+        // success) must carry the geometry so the payload parses uniformly.
+        assert_eq!(DOM_REFRESH_JS_PREFIX.matches("scrollY:scrollY").count(), 3);
     }
 
     #[test]

@@ -423,6 +423,7 @@ impl MacObserver {
                 if remaining > 0 {
                     let mut web_elements = safari_dom::observe_safari_dom(web_area, start_id)?;
                     web_elements.truncate(remaining);
+                    log_suspect_safari_dom_geometry(web_area, &web_elements);
                     elements.extend(web_elements);
                 }
             }
@@ -1328,6 +1329,28 @@ fn rect_has_visible_bounds(rect: Rect) -> bool {
 
 fn rect_area(rect: Rect) -> f64 {
     rect.width.max(0.0) * rect.height.max(0.0)
+}
+
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+/// One log line per observation when a converted Safari DOM element lands
+/// entirely off the display — the smoke signal for a wrong web-area origin
+/// (e.g. an unhandled AXWebArea shape after scrolling).
+fn log_suspect_safari_dom_geometry(web_area: Rect, web_elements: &[Element]) {
+    let Some(display) = main_display_bounds() else {
+        return;
+    };
+    if let Some(stray) = web_elements
+        .iter()
+        .find(|element| !rects_overlap(element.bounds, display))
+    {
+        eprintln!(
+            "[screenie] agent safari-dom geometry suspect web_area={:?} element={:?} bounds={:?}",
+            web_area, stray.name, stray.bounds
+        );
+    }
 }
 
 fn frontmost_application_info() -> Result<Option<FocusedApp>, ObservationError> {
