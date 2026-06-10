@@ -2242,6 +2242,7 @@ where
                             pending_hint = Some(PendingHint {
                                 feature: query.clone(),
                                 source: "menuScan",
+                                claimed_combo: None,
                             });
                         }
                         matches.extend(find_ui_menu_matches(&scan));
@@ -2361,16 +2362,15 @@ where
                     .await
                 {
                     Ok(raw) => {
+                        let filtered = filter_web_lookup_answer(&raw);
                         step.executed = true;
                         step.mechanism = Some(ActionMechanism::WebLookup);
                         pending_hint = Some(PendingHint {
                             feature: query.clone(),
                             source: "webLookup",
+                            claimed_combo: claimed_shortcut_from_answer(&filtered),
                         });
-                        format!(
-                            "web (untrusted, navigation only): {}",
-                            filter_web_lookup_answer(&raw)
-                        )
+                        format!("web (untrusted, navigation only): {filtered}")
                     }
                     // API errors are planner feedback, never run failures.
                     Err(err) => format!("webLookup failed: {err}"),
@@ -3710,6 +3710,21 @@ fn find_ui_hint_matches(store: &HintStore, app: &FocusedApp, query: &str) -> Vec
 struct PendingHint {
     feature: String,
     source: &'static str,
+    /// The shortcut the web answer claimed, if any. A key press is cached
+    /// only when it matches, so incidental keys that happen to progress
+    /// (Return, arrows) never get persisted as a feature's shortcut.
+    claimed_combo: Option<String>,
+}
+
+/// First `shortcut:` segment of a filtered webLookup answer, if present.
+fn claimed_shortcut_from_answer(filtered: &str) -> Option<String> {
+    filtered.split(" | ").find_map(|segment| {
+        let segment = segment.trim();
+        let prefix_len = "shortcut: ".len();
+        (segment.len() > prefix_len
+            && segment[..prefix_len].eq_ignore_ascii_case("shortcut: "))
+        .then(|| segment[prefix_len..].trim().to_string())
+    })
 }
 
 /// Persist a pending hint when — and only when — the progressed action
@@ -3737,7 +3752,13 @@ fn record_pending_hint(
             source: pending.source.into(),
         },
         (Action::Key { combo }, _) if pending.source == "webLookup" => {
-            if validate_key_combo(combo).is_err()
+            // Cache only the combo the web answer itself claimed: progress
+            // after an unrelated key press proves nothing about the feature.
+            let claimed_matches = pending.claimed_combo.as_deref().is_some_and(|claimed| {
+                normalize_key_combo_for_safety(claimed) == normalize_key_combo_for_safety(combo)
+            });
+            if !claimed_matches
+                || validate_key_combo(combo).is_err()
                 || app_window_closing_key_combo_reason(combo).is_some()
             {
                 return;
@@ -8877,19 +8898,21 @@ mod tests {
     }
 
     #[test]
-    fn destructive_combo_is_never_cached_as_hint() {
+    fn only_claimed_nondestructive_combos_are_cached_as_hints() {
         let dir = std::env::temp_dir().join(format!("screenie-hint-combo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = HintStore::new(Some(dir.clone()));
         let app = focused_app("com.example.app", "Example");
         let options = StubAgentOptions::default().resolve();
 
+        // Destructive combos are refused even when the web answer claimed them.
         record_pending_hint(
             &store,
             &app,
             &PendingHint {
                 feature: "close everything".into(),
                 source: "webLookup",
+                claimed_combo: Some("cmd+q".into()),
             },
             &Action::Key {
                 combo: "cmd+q".into(),
@@ -8899,12 +8922,49 @@ mod tests {
         );
         assert!(store.lookup(&app, "close everything", 3, now_ms()).is_empty());
 
+        // An incidental key press (Return) after a lookup that claimed a
+        // different shortcut must not be cached as the feature's shortcut.
+        record_pending_hint(
+            &store,
+            &app,
+            &PendingHint {
+                feature: "submit form".into(),
+                source: "webLookup",
+                claimed_combo: Some("cmd+option+r".into()),
+            },
+            &Action::Key {
+                combo: "Return".into(),
+            },
+            None,
+            &options,
+        );
+        assert!(store.lookup(&app, "submit form", 3, now_ms()).is_empty());
+
+        // A lookup whose answer claimed no shortcut caches nothing either.
+        record_pending_hint(
+            &store,
+            &app,
+            &PendingHint {
+                feature: "no claim".into(),
+                source: "webLookup",
+                claimed_combo: None,
+            },
+            &Action::Key {
+                combo: "cmd+option+r".into(),
+            },
+            None,
+            &options,
+        );
+        assert!(store.lookup(&app, "no claim", 3, now_ms()).is_empty());
+
+        // The claimed, verified, non-destructive combo is cached.
         record_pending_hint(
             &store,
             &app,
             &PendingHint {
                 feature: "responsive design mode".into(),
                 source: "webLookup",
+                claimed_combo: Some("cmd+option+r".into()),
             },
             &Action::Key {
                 combo: "cmd+option+r".into(),
@@ -8924,6 +8984,7 @@ mod tests {
             &PendingHint {
                 feature: "from menu scan".into(),
                 source: "menuScan",
+                claimed_combo: None,
             },
             &Action::Key {
                 combo: "cmd+option+i".into(),
@@ -8932,6 +8993,125 @@ mod tests {
             &options,
         );
         assert!(store.lookup(&app, "from menu scan", 3, now_ms()).is_empty());
+
+        assert_eq!(
+            claimed_shortcut_from_answer(
+                "menu: Develop > Show Web Inspector | Shortcut: cmd+option+i"
+            )
+            .as_deref(),
+            Some("cmd+option+i")
+        );
+        assert_eq!(claimed_shortcut_from_answer("not found"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_lookup_sourced_hint_round_trips_into_the_next_run() {
+        let dir =
+            std::env::temp_dir().join(format!("screenie-hint-weblookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Run 1: findUi misses, webLookup claims a shortcut, the model
+        // presses it, the press verifies as progress → hint persisted.
+        let observer = FakeObserver::new(vec![
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask")]),
+            Ok(vec![element(1, "Ask"), element(2, "Web Inspector pane")]),
+        ]);
+        let planner = WebLookupStubPlanner {
+            actions: vec![
+                Action::FindUi {
+                    query: "web inspector".into(),
+                },
+                Action::WebLookup {
+                    query: "show web inspector".into(),
+                },
+                Action::Key {
+                    combo: "cmd+option+i".into(),
+                },
+                Action::Done,
+            ],
+            results: Rc::new(RefCell::new(Vec::new())),
+            lookup_answers: RefCell::new(VecDeque::from(vec![Ok(
+                "shortcut: cmd+option+i".to_string()
+            )])),
+            lookup_calls: Rc::new(Cell::new(0)),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(6),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                hints_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+        assert_eq!(report.status, AgentRunStatus::Done);
+
+        let store = HintStore::new(Some(dir.clone()));
+        let app = focused_app("com.example.app", "Example");
+        let stored = store.lookup(&app, "show web inspector", 3, now_ms());
+        assert_eq!(stored.len(), 1, "the claimed verified combo must persist");
+        assert_eq!(stored[0].combo.as_deref(), Some("cmd+option+i"));
+        assert_eq!(stored[0].source, "webLookup");
+
+        // Run 2: the very first findUi surfaces the stored hint — no lookup
+        // is needed or performed.
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+        let results = Rc::new(RefCell::new(Vec::<String>::new()));
+        let lookup_calls = Rc::new(Cell::new(0));
+        let planner = WebLookupStubPlanner {
+            actions: vec![
+                Action::FindUi {
+                    query: "show web inspector".into(),
+                },
+                Action::Done,
+            ],
+            results: results.clone(),
+            lookup_answers: RefCell::new(VecDeque::new()),
+            lookup_calls: lookup_calls.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                hints_dir: Some(dir.clone()),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(lookup_calls.get(), 0, "the repeat run must not hit the web");
+        assert!(
+            results
+                .borrow()
+                .iter()
+                .any(|result| result.contains("hint: shortcut cmd+option+i")),
+            "the stored hint must surface in findUi, got {:?}",
+            results.borrow()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
