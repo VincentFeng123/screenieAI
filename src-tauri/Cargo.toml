@@ -84,5 +84,9 @@ windows = { version = "0.58", features = [
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 enigo = "0.6"
+# Streaming GIF encoder for screen-recording clips (raw `gif`, NOT `image`'s
+# gif feature — that would switch on GIF decoding inside every existing
+# image::load_from_memory call site).
+gif = "0.13"
 whisper-rs = { version = "0.16", features = ["metal"] }
 xcap = "=0.9.6"

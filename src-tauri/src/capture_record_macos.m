@@ -749,12 +749,13 @@ bool screenie_recording_stop(void *handle, char **error_out) {
 
     AVAssetWriter *writer = recorder.writer;
     if (writer == nil) {
-      // GIF frame-tap mode: nothing to finalize natively.
+      // GIF frame-tap mode: nothing to finalize natively. A stream that died
+      // early is still salvageable (Rust decides via the encoder's frame
+      // count); pass the cause through error_out either way.
       if (wasFailed) {
         NSString *text = [recorder errorTextCopy];
         screenie_record_set_error(
             error_out, text != nil ? text : @"recording failed");
-        return false;
       }
       return true;
     }
@@ -803,12 +804,12 @@ bool screenie_recording_stop(void *handle, char **error_out) {
 
     if (wasFailed) {
       // The file finalized, but the stream died early (display unplugged,
-      // user hit the system stop button). Report the cause; Rust treats the
-      // partial clip as salvageable.
+      // user hit the system stop button). Salvageable partial clip: report
+      // success WITH the cause in error_out so Rust can surface it as the
+      // stop reason rather than discarding the file.
       NSString *text = [recorder errorTextCopy];
       screenie_record_set_error(error_out,
                                 text != nil ? text : @"recording interrupted");
-      return false;
     }
     return true;
   }

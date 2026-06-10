@@ -344,6 +344,386 @@ async fn finish_frame(
     .map_err(|e| CaptureError::Other(format!("frame finish task join: {e}")))?
 }
 
+// ---------------------------------------------------------------------------
+// Recording (mp4 via native AVAssetWriter, gif via frame-tap + Rust encoder)
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::Arc;
+
+use super::engine::{ClipFormat, EffectiveRecordParams, RecordOpts, StopOutcome};
+
+/// One BGRA frame copied out of the SCStream tap (tight stride).
+struct GifFrame {
+    bgra: Vec<u8>,
+    width: u32,
+    height: u32,
+    pts_seconds: f64,
+}
+
+/// Shared with the ObjC trampoline as an `Arc` raw pointer. The pointer is
+/// reclaimed only after `screenie_recording_stop` + `_release` have returned
+/// (the sample queue is drained by then, so no further callbacks can fire).
+struct GifTapCtx {
+    tx: SyncSender<GifFrame>,
+    dropped: AtomicU64,
+}
+
+/// Fires on the SCStream sample queue: copy and bail, never block. A full
+/// channel means the encoder is behind — drop the frame and count it.
+extern "C" fn gif_frame_trampoline(
+    bgra: *const u8,
+    _len: usize,
+    width: u32,
+    height: u32,
+    bytes_per_row: usize,
+    pts_seconds: f64,
+    ctx: *mut c_void,
+) {
+    if bgra.is_null() || ctx.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    let ctx = unsafe { &*(ctx as *const GifTapCtx) };
+    let row_bytes = width as usize * 4;
+    let mut buf = Vec::with_capacity(row_bytes * height as usize);
+    for row in 0..height as usize {
+        let src = unsafe { std::slice::from_raw_parts(bgra.add(row * bytes_per_row), row_bytes) };
+        buf.extend_from_slice(src);
+    }
+    let frame = GifFrame {
+        bgra: buf,
+        width,
+        height,
+        pts_seconds,
+    };
+    if ctx.tx.try_send(frame).is_err() {
+        ctx.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct GifEncodeStats {
+    frames_written: u64,
+}
+
+/// Streaming GIF encoder: O(1 frame) memory, frames go straight to disk.
+/// Per-frame delays come from real PTS deltas — SCK only delivers frames
+/// when content changes, so fixed 1/fps delays would make static-screen
+/// gifs play absurdly fast.
+fn run_gif_encoder(
+    path: std::path::PathBuf,
+    width: u16,
+    height: u16,
+    fps: u32,
+    rx: Receiver<GifFrame>,
+) -> Result<GifEncodeStats, String> {
+    use gif::{Encoder, Frame, Repeat};
+
+    let file = std::fs::File::create(&path).map_err(|e| format!("gif create: {e}"))?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder =
+        Encoder::new(writer, width, height, &[]).map_err(|e| format!("gif encoder: {e}"))?;
+    encoder
+        .set_repeat(Repeat::Infinite)
+        .map_err(|e| format!("gif repeat: {e}"))?;
+
+    let default_delay_cs = ((100.0 / fps as f64).round() as u16).max(2);
+    let mut frames_written: u64 = 0;
+    // The delay stored on frame N is "how long to show N", i.e. the gap to
+    // frame N+1 — so hold each frame back until its successor arrives.
+    let mut pending: Option<GifFrame> = None;
+
+    let mut write_frame = |frame: GifFrame, delay_cs: u16| -> Result<(), String> {
+        let mut rgba = frame.bgra;
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2); // BGRA -> RGBA
+        }
+        let mut out = Frame::from_rgba_speed(frame.width as u16, frame.height as u16, &mut rgba, 10);
+        out.delay = delay_cs.max(2);
+        encoder
+            .write_frame(&out)
+            .map_err(|e| format!("gif frame write: {e}"))?;
+        frames_written += 1;
+        Ok(())
+    };
+
+    for frame in rx {
+        if let Some(prev) = pending.take() {
+            let delta_cs = ((frame.pts_seconds - prev.pts_seconds) * 100.0).round();
+            let delay = if delta_cs.is_finite() && delta_cs > 0.0 {
+                delta_cs.min(u16::MAX as f64) as u16
+            } else {
+                default_delay_cs
+            };
+            write_frame(prev, delay)?;
+        }
+        pending = Some(frame);
+    }
+    if let Some(last) = pending.take() {
+        write_frame(last, default_delay_cs)?;
+    }
+    // Encoder drop writes the GIF trailer; BufWriter drop flushes.
+    Ok(GifEncodeStats { frames_written })
+}
+
+struct GifPipeline {
+    /// `Arc::into_raw` handed to the ObjC tap; reclaimed in `stop`.
+    ctx: *mut GifTapCtx,
+    encoder: Option<std::thread::JoinHandle<Result<GifEncodeStats, String>>>,
+}
+
+/// A live native recording session. All methods are blocking — call from
+/// `spawn_blocking`. Send is sound: the opaque handle is only ever passed to
+/// thread-safe extern fns (atomic properties; the recorder's real work runs
+/// on its own dispatch queues).
+pub(crate) struct MacRecording {
+    handle: *mut c_void,
+    gif: Option<GifPipeline>,
+}
+
+unsafe impl Send for MacRecording {}
+
+pub(crate) struct StartSpec {
+    pub display_id: u32,
+    pub window_id: u32,
+    /// Display-relative source rect in points (region targets only).
+    pub src_rect: Option<(f64, f64, f64, f64)>,
+    pub fps: u32,
+    pub out_width: u32,
+    pub out_height: u32,
+    pub show_cursor: bool,
+    pub exclude_self: bool,
+    pub format: ClipFormat,
+    /// Where the artifact is written while recording (`.inprogress/`).
+    pub inprogress_path: std::path::PathBuf,
+}
+
+impl MacRecording {
+    pub(crate) fn start(spec: &StartSpec) -> Result<Self, CaptureError> {
+        let (src_x, src_y, src_w, src_h) = spec.src_rect.unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let cfg = ScreenieRecordConfig {
+            display_id: spec.display_id,
+            window_id: spec.window_id,
+            src_x,
+            src_y,
+            src_w,
+            src_h,
+            fps: spec.fps,
+            out_width: spec.out_width,
+            out_height: spec.out_height,
+            show_cursor: spec.show_cursor,
+            exclude_self: spec.exclude_self,
+        };
+
+        let mut gif: Option<GifPipeline> = None;
+        let (c_path, frame_cb, frame_ctx): (
+            Option<std::ffi::CString>,
+            Option<ScreenieFrameCallback>,
+            *mut c_void,
+        ) = match spec.format {
+            ClipFormat::Mp4 => {
+                let c_path = std::ffi::CString::new(
+                    spec.inprogress_path.to_string_lossy().as_bytes(),
+                )
+                .map_err(|_| CaptureError::Other("invalid clip path".into()))?;
+                (Some(c_path), None, std::ptr::null_mut())
+            }
+            ClipFormat::Gif => {
+                // Bounded channel: ~4 in-flight frames (≈4 MiB at the gif
+                // dimension caps). Overflow drops frames instead of stalling
+                // the SCK sample queue.
+                let (tx, rx) = sync_channel::<GifFrame>(4);
+                let ctx = Arc::into_raw(Arc::new(GifTapCtx {
+                    tx,
+                    dropped: AtomicU64::new(0),
+                })) as *mut GifTapCtx;
+                let path = spec.inprogress_path.clone();
+                let (w, h, fps) = (spec.out_width as u16, spec.out_height as u16, spec.fps);
+                let encoder = std::thread::Builder::new()
+                    .name("screenie-gif-encoder".into())
+                    .spawn(move || run_gif_encoder(path, w, h, fps, rx))
+                    .map_err(|e| CaptureError::Other(format!("gif encoder spawn: {e}")))?;
+                gif = Some(GifPipeline {
+                    ctx,
+                    encoder: Some(encoder),
+                });
+                (None, Some(gif_frame_trampoline as ScreenieFrameCallback), ctx as *mut c_void)
+            }
+        };
+
+        let mut err_slot: *mut c_char = std::ptr::null_mut();
+        let handle = unsafe {
+            screenie_recording_start(
+                &cfg,
+                c_path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                frame_cb,
+                frame_ctx,
+                &mut err_slot,
+            )
+        };
+        if handle.is_null() {
+            // Tear the gif pipeline down before surfacing the error: drop the
+            // tap context (no stream ever existed, so no callbacks) and let
+            // the encoder thread run dry.
+            if let Some(mut pipeline) = gif {
+                drop(unsafe { Arc::from_raw(pipeline.ctx as *const GifTapCtx) });
+                if let Some(encoder) = pipeline.encoder.take() {
+                    let _ = encoder.join();
+                }
+            }
+            let err = take_bridge_error(err_slot)
+                .unwrap_or_else(|| "recording failed to start".into());
+            return Err(CaptureError::Recording(err));
+        }
+        Ok(Self { handle, gif })
+    }
+
+    /// 0 = recording, 1 = stopped, 2 = failed.
+    pub(crate) fn state(&self) -> i32 {
+        unsafe { screenie_recording_state(self.handle) }
+    }
+
+    pub(crate) fn failure(&self) -> Option<String> {
+        take_bridge_string(unsafe { screenie_recording_error(self.handle) })
+    }
+
+    pub(crate) fn frame_count(&self) -> u64 {
+        unsafe { screenie_recording_frame_count(self.handle) }
+    }
+
+    /// Stop, finalize, release the native handle, and (gif) drain + join the
+    /// encoder. Consumes self: the session is gone afterwards either way.
+    pub(crate) fn stop(mut self) -> StopOutcome {
+        let mut err_slot: *mut c_char = std::ptr::null_mut();
+        let ok = unsafe { screenie_recording_stop(self.handle, &mut err_slot) };
+        let mut error = take_bridge_error(err_slot);
+        let mut frame_count = unsafe { screenie_recording_frame_count(self.handle) };
+        // After stop the sample queue is drained: no further callbacks.
+        unsafe { screenie_recording_release(self.handle) };
+        self.handle = std::ptr::null_mut();
+
+        let mut finalized = ok;
+        if let Some(mut pipeline) = self.gif.take() {
+            // Reclaim the tap context; dropping it hangs up the channel so
+            // the encoder thread drains and exits.
+            let ctx = unsafe { Arc::from_raw(pipeline.ctx as *const GifTapCtx) };
+            let dropped = ctx.dropped.load(Ordering::Relaxed);
+            drop(ctx);
+            match pipeline.encoder.take().map(|t| t.join()) {
+                Some(Ok(Ok(stats))) => {
+                    frame_count = stats.frames_written;
+                    if stats.frames_written == 0 {
+                        finalized = false;
+                        error.get_or_insert_with(|| {
+                            "no frames were captured (zero complete frames delivered)".into()
+                        });
+                    } else if dropped > 0 {
+                        eprintln!(
+                            "[screenie] gif encoder dropped {dropped} frames (encoder slower than capture)"
+                        );
+                    }
+                }
+                Some(Ok(Err(e))) => {
+                    finalized = false;
+                    error = Some(e);
+                }
+                Some(Err(_)) => {
+                    finalized = false;
+                    error = Some("gif encoder thread panicked".into());
+                }
+                None => {}
+            }
+        }
+
+        StopOutcome {
+            finalized,
+            error,
+            frame_count,
+        }
+    }
+}
+
+/// Resolve a capture target into a native start spec: ids, output pixel
+/// dimensions (long-edge clamped, floored to even for H.264), and the
+/// display-relative source rect for regions. Blocking (target enumeration).
+pub(crate) fn resolve_start_spec_blocking(
+    target: &CaptureTarget,
+    opts: &RecordOpts,
+    params: &EffectiveRecordParams,
+    inprogress_path: std::path::PathBuf,
+) -> Result<StartSpec, CaptureError> {
+    let targets = list_targets_blocking()?;
+
+    let (display_id, window_id, src_rect, native_w, native_h) = match target {
+        CaptureTarget::Display { id } => {
+            let display = match id {
+                Some(id) => targets.displays.iter().find(|d| d.id == *id),
+                None => targets.displays.first(),
+            }
+            .ok_or_else(|| CaptureError::Other("requested display not found".into()))?;
+            (display.id, 0, None, display.pixel_width, display.pixel_height)
+        }
+        CaptureTarget::Window { id } => {
+            let window = targets
+                .windows
+                .iter()
+                .find(|w| w.id == *id)
+                .ok_or_else(|| {
+                    CaptureError::Other("target window not found (it may have closed)".into())
+                })?;
+            let (cx, cy) = (window.x + window.width / 2.0, window.y + window.height / 2.0);
+            let scale = targets
+                .displays
+                .iter()
+                .find(|d| d.contains(cx, cy))
+                .or_else(|| targets.displays.first())
+                .map(|d| d.scale())
+                .unwrap_or(1.0);
+            (0, window.id, None, window.width * scale, window.height * scale)
+        }
+        CaptureTarget::Region { x, y, w, h } => {
+            if *w < 1.0 || *h < 1.0 {
+                return Err(CaptureError::Other("region is empty".into()));
+            }
+            let display = display_for_region(&targets, *x, *y, *w, *h)?;
+            let scale = display.scale();
+            (
+                display.id,
+                0,
+                Some((x - display.x, y - display.y, *w, *h)),
+                w * scale,
+                h * scale,
+            )
+        }
+    };
+
+    if native_w < 1.0 || native_h < 1.0 {
+        return Err(CaptureError::Other("capture target has no size".into()));
+    }
+    let long_edge = native_w.max(native_h);
+    let scale_down = if long_edge > params.max_dimension as f64 {
+        params.max_dimension as f64 / long_edge
+    } else {
+        1.0
+    };
+    // Floor to even: H.264 encoders reject odd dimensions.
+    let out_width = (((native_w * scale_down) as u32).max(2) / 2) * 2;
+    let out_height = (((native_h * scale_down) as u32).max(2) / 2) * 2;
+
+    Ok(StartSpec {
+        display_id,
+        window_id,
+        src_rect,
+        fps: params.fps,
+        out_width,
+        out_height,
+        show_cursor: opts.show_cursor,
+        exclude_self: opts.exclude_self,
+        format: opts.format,
+        inprogress_path,
+    })
+}
+
 #[cfg(test)]
 mod spike_tests {
     use super::*;

@@ -11,8 +11,12 @@
 
 use tauri::WebviewWindow;
 
-use super::engine::{self, CaptureTarget, CapturePermissionMap, CapturedFrame, FrameOpts};
+use super::engine::{
+    self, CaptureTarget, CapturePermissionMap, CapturedFrame, FrameOpts, RecordOpts,
+    RecordingFile, RecordingHandle,
+};
 use super::CaptureError;
+use crate::AppState;
 
 fn require_capture_window(window: &WebviewWindow, allowed: &[&str]) -> Result<(), CaptureError> {
     if allowed.contains(&window.label()) {
@@ -42,6 +46,63 @@ pub async fn capture_frame(
         None
     };
     engine::capture_frame(target, opts, persist_dir).await
+}
+
+/// Fixed-duration recording → saved clip. Clamped to the per-format caps
+/// (mp4 ≤ maxDurationS, gif ≤ 30s). The macOS screen-sharing indicator is
+/// visible for the whole recording.
+#[tauri::command]
+pub async fn record_clip(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    target: CaptureTarget,
+    duration_s: f64,
+    opts: Option<RecordOpts>,
+) -> Result<RecordingFile, CaptureError> {
+    require_capture_window(&window, &["quick_tooltip", "main"])?;
+    let app_data = crate::app_data_dir(&app).map_err(CaptureError::Other)?;
+    engine::record_clip(
+        state.recording.clone(),
+        app_data,
+        target,
+        duration_s,
+        opts.unwrap_or_default(),
+    )
+    .await
+}
+
+/// Open-ended session recording. One active session at a time; auto-stops
+/// at maxDurationS / maxClipBytes.
+#[tauri::command]
+pub async fn start_recording(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    target: CaptureTarget,
+    opts: Option<RecordOpts>,
+) -> Result<RecordingHandle, CaptureError> {
+    require_capture_window(&window, &["quick_tooltip", "main"])?;
+    let app_data = crate::app_data_dir(&app).map_err(CaptureError::Other)?;
+    engine::start_recording(
+        state.recording.clone(),
+        app_data,
+        target,
+        opts.unwrap_or_default(),
+    )
+    .await
+}
+
+/// Stop a session by id and return the finished clip. Returns the stored
+/// outcome when the session already auto-stopped at a cap.
+#[tauri::command]
+pub async fn stop_recording(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<RecordingFile, CaptureError> {
+    require_capture_window(&window, &["quick_tooltip", "main"])?;
+    engine::stop_recording(state.recording.clone(), Some(session_id)).await
 }
 
 /// The perceive/act permission map. `probe: true` additionally runs a real

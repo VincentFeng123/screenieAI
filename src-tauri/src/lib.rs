@@ -515,6 +515,10 @@ struct AppState {
     /// check and the (blocking) session start — prevents two concurrent
     /// invokes from double-opening the microphone.
     voice_starting: AtomicBool,
+    /// Screen-recording session coordination (one active session, busy
+    /// latch, finished-result stash). Arc so the cap-watchdog and the exit
+    /// hook can hold it without an AppHandle.
+    recording: Arc<capture::engine::RecordingSlots>,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -4388,7 +4392,10 @@ pub fn run() {
         voice::voice_download_model,
         voice::voice_set_config,
         capture::commands::capture_permission,
-        capture::commands::capture_frame
+        capture::commands::capture_frame,
+        capture::commands::record_clip,
+        capture::commands::start_recording,
+        capture::commands::stop_recording
     ]);
 
     #[cfg(desktop)]
@@ -4448,6 +4455,15 @@ pub fn run() {
             if let Err(e) = setup_tray(handle) {
                 eprintln!("[screenie] tray setup FAILED: {}", e);
                 return Err(Box::new(e));
+            }
+
+            // Captures TTL sweep: collect crash-orphaned .inprogress clips
+            // and expired artifacts. Runs once, before any recording session
+            // can start, off the main thread (it's all disk I/O).
+            if let Ok(app_data) = app_data_dir(handle) {
+                std::thread::spawn(move || {
+                    capture::storage::sweep(&app_data, capture::storage::DEFAULT_TTL);
+                });
             }
 
             // Milestone demo hook: SCREENIE_VOICE_AUTOSTART=1 starts a
@@ -4577,8 +4593,19 @@ pub fn run() {
     }
 
     builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Never exit with the macOS recording indicator lit or an
+            // unfinalized clip growing in .inprogress/: bounded (~2s)
+            // best-effort stop; anything slower is collected by the
+            // startup sweep next launch.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    capture::engine::stop_active_recording_on_exit(state.recording.clone());
+                }
+            }
+        });
 }
 
 #[cfg(test)]
