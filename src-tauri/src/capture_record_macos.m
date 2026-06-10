@@ -223,6 +223,110 @@ const char *screenie_capture_list_targets(void) {
   }
 }
 
+#pragma mark - Single still (macOS 14+)
+
+// ARC sibling of macos_window.m's static screenie_copy_png_base64_from_image.
+static char *screenie_capture_copy_png_base64(CGImageRef image) {
+  if (image == NULL) {
+    return NULL;
+  }
+  NSMutableData *data = [NSMutableData data];
+  CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+      (__bridge CFMutableDataRef)data, CFSTR("public.png"), 1, NULL);
+  if (dest == NULL) {
+    return NULL;
+  }
+  CGImageDestinationAddImage(dest, image, NULL);
+  BOOL ok = CGImageDestinationFinalize(dest);
+  CFRelease(dest);
+  if (!ok || data.length == 0) {
+    return NULL;
+  }
+  NSString *base64 = [data base64EncodedStringWithOptions:0];
+  const char *utf8 = [base64 UTF8String];
+  return utf8 != NULL ? strdup(utf8) : NULL;
+}
+
+// One still of a display (window_id == 0) or a window. Returns malloc'd
+// base64 PNG, or NULL on failure / below macOS 14 (callers check
+// screenie_screenshot_api_available first and use the screencapture-CLI
+// fallback). max_dimension > 0 downscales the long edge at the SCK layer —
+// GPU-side, so native 5K pixels never cross the FFI boundary.
+const char *screenie_capture_target_png(uint32_t display_id, uint32_t window_id,
+                                        uint32_t max_dimension,
+                                        bool exclude_self, bool show_cursor) {
+  if (@available(macOS 14.0, *)) {
+    @autoreleasepool {
+      SCShareableContent *content = screenie_fetch_shareable_content(NULL);
+      if (content == nil) {
+        return NULL;
+      }
+
+      SCContentFilter *filter = nil;
+      if (window_id != 0) {
+        SCWindow *window = screenie_record_find_window(content, window_id);
+        if (window == nil) {
+          return NULL;
+        }
+        filter =
+            [[SCContentFilter alloc] initWithDesktopIndependentWindow:window];
+      } else {
+        filter = screenie_record_display_filter(
+            content, (CGDirectDisplayID)display_id, exclude_self);
+      }
+      if (filter == nil) {
+        return NULL;
+      }
+
+      CGSize contentSize = filter.contentRect.size;
+      double scale = (double)filter.pointPixelScale;
+      double nativeW = contentSize.width * scale;
+      double nativeH = contentSize.height * scale;
+      if (nativeW < 1.0 || nativeH < 1.0) {
+        return NULL;
+      }
+      double outW = nativeW;
+      double outH = nativeH;
+      if (max_dimension > 0) {
+        double longEdge = MAX(nativeW, nativeH);
+        if (longEdge > (double)max_dimension) {
+          double s = (double)max_dimension / longEdge;
+          outW = MAX(1.0, floor(nativeW * s));
+          outH = MAX(1.0, floor(nativeH * s));
+        }
+      }
+
+      SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+      config.width = (size_t)outW;
+      config.height = (size_t)outH;
+      config.scalesToFit = YES;
+      config.showsCursor = show_cursor;
+
+      __block char *result = NULL;
+      dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+      [SCScreenshotManager
+          captureImageWithFilter:filter
+                   configuration:config
+               completionHandler:^(CGImageRef image, NSError *error) {
+        if (error == nil && image != NULL) {
+          result = screenie_capture_copy_png_base64(image);
+        }
+        dispatch_semaphore_signal(semaphore);
+      }];
+      dispatch_time_t timeout =
+          dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC);
+      if (dispatch_semaphore_wait(semaphore, timeout) != 0) {
+        // Same accepted trade-off as macos_window.m: on the (rare) timeout a
+        // late completion writes into block storage the block itself owns;
+        // the strdup'd string leaks but nothing dangles.
+        return NULL;
+      }
+      return result;
+    }
+  }
+  return NULL;
+}
+
 #pragma mark - Recording
 
 typedef struct ScreenieRecordConfig {

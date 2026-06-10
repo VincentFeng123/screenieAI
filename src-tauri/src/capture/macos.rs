@@ -1,4 +1,4 @@
-use super::{CaptureError, ScreenCapture};
+use super::{png_dimensions, CaptureError, ScreenCapture};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -12,13 +12,25 @@ pub async fn capture_rect(
     w_logical: i32,
     h_logical: i32,
 ) -> Result<ScreenCapture, CaptureError> {
+    let rect = format!("{},{},{},{}", x_logical, y_logical, w_logical, h_logical);
+    capture_cli(&["-x", "-t", "png", "-R", &rect]).await
+}
+
+/// Capture a single window by CGWindowID via the `screencapture` CLI
+/// (`-l <id>`; `-o` omits the drop shadow). Pre-macOS-14 fallback for the
+/// engine's window-target captures — `SCScreenshotManager` needs 14+.
+pub async fn capture_window_cli(window_id: u32) -> Result<ScreenCapture, CaptureError> {
+    let id_arg = window_id.to_string();
+    capture_cli(&["-x", "-t", "png", "-o", "-l", &id_arg]).await
+}
+
+async fn capture_cli(args: &[&str]) -> Result<ScreenCapture, CaptureError> {
     let id = uuid::Uuid::new_v4();
     let mut path: PathBuf = std::env::temp_dir();
     path.push(format!("screenie-screen-{}.png", id));
 
-    let rect = format!("{},{},{},{}", x_logical, y_logical, w_logical, h_logical);
     let status = Command::new("/usr/sbin/screencapture")
-        .args(["-x", "-t", "png", "-R", &rect])
+        .args(args)
         .arg(&path)
         .status()
         .await?;
@@ -66,24 +78,11 @@ pub async fn capture_rect(
     })
 }
 
-fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 24 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
-        return None;
-    }
-    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
-    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
-    Some((w, h))
-}
-
 /// Sparse-sample the decoded PNG and return true ONLY when every sampled
 /// channel is exactly 0. This matches macOS's TCC "Screen Recording
 /// denied" placeholder (uniform 0x00) without false-positives on real
 /// dark-mode / dim-content captures — even a dark terminal contains some
 /// non-zero pixels (anti-aliased text, scrollbar tracks, focus rings).
 fn is_blank(bytes: &[u8]) -> bool {
-    let img = match image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
-        Ok(i) => i,
-        Err(_) => return false,
-    };
-    super::rgba_is_blank(&img.to_rgba8())
+    super::png_is_blank(bytes)
 }

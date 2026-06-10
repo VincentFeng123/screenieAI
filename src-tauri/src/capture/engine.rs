@@ -247,6 +247,33 @@ pub struct CapturePermissionMap {
     pub screen_capture_verified: Option<bool>,
 }
 
+/// One still of a display / window / region, downscaled to
+/// `opts.max_dimension` on the long edge. Returns base64 PNG in-memory (the
+/// agent usually wants pixels, not a file); `persist_dir` additionally
+/// writes it under `<dir>/captures/` and returns the path.
+pub async fn capture_frame(
+    target: CaptureTarget,
+    opts: FrameOpts,
+    persist_dir: Option<std::path::PathBuf>,
+) -> Result<CapturedFrame, CaptureError> {
+    #[cfg(target_os = "macos")]
+    {
+        super::engine_macos::capture_frame(target, opts, persist_dir).await
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (target, opts, persist_dir);
+        super::engine_win::unsupported("screen frame capture")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (target, opts, persist_dir);
+        Err(CaptureError::Unsupported(
+            "screen frame capture is not available on this platform".into(),
+        ))
+    }
+}
+
 /// Build the permission map. Blocking (FFI + optional real capture probe) —
 /// call from `spawn_blocking`.
 pub fn permission_map_blocking(probe: bool) -> CapturePermissionMap {

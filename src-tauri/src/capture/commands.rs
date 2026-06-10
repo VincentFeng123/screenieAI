@@ -11,7 +11,7 @@
 
 use tauri::WebviewWindow;
 
-use super::engine::{self, CapturePermissionMap};
+use super::engine::{self, CaptureTarget, CapturePermissionMap, CapturedFrame, FrameOpts};
 use super::CaptureError;
 
 fn require_capture_window(window: &WebviewWindow, allowed: &[&str]) -> Result<(), CaptureError> {
@@ -22,6 +22,26 @@ fn require_capture_window(window: &WebviewWindow, allowed: &[&str]) -> Result<()
             "command not allowed from this window".into(),
         ))
     }
+}
+
+/// One still of a display / window / region for perception. Base64 PNG
+/// in-memory by default; `opts.persist` also writes it to the captures
+/// directory and returns the path.
+#[tauri::command]
+pub async fn capture_frame(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    target: CaptureTarget,
+    opts: Option<FrameOpts>,
+) -> Result<CapturedFrame, CaptureError> {
+    require_capture_window(&window, &["quick_tooltip", "main"])?;
+    let opts = opts.unwrap_or_default();
+    let persist_dir = if opts.persist {
+        Some(crate::app_data_dir(&app).map_err(CaptureError::Other)?)
+    } else {
+        None
+    };
+    engine::capture_frame(target, opts, persist_dir).await
 }
 
 /// The perceive/act permission map. `probe: true` additionally runs a real

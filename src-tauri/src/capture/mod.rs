@@ -8,6 +8,7 @@ mod win;
 
 pub(crate) mod commands;
 pub(crate) mod engine;
+pub(crate) mod storage;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod engine_macos;
@@ -92,6 +93,27 @@ pub(crate) fn rgba_is_blank(rgba: &image::RgbaImage) -> bool {
         }
     }
     true
+}
+
+/// Parse width/height straight out of a PNG header (no decode).
+pub(crate) fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((w, h))
+}
+
+/// Decode a PNG and run the strict all-zero blank probe (the macOS TCC
+/// "Screen Recording denied" placeholder). Full decode — run on the
+/// blocking pool for large images.
+pub(crate) fn png_is_blank(bytes: &[u8]) -> bool {
+    let img = match image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
+        Ok(i) => i,
+        Err(_) => return false,
+    };
+    rgba_is_blank(&img.to_rgba8())
 }
 
 pub async fn capture_rect(
