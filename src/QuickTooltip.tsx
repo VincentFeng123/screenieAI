@@ -147,6 +147,8 @@ const AGENT_MECHANISM_LABELS: Record<string, string> = {
   syntheticClick: "click",
   clipboardPaste: "paste",
   syntheticInput: "keys",
+  uiSearch: "search",
+  webLookup: "web",
 };
 
 function agentStepDetail(update: AgentStepUpdate): string {

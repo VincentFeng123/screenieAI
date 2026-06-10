@@ -436,6 +436,10 @@ pub enum ActionMechanism {
     ClipboardPaste,
     SyntheticInput,
     Script,
+    /// Read-only findUi search over hints, menus, and the observation.
+    UiSearch,
+    /// webLookup research call through the planner's web-search model.
+    WebLookup,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1628,7 +1632,10 @@ where
     let mut failure_reason = None;
     let mut calibrated_first_click = false;
     let mut recent_no_progress = VecDeque::<ProgressLoopEntry>::new();
-    let mut stuck_recovery = StuckRecovery::default();
+    let mut stuck_recovery = StuckRecovery {
+        web_lookup_available: planner.web_lookup_available(),
+        ..StuckRecovery::default()
+    };
     let mut approved_confirmations = HashSet::<ConfirmationApprovalKey>::new();
     let mut step_budget = options.max_steps;
     let hard_step_limit = if adaptive_step_budget {
@@ -2241,6 +2248,7 @@ where
                     }
                     matches.extend(find_ui_observation_matches(&before, query));
                     step.executed = true;
+                    step.mechanism = Some(ActionMechanism::UiSearch);
                     compose_find_ui_result(
                         query,
                         &matches,
@@ -2354,6 +2362,7 @@ where
                 {
                     Ok(raw) => {
                         step.executed = true;
+                        step.mechanism = Some(ActionMechanism::WebLookup);
                         pending_hint = Some(PendingHint {
                             feature: query.clone(),
                             source: "webLookup",
@@ -5016,6 +5025,9 @@ struct StuckRecovery {
     /// Set when the ladder reaches AskUser; the run loop pops it and blocks
     /// on a question to the user before the next step.
     pending_question: Option<String>,
+    /// Whether webLookup can actually run this task; controls whether the
+    /// KeyboardHint notice suggests it as the last resort before asking.
+    web_lookup_available: bool,
 }
 
 impl StuckRecovery {
@@ -5053,17 +5065,21 @@ impl StuckRecovery {
         };
         self.notice = match self.stage {
             StuckRecoveryStage::StuckNotice => Some(format!(
-                "STUCK: you repeated '{}' {} times with no UI change. That action is now banned for this task. Choose a DIFFERENT strategy: a different element id, a keyboard shortcut (key), scroll to reveal new targets, or activateApp.",
+                "STUCK: you repeated '{}' {} times with no UI change. That action is now banned for this task. Choose a DIFFERENT strategy: emit findUi with a short feature query to locate the control, or try a different element id, a keyboard shortcut (key), scroll to reveal new targets, or activateApp.",
                 entry.normalized_action, threshold
             )),
             StuckRecoveryStage::VisionReplan => Some(format!(
-                "STUCK: '{}' and earlier banned actions keep failing. Re-inspect the fresh observation before acting and pick a target you have not tried yet.",
+                "STUCK: '{}' and earlier banned actions keep failing. Re-inspect the fresh observation before acting and pick a target you have not tried yet. If the target may live in a menu or in settings, emit findUi before clicking again.",
                 entry.normalized_action
             )),
-            StuckRecoveryStage::KeyboardHint => Some(
-                "Mouse actions are not working here. Use the keyboard only: key cmd+l focuses the browser address bar, key tab moves focus, key Return submits, and typeFocused types into whatever is focused."
-                    .to_string(),
-            ),
+            StuckRecoveryStage::KeyboardHint => Some(format!(
+                "Mouse actions are not working here. Use the keyboard only: key cmd+l focuses the browser address bar, key tab moves focus, key Return submits, and typeFocused types into whatever is focused.{}",
+                if self.web_lookup_available {
+                    " If you still cannot find the control, emit webLookup with the feature name before asking the user."
+                } else {
+                    ""
+                }
+            )),
             _ => self.notice.take(),
         };
         self.stage
@@ -5090,7 +5106,7 @@ impl StuckRecovery {
         };
         self.notice = match self.stage {
             StuckRecoveryStage::StuckNotice => Some(format!(
-                "STUCK: '{normalized_action}' keeps getting rejected and is now banned for this task. Do exactly this instead: {rejection_reason}"
+                "STUCK: '{normalized_action}' keeps getting rejected and is now banned for this task. Do exactly this instead: {rejection_reason}. If you cannot locate the control, emit findUi with a feature query."
             )),
             StuckRecoveryStage::VisionReplan => Some(format!(
                 "STILL STUCK: re-read the annotated screenshot, then act. The fix is: {rejection_reason}"
@@ -7877,6 +7893,37 @@ mod tests {
         assert!(recovery.rejection_for("click:abc").is_none());
         assert!(recovery.notice().is_none());
         assert!(recovery.pending_question.is_none());
+    }
+
+    #[test]
+    fn stuck_notices_suggest_find_ui_and_web_lookup_only_when_available() {
+        let entry = ProgressLoopEntry {
+            pre_state_hash: "hash".into(),
+            normalized_action: "click:abc".into(),
+        };
+
+        let mut without_lookup = StuckRecovery::default();
+        without_lookup.escalate(&entry, 3);
+        assert!(without_lookup.notice().unwrap().contains("emit findUi"));
+        without_lookup.escalate(&entry, 3);
+        assert!(without_lookup.notice().unwrap().contains("findUi"));
+        without_lookup.escalate(&entry, 3);
+        let keyboard = without_lookup.notice().unwrap();
+        assert!(keyboard.contains("keyboard"));
+        assert!(!keyboard.contains("webLookup"));
+
+        let mut with_lookup = StuckRecovery {
+            web_lookup_available: true,
+            ..StuckRecovery::default()
+        };
+        with_lookup.escalate(&entry, 3);
+        with_lookup.escalate(&entry, 3);
+        with_lookup.escalate(&entry, 3);
+        assert!(with_lookup.notice().unwrap().contains("emit webLookup"));
+
+        let mut rejection = StuckRecovery::default();
+        rejection.escalate_rejection("type:abc", "emit key Return to submit");
+        assert!(rejection.notice().unwrap().contains("emit findUi"));
     }
 
     #[test]

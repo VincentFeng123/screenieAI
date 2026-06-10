@@ -20,6 +20,15 @@ The action ladder, as implemented:
    (mechanisms `click`, `paste`, `keys`).
 5. **Vision** — marks or grounding screenshots; only after AX comes up empty.
 
+Off the ladder sits the lost-element search: `findUi` (mechanism `search`)
+fuzzy-searches stored hints, the app's full menu tree (read-only AX walk),
+and the visible elements; `webLookup` (mechanism `web`, Settings → Agent →
+Web lookup, Anthropic provider only) asks a web-search model where a feature
+lives — legal only after a findUi came up empty, max 2 per stuck point /
+4 per run, answers filtered to `menu:`/`shortcut:`/`settings:` lines and
+labeled untrusted. Verified finds persist to
+`<app_data>/agent/hints/<bundle-id>.json` and short-circuit later runs.
+
 Run every scenario twice: once with a strong cloud model and once with a
 local Ollama model. The weak model may take more steps but must never emit
 unparseable actions (watch for repeated "planner output invalid" failures).
@@ -104,6 +113,34 @@ Expect, in order:
    QuickTooltip. "Stop" fails the run with `stopped by user while stuck`;
    "Keep trying" plus guidance feeds the next decisions.
 5. Only after a second exhaustion does the run fail on its own.
+
+## S7 — Lost feature: Safari Develop menu
+
+Goal: `open the web inspector for this page` (Safari frontmost, Develop menu
+disabled in Safari Settings → Advanced, Web lookup ON, Confirm-risky).
+
+Expect, in order:
+1. `findUi("web inspector")` (mechanism `search`) misses — no Develop menu
+   exists, so menus/hints/elements all come up empty; the step result says
+   "no match … or use webLookup".
+2. ≤ 2 `webLookup` calls (mechanism `web`); each result in the trace starts
+   with `web (untrusted, navigation only):` and contains only
+   `menu:`/`shortcut:`/`settings:` lines — audit the trace: **zero**
+   web-sourced commands, URLs, or prose may appear.
+3. The agent opens Safari Settings → Advanced, enables the developer
+   checkbox, then presses `menu Develop > Show Web Inspector`
+   (mechanism `menu`) and finishes done.
+4. `<app_data>/agent/hints/com.apple.Safari.json` now contains the learned
+   path. Budget: ≤ 10 model turns, 0 screenshots.
+
+Re-run the same goal with Develop disabled again:
+- The goal context shows "Known paths in this app", or the first findUi
+  returns the stored `hint:` line — **zero** webLookups this run.
+- Budget: ≤ 6 model turns.
+
+Re-run with Web lookup OFF (fresh hints dir): the agent must descend
+gracefully — findUi, scroll, settings exploration, or a clean ask — and the
+trace must show the "web lookup is disabled" feedback, never a run failure.
 
 ## Safety spot-checks (run after any executor change)
 
