@@ -3066,25 +3066,45 @@ where
 
             // WI-3: scroll anchors come from the live scroll container,
             // clamped to window and screen, recomputed on every attempt —
-            // never from remembered element positions. The pre-scroll
-            // position feeds the postcondition check after execution.
+            // never from remembered element positions. Retries walk an
+            // anchor ladder (container → window center → lower third) so a
+            // no-op wheel is never replayed at the identical point. The
+            // pre-scroll position feeds the postcondition check after
+            // execution, but only while the container is trusted — a
+            // chrome-strip scrollbar must not mint boundary verdicts.
             let mut scroll_pre_position: Option<f64> = None;
+            let mut scroll_anchor_strategy: Option<ScrollAnchorStrategy> = None;
+            let mut scroll_container_trusted = true;
             if matches!(prepared.kind, PreparedKind::Scroll { .. }) && prepared.target.is_none() {
                 let context = observer.scroll_context();
-                scroll_pre_position = context.and_then(|ctx| ctx.vertical_position);
-                let anchor = context.and_then(|ctx| {
-                    derive_scroll_anchor(&ctx).or_else(|| {
-                        eprintln!(
-                            "[screenie] agent step {} scroll_anchor_invalid context={:?}; recomputing without container",
-                            step_number, ctx
-                        );
-                        derive_scroll_anchor(&ScrollContext {
-                            container: None,
-                            ..ctx
-                        })
-                    })
-                });
-                prepared.click_point = anchor
+                let mut rung: Option<ScrollAnchorRung> = None;
+                if let Some(ctx) = context.as_ref() {
+                    let ladder = scroll_anchor_ladder(ctx);
+                    if !ladder.is_empty() {
+                        let index = (attempt as usize).saturating_sub(1).min(ladder.len() - 1);
+                        rung = Some(ladder[index]);
+                    }
+                    eprintln!(
+                        "[screenie] agent step {} scroll_anchor attempt={} strategy={:?} anchor={} container_kind={:?} container={:?} window={:?} screen={:?} pos={:?}",
+                        step_number,
+                        attempt,
+                        rung.map(|rung| rung.strategy),
+                        rung.map(|rung| format!("({}, {})", rung.anchor.x, rung.anchor.y))
+                            .unwrap_or_else(|| "none".into()),
+                        ctx.container_kind,
+                        ctx.container,
+                        ctx.window,
+                        ctx.screen,
+                        ctx.vertical_position,
+                    );
+                }
+                scroll_anchor_strategy = rung.map(|rung| rung.strategy);
+                scroll_container_trusted = rung.map_or(true, |rung| rung.container_trusted);
+                if scroll_container_trusted {
+                    scroll_pre_position = context.and_then(|ctx| ctx.vertical_position);
+                }
+                prepared.click_point = rung
+                    .map(|rung| rung.anchor)
                     .or_else(|| scroll_point_from_observation(&before))
                     .or(prepared.click_point);
             }
@@ -3470,16 +3490,25 @@ where
                 if step.executed && report.status != VerificationStatus::ObservationFailed {
                     if let PreparedKind::Scroll { dy, .. } = prepared.kind {
                         if dy != 0 {
-                            let post_position = observer
-                                .scroll_context()
-                                .and_then(|ctx| ctx.vertical_position);
+                            // An untrusted (chrome-strip) container's
+                            // scrollbar describes the wrong surface; without
+                            // position evidence the verdict rests on
+                            // content_shift alone and can never be a bogus
+                            // ScrollBoundary.
+                            let post_position = if scroll_container_trusted {
+                                observer
+                                    .scroll_context()
+                                    .and_then(|ctx| ctx.vertical_position)
+                            } else {
+                                None
+                            };
                             let fmt_pos = |value: Option<f64>| {
                                 value
                                     .map(|pos| format!("{pos:.3}"))
                                     .unwrap_or_else(|| "na".into())
                             };
                             eprintln!(
-                                "[screenie] agent step {} scroll_pos_before={} scroll_pos_after={} unit=px anchor={} content_shift={}",
+                                "[screenie] agent step {} scroll_pos_before={} scroll_pos_after={} unit=px anchor={} content_shift={} strategy={:?}",
                                 step_number,
                                 fmt_pos(scroll_pre_position),
                                 fmt_pos(post_position),
@@ -3490,6 +3519,7 @@ where
                                 scroll_shift
                                     .map(|shift| format!("{shift:.0}"))
                                     .unwrap_or_else(|| "na".into()),
+                                scroll_anchor_strategy,
                             );
                             if let Some((status, reason)) = scroll_verification(
                                 dy,
@@ -6584,10 +6614,10 @@ const SCROLL_SHIFT_EPSILON_POINTS: f64 = 2.0;
 const SCROLL_POSITION_EPSILON: f64 = 0.005;
 const SCROLL_BOUNDARY_TOLERANCE: f64 = 0.005;
 
-/// Center of (container ∩ window ∩ screen); missing pieces are skipped.
-/// `None` means the pieces do not overlap — an anchor must never be
-/// fabricated from a disjoint intersection.
-fn derive_scroll_anchor(ctx: &ScrollContext) -> Option<ClickPoint> {
+/// Clamped intersection (container ∩ window ∩ screen); missing pieces are
+/// skipped. `None` means the pieces are degenerate or do not overlap — an
+/// anchor must never be fabricated from a disjoint intersection.
+fn derive_scroll_frame(ctx: &ScrollContext) -> Option<Rect> {
     let mut frame: Option<Rect> = None;
     for rect in [ctx.container, ctx.window, ctx.screen].into_iter().flatten() {
         if !rect_is_finite(rect) || rect.is_empty() {
@@ -6598,12 +6628,111 @@ fn derive_scroll_anchor(ctx: &ScrollContext) -> Option<ClickPoint> {
             Some(acc) => intersect_rects(acc, rect)?,
         });
     }
-    let frame = frame?;
+    frame
+}
+
+/// Center of (container ∩ window ∩ screen); missing pieces are skipped.
+/// Production anchoring goes through `scroll_anchor_ladder`; this remains
+/// as the test seam for the clamped-intersection geometry.
+#[cfg(test)]
+fn derive_scroll_anchor(ctx: &ScrollContext) -> Option<ClickPoint> {
+    derive_scroll_frame(ctx).map(rect_center_point)
+}
+
+fn rect_center_point(frame: Rect) -> ClickPoint {
     let (x, y) = frame.center();
-    Some(ClickPoint {
+    ClickPoint {
         x: x.round() as i32,
         y: y.round() as i32,
+    }
+}
+
+const MIN_SCROLL_ANCHOR_HEIGHT_POINTS: f64 = 150.0;
+const MIN_SCROLL_ANCHOR_WINDOW_FRACTION: f64 = 0.25;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollAnchorStrategy {
+    Container,
+    WindowCenter,
+    WindowLowerThird,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollAnchorRung {
+    anchor: ClickPoint,
+    strategy: ScrollAnchorStrategy,
+    /// False when the container was rejected as browser chrome — its
+    /// scrollbar position must not feed boundary verdicts.
+    container_trusted: bool,
+}
+
+/// True when the anchor frame looks like a browser-chrome strip (Safari's
+/// tab bar is a ~94pt AXScrollArea spanning the window): short in absolute
+/// terms AND relative to the window. Only consulted on the untargeted
+/// page-scroll path, where a window-center fallback is the right semantic
+/// for tiny frames anyway.
+fn scroll_anchor_frame_is_chrome_strip(frame: Rect, window: Option<Rect>) -> bool {
+    if frame.height >= MIN_SCROLL_ANCHOR_HEIGHT_POINTS {
+        return false;
+    }
+    window.map_or(true, |window| {
+        frame.height < MIN_SCROLL_ANCHOR_WINDOW_FRACTION * window.height
     })
+}
+
+/// Ordered anchor candidates for an untargeted page scroll. Attempt N uses
+/// rung N (clamped to the last), so no-op retries post the wheel somewhere
+/// meaningfully different instead of replaying the identical failure:
+/// container center first (unless it looks like browser chrome), then the
+/// window center, then the window's lower third. When the container was
+/// guard-rejected, every remaining rung is marked untrusted.
+fn scroll_anchor_ladder(ctx: &ScrollContext) -> Vec<ScrollAnchorRung> {
+    let mut rungs: Vec<ScrollAnchorRung> = Vec::new();
+    let mut container_trusted = true;
+
+    if ctx.container.is_some() {
+        match derive_scroll_frame(ctx) {
+            Some(frame) if !scroll_anchor_frame_is_chrome_strip(frame, ctx.window) => {
+                rungs.push(ScrollAnchorRung {
+                    anchor: rect_center_point(frame),
+                    strategy: ScrollAnchorStrategy::Container,
+                    container_trusted: true,
+                });
+            }
+            // Chrome strip or disjoint from the window/screen: the
+            // container's geometry describes the wrong surface.
+            _ => container_trusted = false,
+        }
+    }
+
+    let window_ctx = ScrollContext {
+        container: None,
+        container_kind: None,
+        ..*ctx
+    };
+    if let Some(frame) = derive_scroll_frame(&window_ctx) {
+        let center = rect_center_point(frame);
+        if rungs.last().map_or(true, |rung| rung.anchor != center) {
+            rungs.push(ScrollAnchorRung {
+                anchor: center,
+                strategy: ScrollAnchorStrategy::WindowCenter,
+                container_trusted,
+            });
+        }
+        let lower_third = ClickPoint {
+            x: center.x,
+            y: (frame.y + frame.height * 2.0 / 3.0).round() as i32,
+        };
+        if rungs.last().map_or(true, |rung| rung.anchor != lower_third) {
+            rungs.push(ScrollAnchorRung {
+                anchor: lower_third,
+                strategy: ScrollAnchorStrategy::WindowLowerThird,
+                container_trusted,
+            });
+        }
+    }
+
+    rungs
 }
 
 /// Median vertical shift of the page content between two observations, by
@@ -8582,6 +8711,94 @@ mod tests {
     }
 
     #[test]
+    fn scroll_anchor_ladder_rejects_chrome_strip_container() {
+        // Regression fixture from the field log: Safari's tab-bar
+        // AXScrollArea won container selection and the anchor landed at
+        // (723, 47) — inside chrome — for three identical no-op retries.
+        let ctx = ScrollContext {
+            container: Some(Rect {
+                x: 3.0,
+                y: 0.0,
+                width: 1437.0,
+                height: 94.0,
+            }),
+            container_kind: Some(ScrollContainerKind::ScrollArea),
+            window: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            screen: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            vertical_position: Some(0.0),
+        };
+
+        let ladder = scroll_anchor_ladder(&ctx);
+        assert_eq!(ladder.len(), 2);
+        assert_eq!(ladder[0].strategy, ScrollAnchorStrategy::WindowCenter);
+        assert_eq!(ladder[0].anchor, ClickPoint { x: 720, y: 450 });
+        assert!(!ladder[0].container_trusted);
+        assert_eq!(ladder[1].strategy, ScrollAnchorStrategy::WindowLowerThird);
+        assert_eq!(ladder[1].anchor, ClickPoint { x: 720, y: 600 });
+        assert!(!ladder[1].container_trusted);
+    }
+
+    #[test]
+    fn scroll_anchor_ladder_varies_anchor_across_attempts() {
+        // Healthy context: three rungs with three distinct anchors, the
+        // last in the lower third of the window, all trusted.
+        let ladder = scroll_anchor_ladder(&scroll_test_context(0.2));
+        assert_eq!(
+            ladder.iter().map(|rung| rung.strategy).collect::<Vec<_>>(),
+            vec![
+                ScrollAnchorStrategy::Container,
+                ScrollAnchorStrategy::WindowCenter,
+                ScrollAnchorStrategy::WindowLowerThird,
+            ]
+        );
+        assert_eq!(ladder[0].anchor, ClickPoint { x: 400, y: 350 });
+        assert_eq!(ladder[1].anchor, ClickPoint { x: 400, y: 300 });
+        assert_eq!(ladder[2].anchor, ClickPoint { x: 400, y: 400 });
+        assert!(ladder.iter().all(|rung| rung.container_trusted));
+    }
+
+    #[test]
+    fn scroll_anchor_ladder_handles_missing_pieces() {
+        // Without a window the absolute height floor still rejects a
+        // chrome-sized container, and the screen alone anchors the rest.
+        let chrome_no_window = ScrollContext {
+            container: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 94.0,
+            }),
+            container_kind: Some(ScrollContainerKind::ScrollArea),
+            window: None,
+            screen: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            vertical_position: None,
+        };
+        let ladder = scroll_anchor_ladder(&chrome_no_window);
+        assert_eq!(ladder.len(), 2);
+        assert_eq!(ladder[0].strategy, ScrollAnchorStrategy::WindowCenter);
+        assert!(!ladder[0].container_trusted);
+
+        // Nothing to anchor on at all: empty ladder, caller falls back to
+        // observation-derived anchors.
+        assert!(scroll_anchor_ladder(&ScrollContext::default()).is_empty());
+    }
+
+    #[test]
     fn scroll_point_from_observation_ignores_offscreen_elements() {
         let on_screen = element_with_bounds(
             1,
@@ -8822,6 +9039,125 @@ mod tests {
         // Exactly one move + one wheel: the boundary verdict skipped the
         // no-op retry ladder entirely.
         assert_eq!(events.borrow().len(), 2);
+    }
+
+    #[test]
+    fn scroll_noop_retries_walk_the_anchor_ladder() {
+        // Identical pre/post observations with two stable elements:
+        // content_shift = Some(0.0) → NoOp each attempt. The retries must
+        // post the wheel at the next ladder rung instead of replaying the
+        // identical anchor (the field log's three no-ops at (723, 47)).
+        let page = || vec![element(1, "Ask"), element(2, "Settings")];
+        let observer = FakeObserver::new(vec![
+            Ok(page()),
+            Ok(page()),
+            Ok(page()),
+            Ok(page()),
+            Ok(page()),
+            Ok(page()),
+        ])
+        .with_scroll_contexts(vec![
+            // Two pops per attempt: anchor derivation + trusted verify.
+            Some(scroll_test_context(0.2)),
+            Some(scroll_test_context(0.2)),
+            Some(scroll_test_context(0.2)),
+            Some(scroll_test_context(0.2)),
+            Some(scroll_test_context(0.2)),
+            Some(scroll_test_context(0.2)),
+        ]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Scroll { dx: 0, dy: 300 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(2),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                RecordedInput::Move(ClickPoint { x: 400, y: 350 }),
+                RecordedInput::ScrollPixels(0, 300),
+                RecordedInput::Move(ClickPoint { x: 400, y: 300 }),
+                RecordedInput::ScrollPixels(0, 300),
+                RecordedInput::Move(ClickPoint { x: 400, y: 400 }),
+                RecordedInput::ScrollPixels(0, 300),
+            ]
+        );
+        assert_eq!(report.steps[0].verification.status, VerificationStatus::NoOp);
+    }
+
+    #[test]
+    fn chrome_strip_context_suppresses_position_verdicts() {
+        // A chrome-strip container's scrollbar describes the wrong surface:
+        // its position (here 1.0, "bottom") must not mint a ScrollBoundary
+        // verdict. With position evidence suppressed, the verdict rests on
+        // content_shift alone → NoOp.
+        let chrome = ScrollContext {
+            container: Some(Rect {
+                x: 3.0,
+                y: 0.0,
+                width: 1437.0,
+                height: 94.0,
+            }),
+            container_kind: Some(ScrollContainerKind::ScrollArea),
+            window: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            screen: Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1440.0,
+                height: 900.0,
+            }),
+            vertical_position: Some(1.0),
+        };
+        let page = || vec![element(1, "Ask"), element(2, "Settings")];
+        let observer = FakeObserver::new(vec![Ok(page()), Ok(page())])
+            .with_scroll_contexts(vec![Some(chrome), Some(chrome)]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Scroll { dx: 0, dy: 300 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.steps[0].verification.status, VerificationStatus::NoOp);
+        // And the wheel was anchored at the window center, not the strip.
+        assert_eq!(
+            events.borrow()[0],
+            RecordedInput::Move(ClickPoint { x: 720, y: 450 })
+        );
     }
 
     #[test]
