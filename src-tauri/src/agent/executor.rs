@@ -60,6 +60,11 @@ const DEFAULT_VISION_FALLBACK_MIN_WINDOW_AREA_POINTS: f64 = 120_000.0;
 const CLICK_PREFLIGHT_CURSOR_TOLERANCE_POINTS: f64 = 3.0;
 const CLICK_PREFLIGHT_MAX_ATTEMPTS: u32 = 3;
 const CLICK_PREFLIGHT_RETRY_SETTLE_MS: u64 = 150;
+const TYPE_FOCUS_SETTLE_MS: u64 = 80;
+/// How long the injected pasteboard text is held before the user's clipboard
+/// is restored after a synthetic Cmd+V (see paste_text_with_clipboard).
+#[cfg(target_os = "macos")]
+const PASTE_PASTEBOARD_HOLD_MS: u64 = 300;
 /// Re-read delays after a mouse warp whose first cursor read came back
 /// stale; a fixed schedule (not wall-clock) keeps fake-backend tests
 /// deterministic.
@@ -1237,6 +1242,7 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
                     self.click_at(point, 1)?;
                 }
                 eprintln!("[screenie] agent input type phase=click-target-ok");
+                thread::sleep(Duration::from_millis(TYPE_FOCUS_SETTLE_MS));
                 if *replace_existing {
                     eprintln!("[screenie] agent input type phase=select-all-start");
                     self.select_all_text()?;
@@ -1522,7 +1528,14 @@ fn paste_text_with_clipboard(enigo: &mut enigo::Enigo, text: &str) -> Result<(),
         }
     }
 
-    thread::sleep(Duration::from_millis(50));
+    // The Cmd+V keystroke is an async CGEvent: the target app reads the
+    // pasteboard only when its run loop processes the key event, which in
+    // browsers/Electron apps routinely takes >100ms. Restoring the user's
+    // clipboard before that read makes the app paste the OLD clipboard
+    // instead of the agent's text (or nothing) — hold the injected text long
+    // enough for the paste to land. The post-action verification re-reads
+    // the field, so a too-long hold costs latency, never correctness.
+    thread::sleep(Duration::from_millis(PASTE_PASTEBOARD_HOLD_MS));
     if !unsafe { screenie_agent_restore_clipboard_after_paste() } {
         eprintln!("[screenie] agent input pasteboard restore skipped or failed");
     }

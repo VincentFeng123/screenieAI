@@ -940,6 +940,12 @@ bool screenie_agent_prepare_clipboard_text(const char *utf8_text) {
       [pasteboard clearContents];
       BOOL ok = [pasteboard setString:text forType:NSPasteboardTypeString];
       [text release];
+      // Mark the injected text as transient/concealed (the de-facto
+      // org.nspasteboard.* convention) so clipboard managers (Maccy, Paste,
+      // Alfred) do not record what the agent types — which can include
+      // user-confirmed secure-field text.
+      [pasteboard setString:@"" forType:@"org.nspasteboard.ConcealedType"];
+      [pasteboard setString:@"" forType:@"org.nspasteboard.TransientType"];
       screenieAgentPasteboardInjectedChangeCount = [pasteboard changeCount];
       return ok;
     }
