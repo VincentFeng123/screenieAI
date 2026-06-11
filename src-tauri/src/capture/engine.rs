@@ -25,6 +25,9 @@ use super::CaptureError;
 pub enum CaptureTarget {
     /// A whole display; `None` = the main/first display.
     Display { id: Option<u32> },
+    /// All connected displays composed in global logical coordinate space.
+    /// Still-frame target only; recording uses single display/window streams.
+    VirtualDesktop,
     Window { id: u32 },
     Region { x: f64, y: f64, w: f64, h: f64 },
 }
@@ -772,6 +775,8 @@ mod tests {
         let display: CaptureTarget =
             serde_json::from_str(r#"{"kind":"display","id":7}"#).unwrap();
         assert_eq!(display, CaptureTarget::Display { id: Some(7) });
+        let desktop: CaptureTarget = serde_json::from_str(r#"{"kind":"virtualDesktop"}"#).unwrap();
+        assert_eq!(desktop, CaptureTarget::VirtualDesktop);
         let window: CaptureTarget =
             serde_json::from_str(r#"{"kind":"window","id":123}"#).unwrap();
         assert_eq!(window, CaptureTarget::Window { id: 123 });

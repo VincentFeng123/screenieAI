@@ -1508,7 +1508,21 @@ impl TauriCaptureEngine {
         self.app.state::<AppState>().recording.clone()
     }
 
-    fn resolve_target(
+    fn resolve_frame_target(
+        &self,
+        scope: agent::CaptureScope,
+    ) -> Result<capture::engine::CaptureTarget, String> {
+        match scope {
+            agent::CaptureScope::Screen => {
+                Ok(capture::engine::CaptureTarget::VirtualDesktop)
+            }
+            agent::CaptureScope::Window => capture::engine_macos::frontmost_window_id()
+                .map(|id| capture::engine::CaptureTarget::Window { id })
+                .ok_or_else(|| "no frontmost window found to capture".to_string()),
+        }
+    }
+
+    fn resolve_record_target(
         &self,
         scope: agent::CaptureScope,
     ) -> Result<capture::engine::CaptureTarget, String> {
@@ -1570,7 +1584,7 @@ impl agent::CaptureEngine for TauriCaptureEngine {
         &self,
         scope: agent::CaptureScope,
     ) -> Result<capture::engine::CapturedFrame, String> {
-        let target = self.resolve_target(scope)?;
+        let target = self.resolve_frame_target(scope)?;
         let app_data = app_data_dir(&self.app)?;
         capture::engine::capture_frame(
             target,
@@ -1595,7 +1609,7 @@ impl agent::CaptureEngine for TauriCaptureEngine {
         if abort.is_aborted() {
             return Err("agent aborted before recording started".into());
         }
-        let target = self.resolve_target(scope)?;
+        let target = self.resolve_record_target(scope)?;
         let app_data = app_data_dir(&self.app)?;
         let slots = self.slots();
         let opts = capture::engine::RecordOpts::default();
@@ -1635,7 +1649,7 @@ impl agent::CaptureEngine for TauriCaptureEngine {
     }
 
     async fn start_recording(&self, scope: agent::CaptureScope) -> Result<(), String> {
-        let target = self.resolve_target(scope)?;
+        let target = self.resolve_record_target(scope)?;
         let app_data = app_data_dir(&self.app)?;
         let handle = capture::engine::start_recording(
             self.slots(),

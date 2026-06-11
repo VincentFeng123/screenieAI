@@ -478,7 +478,8 @@ pub enum ActionTargetRef {
 /// window at execution time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CaptureScope {
-    /// The active display (default).
+    /// The visible desktop (default). Still captures include all displays;
+    /// recordings currently use the main/first display.
     #[default]
     Screen,
     /// The focused window.

@@ -241,6 +241,66 @@ fn display_for_region(
         .ok_or_else(|| CaptureError::Other("no display available for region capture".into()))
 }
 
+fn virtual_desktop_bounds(displays: &[DisplayTarget]) -> Option<(f64, f64, f64, f64)> {
+    let mut iter = displays
+        .iter()
+        .filter(|display| display.width >= 1.0 && display.height >= 1.0);
+    let first = iter.next()?;
+    let mut min_x = first.x.floor();
+    let mut min_y = first.y.floor();
+    let mut max_x = (first.x + first.width).ceil();
+    let mut max_y = (first.y + first.height).ceil();
+    for display in iter {
+        min_x = min_x.min(display.x.floor());
+        min_y = min_y.min(display.y.floor());
+        max_x = max_x.max((display.x + display.width).ceil());
+        max_y = max_y.max((display.y + display.height).ceil());
+    }
+    Some((min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0)))
+}
+
+async fn capture_virtual_desktop_frame(
+    opts: FrameOpts,
+    persist_dir: Option<PathBuf>,
+    sck: bool,
+) -> Result<CapturedFrame, CaptureError> {
+    let targets = list_targets().await?;
+    let displays = targets
+        .displays
+        .into_iter()
+        .filter(|display| display.width >= 1.0 && display.height >= 1.0)
+        .collect::<Vec<_>>();
+    if displays.is_empty() {
+        return Err(CaptureError::Other("no displays available for capture".into()));
+    }
+
+    if sck {
+        let mut captures = Vec::with_capacity(displays.len());
+        for display in displays {
+            let png_base64 =
+                sck_target_png(display.id, 0, 0, opts.exclude_self, opts.show_cursor).await?;
+            captures.push((display, png_base64));
+        }
+        let max_dimension = opts.max_dimension;
+        return tauri::async_runtime::spawn_blocking(move || {
+            compose_virtual_desktop_frame_blocking(captures, max_dimension, persist_dir)
+        })
+        .await
+        .map_err(|e| CaptureError::Other(format!("virtual desktop compose task join: {e}")))?;
+    }
+
+    let (x, y, w, h) = virtual_desktop_bounds(&displays)
+        .ok_or_else(|| CaptureError::Other("no displays available for capture".into()))?;
+    let capture = super::capture_rect(x as i32, y as i32, w as i32, h as i32).await?;
+    let blank = capture.blank;
+    let png_base64 = if opts.max_dimension > 0 {
+        super::downscale_for_cloud(&capture.png_base64, opts.max_dimension).await?
+    } else {
+        capture.png_base64
+    };
+    finish_frame(png_base64, persist_dir, Some(blank)).await
+}
+
 /// One still of a display / window / region, downscaled so the long edge is
 /// at most `opts.max_dimension`. The perception fast path: on macOS 14+ a
 /// single SCScreenshotManager call with GPU-side downscale; regions grab the
@@ -255,6 +315,9 @@ pub(crate) async fn capture_frame(
     let sck = sck_still_path_available();
 
     let (png_base64, known_blank) = match (&target, sck) {
+        (CaptureTarget::VirtualDesktop, _) => {
+            return capture_virtual_desktop_frame(opts, persist_dir, sck).await;
+        }
         (CaptureTarget::Window { id }, true) => (
             sck_target_png(0, *id, opts.max_dimension, false, opts.show_cursor).await?,
             None,
@@ -457,6 +520,87 @@ fn decode_process_frame_blocking(
         png_bytes: out,
         width,
         height,
+        blank,
+    })
+}
+
+fn compose_virtual_desktop_frame_blocking(
+    captures: Vec<(DisplayTarget, String)>,
+    max_dimension: u32,
+    persist_dir: Option<PathBuf>,
+) -> Result<CapturedFrame, CaptureError> {
+    let displays = captures
+        .iter()
+        .map(|(display, _)| display.clone())
+        .collect::<Vec<_>>();
+    let (origin_x, origin_y, canvas_w, canvas_h) = virtual_desktop_bounds(&displays)
+        .ok_or_else(|| CaptureError::Other("no displays available for capture".into()))?;
+    let canvas_w = canvas_w.round().max(1.0) as u32;
+    let canvas_h = canvas_h.round().max(1.0) as u32;
+    if (canvas_w as u64).saturating_mul(canvas_h as u64) > super::MAX_IMAGE_PIXELS {
+        return Err(CaptureError::Other("virtual desktop dimensions too large".into()));
+    }
+
+    let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, image::Rgba([0, 0, 0, 255]));
+    for (display, png_base64) in captures {
+        if png_base64.len() > super::MAX_PNG_B64_CHARS {
+            return Err(CaptureError::Other("PNG payload too large".into()));
+        }
+        let bytes = STANDARD
+            .decode(&png_base64)
+            .map_err(|e| CaptureError::Other(format!("base64 decode: {e}")))?;
+        let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)?;
+        if (img.width() as u64).saturating_mul(img.height() as u64) > super::MAX_IMAGE_PIXELS {
+            return Err(CaptureError::Other("image dimensions too large".into()));
+        }
+
+        let draw_w = display.width.round().max(1.0) as u32;
+        let draw_h = display.height.round().max(1.0) as u32;
+        let resized = img
+            .resize_exact(draw_w, draw_h, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+        image::imageops::overlay(
+            &mut canvas,
+            &resized,
+            (display.x.floor() - origin_x) as i64,
+            (display.y.floor() - origin_y) as i64,
+        );
+    }
+
+    let img = image::DynamicImage::ImageRgba8(canvas);
+    let (w, h) = (img.width(), img.height());
+    let long = w.max(h);
+    let img = if max_dimension > 0 && long > max_dimension {
+        let scale = f64::from(max_dimension) / f64::from(long);
+        img.resize_exact(
+            ((f64::from(w) * scale).round().max(1.0)) as u32,
+            ((f64::from(h) * scale).round().max(1.0)) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+
+    let rgba = img.to_rgba8();
+    let blank = super::rgba_is_blank(&rgba);
+    let (width, height) = (rgba.width(), rgba.height());
+    let mut out = Vec::with_capacity((width * height * 4) as usize);
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    let path = match persist_dir {
+        Some(dir) => Some(
+            super::storage::persist_frame(&dir, &out)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        None => None,
+    };
+
+    Ok(CapturedFrame {
+        png_base64: STANDARD.encode(&out),
+        width,
+        height,
+        path,
         blank,
     })
 }
@@ -802,6 +946,12 @@ pub(crate) fn resolve_start_spec_blocking(
     let targets = list_targets_blocking()?;
 
     let (display_id, window_id, src_rect, native_w, native_h) = match target {
+        CaptureTarget::VirtualDesktop => {
+            return Err(CaptureError::Unsupported(
+                "recording all displays at once is not supported yet; record a display or window"
+                    .into(),
+            ));
+        }
         CaptureTarget::Display { id } => {
             let display = match id {
                 Some(id) => targets.displays.iter().find(|d| d.id == *id),
@@ -869,6 +1019,37 @@ pub(crate) fn resolve_start_spec_blocking(
         format: opts.format,
         inprogress_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{virtual_desktop_bounds, DisplayTarget};
+
+    fn display(id: u32, x: f64, y: f64, width: f64, height: f64) -> DisplayTarget {
+        DisplayTarget {
+            id,
+            x,
+            y,
+            width,
+            height,
+            pixel_width: width * 2.0,
+            pixel_height: height * 2.0,
+        }
+    }
+
+    #[test]
+    fn virtual_desktop_bounds_cover_negative_and_offset_displays() {
+        let displays = vec![
+            display(1, 0.0, 0.0, 1440.0, 900.0),
+            display(2, -1280.0, 80.0, 1280.0, 720.0),
+            display(3, 1440.0, -120.0, 1024.0, 768.0),
+        ];
+
+        assert_eq!(
+            virtual_desktop_bounds(&displays),
+            Some((-1280.0, -120.0, 3744.0, 1020.0))
+        );
+    }
 }
 
 #[cfg(test)]
