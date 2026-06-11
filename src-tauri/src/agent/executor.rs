@@ -33,9 +33,17 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 const DEFAULT_MAX_STEPS: u32 = 24;
-const DEFAULT_ADAPTIVE_MAX_STEPS: u32 = 60;
+// Runaway backstop, not a task-size estimate: verified progress keeps buying
+// more budget, so a healthy long run must never hit this. Stuck runs die much
+// earlier via the no-progress drain and loop detection.
+const DEFAULT_ADAPTIVE_MAX_STEPS: u32 = 240;
 const DEFAULT_ADAPTIVE_PROGRESS_STEP_BONUS: u32 = 2;
 const DEFAULT_WALL_CLOCK_BUDGET_MS: u64 = 300_000;
+// Like the step budget, the wall clock extends on verified progress (when not
+// explicitly configured) so long tasks aren't cut off mid-run; the ceiling is
+// the cost/runaway backstop.
+const DEFAULT_ADAPTIVE_PROGRESS_TIME_BONUS_MS: u64 = 30_000;
+const DEFAULT_ADAPTIVE_WALL_CLOCK_MAX_MS: u64 = 1_800_000;
 const MAX_AGENT_NOTES: usize = 12;
 const MAX_AGENT_NOTE_CHARS: usize = 200;
 const DEFAULT_STABLE_SETTLE_TIMEOUT_MS: u64 = 1_500;
@@ -1760,6 +1768,7 @@ where
     E: CaptureEngine + ?Sized,
 {
     let adaptive_step_budget = options.max_steps.is_none();
+    let adaptive_wall_clock = options.wall_clock_budget_ms.is_none();
     let options = options.resolve();
     let stable_timeout = Duration::from_millis(options.stable_settle_timeout_ms);
     let stable_poll = Duration::from_millis(options.stable_settle_poll_ms);
@@ -1785,7 +1794,12 @@ where
     };
     let mut step_index = 0_u32;
     let mut force_visual_replan_next: Option<String> = None;
-    let wall_clock_budget = Duration::from_millis(options.wall_clock_budget_ms);
+    let mut wall_clock_budget = Duration::from_millis(options.wall_clock_budget_ms);
+    let hard_wall_clock_limit = if adaptive_wall_clock {
+        Duration::from_millis(DEFAULT_ADAPTIVE_WALL_CLOCK_MAX_MS.max(options.wall_clock_budget_ms))
+    } else {
+        wall_clock_budget
+    };
     let run_started = Instant::now();
     // Time spent blocked on the user (confirmations, questions) is excluded
     // from the wall-clock budget — user think-time is not agent time.
@@ -1831,7 +1845,7 @@ where
             terminal_status = Some(AgentRunStatus::MaxStepsReached);
             failure_reason = Some(format!(
                 "time budget ({}s) exhausted after {} step(s)",
-                options.wall_clock_budget_ms / 1000,
+                wall_clock_budget.as_secs(),
                 step_index
             ));
             break;
@@ -4061,6 +4075,12 @@ where
                         adaptive_step_budget,
                         &mut step_budget,
                         hard_step_limit,
+                        step_number,
+                    );
+                    extend_adaptive_wall_clock_budget(
+                        adaptive_wall_clock,
+                        &mut wall_clock_budget,
+                        hard_wall_clock_limit,
                         step_number,
                     );
                     continue 'steps;
@@ -7737,6 +7757,32 @@ fn extend_adaptive_step_budget(
     }
 }
 
+fn extend_adaptive_wall_clock_budget(
+    enabled: bool,
+    wall_clock_budget: &mut Duration,
+    hard_wall_clock_limit: Duration,
+    step: u32,
+) {
+    if !enabled || *wall_clock_budget >= hard_wall_clock_limit {
+        return;
+    }
+
+    let previous = *wall_clock_budget;
+    *wall_clock_budget = previous
+        .saturating_add(Duration::from_millis(
+            DEFAULT_ADAPTIVE_PROGRESS_TIME_BONUS_MS,
+        ))
+        .min(hard_wall_clock_limit);
+    if *wall_clock_budget != previous {
+        eprintln!(
+            "[screenie] agent step {} extended adaptive time budget {}s -> {}s after progress",
+            step,
+            previous.as_secs(),
+            wall_clock_budget.as_secs()
+        );
+    }
+}
+
 fn loop_detection_reason(entry: &ProgressLoopEntry) -> String {
     format!(
         "progress loop detected: action '{}' repeated without UI progress",
@@ -10853,6 +10899,44 @@ mod tests {
     }
 
     #[test]
+    fn progressing_run_is_not_cut_off_by_adaptive_hard_cap() {
+        // 72 verified-progress steps — past the old 60-step adaptive ceiling.
+        // A run that keeps making progress must keep earning budget until the
+        // planner says Done; only stuck runs may exhaust the step budget.
+        let total_steps = DEFAULT_MAX_STEPS * 3;
+        let mut observations = vec![Ok(vec![element(1, "Step 1")])];
+        let mut actions = Vec::new();
+        for step in 1..=total_steps {
+            observations.push(Ok(vec![element(step + 1, &format!("Step {}", step + 1))]));
+            actions.push(Action::Click { id: step });
+        }
+        actions.push(Action::Done);
+
+        let report = block_on(run_stub_agent_loop(
+            &FakeObserver::new(observations),
+            &StubPlanner::sequence(actions),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(report.steps.len(), total_steps as usize + 1);
+        assert_eq!(report.steps.last().unwrap().action, Action::Done);
+    }
+
+    #[test]
     fn jit_gone_target_replans_without_executing() {
         let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]), Ok(Vec::new())])
             .with_refreshes(vec![None]);
@@ -12053,6 +12137,25 @@ mod tests {
             .unwrap_or("")
             .contains("time budget"));
         assert!(report.steps.len() < 50);
+    }
+
+    #[test]
+    fn adaptive_wall_clock_budget_extends_on_progress_and_caps() {
+        let base = Duration::from_millis(DEFAULT_WALL_CLOCK_BUDGET_MS);
+        let bonus = Duration::from_millis(DEFAULT_ADAPTIVE_PROGRESS_TIME_BONUS_MS);
+        let hard_limit = base + bonus * 2;
+
+        let mut budget = base;
+        extend_adaptive_wall_clock_budget(true, &mut budget, hard_limit, 1);
+        assert_eq!(budget, base + bonus);
+        extend_adaptive_wall_clock_budget(true, &mut budget, hard_limit, 2);
+        extend_adaptive_wall_clock_budget(true, &mut budget, hard_limit, 3);
+        assert_eq!(budget, hard_limit);
+
+        // An explicitly configured budget never extends.
+        let mut fixed = Duration::from_millis(20);
+        extend_adaptive_wall_clock_budget(false, &mut fixed, hard_limit, 1);
+        assert_eq!(fixed, Duration::from_millis(20));
     }
 
     #[test]
