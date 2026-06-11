@@ -1843,7 +1843,7 @@ fn parse_followup_actions(items: &[Value], obs: &[Element]) -> Vec<Action> {
 
 /// Only cheap, target-resolved, non-terminal actions ride in a batch; the
 /// executor still verifies and safety-gates each one individually.
-fn batchable_followup(action: &Action) -> bool {
+pub(crate) fn batchable_followup(action: &Action) -> bool {
     matches!(
         action,
         Action::Click { .. }
@@ -2419,7 +2419,7 @@ const DROPPABLE_ACTION_FIELDS: &[&str] = &[
 
 /// Which scoped fields each action legitimately uses. `None` for unknown
 /// action names so the "unknown action" error stays intact.
-fn action_specific_fields(action: &str) -> Option<&'static [&'static str]> {
+pub(crate) fn action_specific_fields(action: &str) -> Option<&'static [&'static str]> {
     Some(match action {
         "activateApp" | "activate_app" => &["app"],
         "click" | "doubleClick" | "double_click" => &["id"],
