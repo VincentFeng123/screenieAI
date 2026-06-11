@@ -1703,6 +1703,18 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             reject_fields(raw, FieldSet::NONE)?;
             Action::ReadPage
         }
+        "findUi" | "find_ui" => {
+            reject_fields(raw, FieldSet::QUERY)?;
+            Action::FindUi {
+                query: require_string("query", raw.query.as_deref())?.to_string(),
+            }
+        }
+        "webLookup" | "web_lookup" => {
+            reject_fields(raw, FieldSet::QUERY)?;
+            Action::WebLookup {
+                query: require_string("query", raw.query.as_deref())?.to_string(),
+            }
+        }
         "ask" => {
             reject_fields(raw, FieldSet::QUESTION)?;
             let question = normalize_optional_field(raw.question.as_deref(), MAX_QUESTION_CHARS)
@@ -2445,7 +2457,9 @@ fn canonical_action_name(action: &str) -> String {
         "type_text" | "input" | "input_text" | "enter_text" | "set_text" | "settext" => {
             "type".into()
         }
-        "press" | "press_key" | "hotkey" | "keypress" | "key_press" | "shortcut" => "key".into(),
+        // "shortcut" must NOT alias to "key": it is itself a canonical action
+        // (RunShortcut) and the prompt teaches {"action":"shortcut","name":...}.
+        "press" | "press_key" | "hotkey" | "keypress" | "key_press" => "key".into(),
         "menu_click" | "menuclick" | "click_menu" | "menu_item" | "menuitem" | "select_menu"
         | "menu_select" => "menu".into(),
         "ask_user" | "askuser" | "ask_human" | "question" => "ask".into(),
@@ -3111,6 +3125,76 @@ mod tests {
         assert_eq!(canonical_action_name("lookup"), "webLookup");
         // "search" stays a webSearch alias.
         assert_eq!(canonical_action_name("search"), "webSearch");
+    }
+
+    #[test]
+    fn parse_accepts_find_ui_and_web_lookup() {
+        // Regression: both actions were advertised in the prompt and schema but
+        // had no parse arms, so every planner-emitted findUi/webLookup failed.
+        let decision = parse_planner_decision(
+            r#"{"reason":"export control not visible","action":"findUi","query":"export as pdf"}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::FindUi {
+                query: "export as pdf".into()
+            }
+        );
+
+        let decision = parse_planner_decision(
+            r#"{"reason":"findUi found nothing","action":"webLookup","query":"export note as PDF"}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::WebLookup {
+                query: "export note as PDF".into()
+            }
+        );
+
+        // Snake-case synonyms canonicalize into the same arms.
+        let decision = parse_planner_decision(
+            r#"{"reason":"look for it","action":"find_ui","query":"share button"}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::FindUi {
+                query: "share button".into()
+            }
+        );
+
+        // Both require a query.
+        assert!(parse_planner_decision(r#"{"reason":"r","action":"findUi"}"#, &[]).is_err());
+        assert!(parse_planner_decision(r#"{"reason":"r","action":"webLookup"}"#, &[]).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_shortcut_as_run_shortcut() {
+        // Regression: canonical_action_name mapped "shortcut" -> "key" before
+        // parsing, making the RunShortcut arm unreachable for the exact action
+        // name the prompt example teaches.
+        assert_eq!(canonical_action_name("shortcut"), "shortcut");
+        // Keypress-style synonyms still map to key.
+        assert_eq!(canonical_action_name("press"), "key");
+        assert_eq!(canonical_action_name("hotkey"), "key");
+
+        let decision = parse_planner_decision(
+            r#"{"reason":"brief reason","action":"shortcut","name":"Set Do Not Disturb"}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            decision.action,
+            Action::RunShortcut {
+                name: "Set Do Not Disturb".into(),
+                input: None
+            }
+        );
     }
 
     #[test]
