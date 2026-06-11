@@ -53,8 +53,10 @@ const AGENT_KILL_SWITCH_SHORTCUT: &str = "CommandOrControl+Alt+Escape";
 const QUICK_TOOLTIP_EDGE_PAD: f64 = 2.0;
 const QUICK_TOOLTIP_COMPACT_W: f64 = 238.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_COMPACT_H: f64 = 54.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
-const QUICK_TOOLTIP_AGENT_INPUT_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
-const QUICK_TOOLTIP_EXPANDED_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+// Must match --quick-tooltip-agent-card-w in src/quick-tooltip.css (the
+// pill centers itself against that var in every expanded mode).
+const QUICK_TOOLTIP_AGENT_INPUT_W: f64 = 460.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+const QUICK_TOOLTIP_EXPANDED_W: f64 = 460.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_EXPANDED_H: f64 = 540.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_GAP: f64 = 12.0;
 const QUICK_TOOLTIP_AGENT_CARD_H: f64 = 106.0;

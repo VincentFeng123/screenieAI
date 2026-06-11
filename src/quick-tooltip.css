@@ -16,7 +16,8 @@ body,
   --quick-tooltip-pill-w: 238px;
   --quick-tooltip-pill-h: 54px;
   --quick-tooltip-gap: 12px;
-  --quick-tooltip-agent-card-w: 400px;
+  /* Must match QUICK_TOOLTIP_AGENT_INPUT_W / _EXPANDED_W in lib.rs. */
+  --quick-tooltip-agent-card-w: 460px;
   --quick-tooltip-agent-card-h: 106px;
   --quick-tooltip-status-h: 178px;
   --quick-tooltip-stack-top: calc(var(--quick-tooltip-pill-h) + var(--quick-tooltip-gap));
@@ -639,7 +640,7 @@ body,
 
 .quick-tooltip-agent-model-label {
   min-width: 0;
-  max-width: 338px;
+  max-width: 398px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
