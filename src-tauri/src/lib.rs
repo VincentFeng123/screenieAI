@@ -3930,6 +3930,23 @@ async fn start_capture(app: AppHandle, window: WebviewWindow) -> Result<(), Stri
     Ok(())
 }
 
+/// True when the menu-grown agent-input window still fits between the
+/// toolbar's CURRENT y and the monitor's bottom edge — i.e. growing for a
+/// downward menu would not trip the y clamp. Shared by the direction query
+/// and resize_quick_tooltip so they can never disagree.
+fn quick_tooltip_menu_fits_below(
+    monitor: Option<&tauri::Monitor>,
+    position: QuickTooltipPosition,
+    agent_card_height: Option<f64>,
+) -> bool {
+    let Some(monitor) = monitor else {
+        return true;
+    };
+    let size = QuickTooltipSize::agent_input_with_menu(agent_card_height);
+    let (_, y, _, h) = monitor_logical_rect(monitor);
+    position.y as f64 + size.height + QUICK_TOOLTIP_SCREEN_PAD <= y + h
+}
+
 /// Which way the agent card's dropdown menus should open: "below" when the
 /// menu-grown window still fits between the toolbar and the monitor's
 /// bottom edge, "above" otherwise. The webview can't know where its window
@@ -3944,12 +3961,8 @@ fn quick_tooltip_menu_direction(
     let Some(position) = quick_tooltip_current_logical_position(&window) else {
         return Ok("below");
     };
-    let Some(monitor) = window.current_monitor().ok().flatten() else {
-        return Ok("below");
-    };
-    let size = QuickTooltipSize::agent_input_with_menu(agent_card_height);
-    let (_, y, _, h) = monitor_logical_rect(&monitor);
-    let fits_below = position.y as f64 + size.height + QUICK_TOOLTIP_SCREEN_PAD <= y + h;
+    let monitor = window.current_monitor().ok().flatten();
+    let fits_below = quick_tooltip_menu_fits_below(monitor.as_ref(), position, agent_card_height);
     Ok(if fits_below { "below" } else { "above" })
 }
 
@@ -3967,12 +3980,24 @@ fn resize_quick_tooltip(
     let status_open = status_open.unwrap_or(false);
     let agent_input_open = agent_input_open.unwrap_or(false);
     let agent_model_menu_open = agent_model_menu_open.unwrap_or(false);
+    let position = quick_tooltip_current_logical_position(&window)
+        .unwrap_or(QuickTooltipPosition { x: 24, y: 24 });
+    let monitor = window.current_monitor().ok().flatten();
     let requested_size = if expanded && status_open {
         QuickTooltipSize::expanded_with_status(status_height)
     } else if expanded {
         QuickTooltipSize::expanded()
     } else if agent_input_open && agent_model_menu_open {
-        QuickTooltipSize::agent_input_with_menu(agent_card_height)
+        // Growing for a downward menu must never trip the y clamp and shove
+        // the toolbar up — near the bottom edge the menu opens upward over
+        // the card instead (quick_tooltip_menu_direction) and the window
+        // keeps its agent-input size. Enforced HERE, not just advised from
+        // React, so a stale frontend placement can't move the window.
+        if quick_tooltip_menu_fits_below(monitor.as_ref(), position, agent_card_height) {
+            QuickTooltipSize::agent_input_with_menu(agent_card_height)
+        } else {
+            QuickTooltipSize::agent_input(agent_card_height)
+        }
     } else if agent_input_open {
         QuickTooltipSize::agent_input(agent_card_height)
     } else if status_open {
@@ -3980,10 +4005,7 @@ fn resize_quick_tooltip(
     } else {
         QuickTooltipSize::compact()
     };
-    let position = quick_tooltip_current_logical_position(&window)
-        .unwrap_or(QuickTooltipPosition { x: 24, y: 24 });
     let current_size = quick_tooltip_current_logical_size(&window).unwrap_or(requested_size);
-    let monitor = window.current_monitor().ok().flatten();
     let size = constrain_quick_tooltip_size_to_monitor(monitor.as_ref(), requested_size);
     let anchored_position = QuickTooltipPosition {
         x: (position.x as f64 + ((current_size.width - size.width) / 2.0)).round() as i32,

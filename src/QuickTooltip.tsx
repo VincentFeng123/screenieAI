@@ -974,25 +974,50 @@ export default function QuickTooltip() {
   // Which way the card's dropdown menus open, decided by the toolbar's
   // position on its monitor (only Rust knows that): "below" grows the
   // native window downward as before; "above" keeps the window as-is and
-  // the menu overlays the card upward. Re-queried when the card opens, the
-  // card height changes, and on every menu open/close (covers a toolbar
-  // dragged while the card was open).
+  // the menu overlays the card upward. Re-queried when the card opens,
+  // the card height changes, on menu open/close, and (debounced) when the
+  // window moves — so a dragged toolbar has a fresh answer BEFORE the next
+  // menu open. Rust enforces the no-clamp rule independently, so a stale
+  // value here can mis-place the menu for a frame but never move the
+  // window.
   const [agentMenuPlacement, setAgentMenuPlacement] = useState<"below" | "above">(
     "below",
   );
   useEffect(() => {
     if (!agentInputOpen) return;
     let cancelled = false;
-    invoke<string>("quick_tooltip_menu_direction", { agentCardHeight })
-      .then((direction) => {
-        if (cancelled) return;
-        setAgentMenuPlacement(direction === "above" ? "above" : "below");
+    let moveTimer: number | null = null;
+    const query = () => {
+      invoke<string>("quick_tooltip_menu_direction", { agentCardHeight })
+        .then((direction) => {
+          if (cancelled) return;
+          setAgentMenuPlacement(direction === "above" ? "above" : "below");
+        })
+        .catch((e) => {
+          console.error("quick_tooltip_menu_direction failed:", e);
+        });
+    };
+    query();
+    let offMoved: (() => void) | null = null;
+    getCurrentWindow()
+      .onMoved(() => {
+        if (moveTimer !== null) window.clearTimeout(moveTimer);
+        moveTimer = window.setTimeout(query, 120);
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          offMoved = off;
+        }
       })
       .catch((e) => {
-        console.error("quick_tooltip_menu_direction failed:", e);
+        console.error("tooltip move listener failed:", e);
       });
     return () => {
       cancelled = true;
+      if (moveTimer !== null) window.clearTimeout(moveTimer);
+      offMoved?.();
     };
   }, [agentInputOpen, agentCardHeight, agentModelMenuOpen]);
 
