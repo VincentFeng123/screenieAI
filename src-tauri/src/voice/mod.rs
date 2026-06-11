@@ -49,6 +49,10 @@ pub enum WhisperModel {
     BaseEn,
     #[serde(rename = "small.en")]
     SmallEn,
+    /// Distilled large-v3, q5_0-quantized: near-large accuracy at a fraction
+    /// of the decode cost. Multilingual, but the decode pins language("en").
+    #[serde(rename = "large-v3-turbo")]
+    LargeV3Turbo,
 }
 
 /// Persisted voice settings (`voice.json` in the app data dir). Rust is the
@@ -68,7 +72,7 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             silence_ms: 700,
-            model: WhisperModel::BaseEn,
+            model: WhisperModel::LargeV3Turbo,
             auto_stop_s: 90,
         }
     }
@@ -81,6 +85,7 @@ impl WhisperModel {
             "tiny.en" => Some(Self::TinyEn),
             "base.en" => Some(Self::BaseEn),
             "small.en" => Some(Self::SmallEn),
+            "large-v3-turbo" => Some(Self::LargeV3Turbo),
             _ => None,
         }
     }
@@ -429,6 +434,7 @@ pub struct VoiceStatusPayload {
     pub model_present: bool,
     pub mic_permission: &'static str,
     pub config: VoiceConfig,
+    pub queue_paused: bool,
 }
 
 /// Async so the bounded waits inside (TCC prompt, stream startup) never run
@@ -524,12 +530,16 @@ pub fn voice_get_status(
         .as_ref()
         .map(VoiceSessionHandle::status)
         .unwrap_or(VoiceStatus::Idle);
+    let queue_paused = lock_poison_safe(&state.voice_dispatch)
+        .as_ref()
+        .is_some_and(|d| d.is_paused());
     let config = current_config(&app);
     Ok(VoiceStatusPayload {
         status,
         model_present: model::is_model_present(&app, config.model),
         mic_permission: capture::mic_permission().as_str(),
         config,
+        queue_paused,
     })
 }
 
@@ -596,6 +606,82 @@ pub fn voice_set_config(
     Ok(merged)
 }
 
+/// Pauses/resumes dispatch of QUEUED tasks. The running task (if any)
+/// finishes; the mic keeps listening and new utterances keep queueing.
+#[tauri::command]
+pub fn voice_queue_pause(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    paused: bool,
+) -> Result<(), String> {
+    crate::require_window(&window, VOICE_WINDOW)?;
+    // ensure_dispatcher so pausing before the first mic-on still sticks.
+    let dispatch = ensure_dispatcher(&app).map_err(|e| e.to_string())?;
+    dispatch.set_paused(paused);
+    emit_voice(&app, "voice:queue", serde_json::json!({ "paused": paused }));
+    Ok(())
+}
+
+/// Drops every queued task (running task untouched — kill words / Stop are
+/// the only things that abort work). Each dropped task emits `removed`.
+#[tauri::command]
+pub fn voice_queue_clear(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+    crate::require_window(&window, VOICE_WINDOW)?;
+    let dispatch = ensure_dispatcher(&app).map_err(|e| e.to_string())?;
+    for task in dispatch.clear_queued() {
+        emit_voice(
+            &app,
+            "voice:task",
+            serde_json::json!({ "id": task.id, "state": "removed" }),
+        );
+    }
+    Ok(())
+}
+
+/// Removes one queued task. Errs when the task already started (or
+/// finished) so the UI can say it's too late.
+#[tauri::command]
+pub fn voice_queue_remove(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    id: String,
+) -> Result<(), String> {
+    crate::require_window(&window, VOICE_WINDOW)?;
+    let dispatch = ensure_dispatcher(&app).map_err(|e| e.to_string())?;
+    match dispatch.remove_queued(&id) {
+        Some(task) => {
+            emit_voice(
+                &app,
+                "voice:task",
+                serde_json::json!({ "id": task.id, "state": "removed" }),
+            );
+            Ok(())
+        }
+        None => Err("Task already started".into()),
+    }
+}
+
+/// Rewrites the text of one queued task. Errs when the task already started.
+#[tauri::command]
+pub fn voice_queue_edit(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    id: String,
+    text: String,
+) -> Result<(), String> {
+    crate::require_window(&window, VOICE_WINDOW)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Command can't be empty".into());
+    }
+    let dispatch = ensure_dispatcher(&app).map_err(|e| e.to_string())?;
+    if dispatch.edit_queued(&id, trimmed) {
+        Ok(())
+    } else {
+        Err("Task already started".into())
+    }
+}
+
 /// Minimal WAV reader for integration-test fixtures: scans for the `data`
 /// chunk and decodes 32-bit-float little-endian samples (the format
 /// `say --data-format=LEF32@16000` produces).
@@ -624,6 +710,10 @@ mod tests {
         assert_eq!(WhisperModel::parse("tiny.en"), Some(WhisperModel::TinyEn));
         assert_eq!(WhisperModel::parse("base.en"), Some(WhisperModel::BaseEn));
         assert_eq!(WhisperModel::parse("small.en"), Some(WhisperModel::SmallEn));
+        assert_eq!(
+            WhisperModel::parse("large-v3-turbo"),
+            Some(WhisperModel::LargeV3Turbo)
+        );
         assert_eq!(WhisperModel::parse("large"), None);
         assert_eq!(WhisperModel::parse(""), None);
     }
@@ -650,7 +740,7 @@ mod tests {
     #[test]
     fn config_serializes_model_as_wire_name() {
         let json = serde_json::to_string(&VoiceConfig::default()).unwrap();
-        assert!(json.contains("\"base.en\""), "got {json}");
+        assert!(json.contains("\"large-v3-turbo\""), "got {json}");
         assert!(json.contains("\"silenceMs\":700"), "got {json}");
         let back: VoiceConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, VoiceConfig::default());

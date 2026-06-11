@@ -57,9 +57,9 @@ const QUICK_TOOLTIP_AGENT_INPUT_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_EXPANDED_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_EXPANDED_H: f64 = 540.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_GAP: f64 = 12.0;
-const QUICK_TOOLTIP_AGENT_CARD_H: f64 = 88.0;
+const QUICK_TOOLTIP_AGENT_CARD_H: f64 = 106.0;
 /// Upper bound for the voice-feed-grown agent card (level meter + chips).
-const QUICK_TOOLTIP_AGENT_CARD_MAX_H: f64 = 300.0;
+const QUICK_TOOLTIP_AGENT_CARD_MAX_H: f64 = 340.0;
 const QUICK_TOOLTIP_AGENT_INPUT_WITH_MENU_H: f64 = 380.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_STATUS_H: f64 = 178.0;
 const QUICK_TOOLTIP_STATUS_MIN_H: f64 = 82.0;
@@ -4610,6 +4610,10 @@ pub fn run() {
         voice::voice_get_status,
         voice::voice_download_model,
         voice::voice_set_config,
+        voice::voice_queue_pause,
+        voice::voice_queue_clear,
+        voice::voice_queue_remove,
+        voice::voice_queue_edit,
         capture::commands::capture_permission,
         capture::commands::capture_frame,
         capture::commands::record_clip,

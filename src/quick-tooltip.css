@@ -17,7 +17,7 @@ body,
   --quick-tooltip-pill-h: 54px;
   --quick-tooltip-gap: 12px;
   --quick-tooltip-agent-card-w: 400px;
-  --quick-tooltip-agent-card-h: 88px;
+  --quick-tooltip-agent-card-h: 106px;
   --quick-tooltip-status-h: 178px;
   --quick-tooltip-stack-top: calc(var(--quick-tooltip-pill-h) + var(--quick-tooltip-gap));
   width: calc(100vw - 2 * var(--quick-tooltip-edge-pad));
@@ -238,16 +238,38 @@ body,
 }
 
 .quick-tooltip-agent-form {
-  /* Content-sized: the voice meter/feed grows it, React measures it, and
+  /* Content-sized: the voice feed grows it, React measures it, and
      the card + native window follow via --quick-tooltip-agent-card-h. */
   min-height: var(--quick-tooltip-agent-card-h);
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
   align-items: stretch;
-  gap: 2px;
-  padding: 0 10px 8px;
+  gap: 8px;
+  /* Uniform margins on all four sides of the composer/queue panel. */
+  padding: 8px;
   box-sizing: border-box;
+}
+
+/* Frosted rounded rect that encompasses the input row AND the model /
+   autonomy dropdown buttons — this is the frost region (native vibrancy
+   pane on macOS, backdrop-filter on Windows), not the inner pill. */
+.quick-tooltip-agent-composer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 18px;
+  background: rgba(42, 45, 44, 0.46);
+  box-sizing: border-box;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.quick-tooltip-agent-composer > :not(.screenie-inset-border) {
+  position: relative;
+  z-index: 1;
 }
 
 /* ---- Voice command mode ---- */
@@ -313,7 +335,7 @@ body,
 
 .quick-tooltip-voice-meter {
   height: 3px;
-  margin: 4px 14px 0;
+  margin: 2px 8px 0;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.14);
   overflow: hidden;
@@ -330,17 +352,85 @@ body,
 }
 
 .quick-tooltip-voice-notice {
-  margin: 6px 4px 0;
+  margin: 0 4px;
   font-size: 12px;
   line-height: 1.45;
   color: rgba(255, 255, 255, 0.62);
 }
 
+/* Queue panel below the composer: its own frosted, tinted rounded rect
+   (listed in QUICK_TOOLTIP_FROST_REGION_SELECTOR for the native pane). */
 .quick-tooltip-voice-feed {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin: 6px 0 0;
+  padding: 8px;
+  border-radius: 14px;
+  background: rgba(42, 45, 44, 0.46);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.quick-tooltip-voice-feed-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+  padding: 0 2px;
+}
+
+.quick-tooltip-voice-feed-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.quick-tooltip-voice-feed-paused-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #ffd47e;
+  background: rgba(255, 212, 126, 0.14);
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+
+.quick-tooltip-voice-feed-btn {
+  border: none;
+  appearance: none;
+  -webkit-appearance: none;
+  font-family: inherit;
+  padding: 0;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.66);
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+/* First control hugs the right edge; title/badge stay left. */
+.quick-tooltip-voice-feed-btn:first-of-type {
+  margin-left: auto;
+}
+
+.quick-tooltip-voice-feed-btn:hover:not(:disabled) {
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.quick-tooltip-voice-feed-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .quick-tooltip-voice-chip {
@@ -382,6 +472,14 @@ body,
   background: #ffaaa4;
 }
 
+.quick-tooltip-voice-chip[data-state="removed"] {
+  opacity: 0.55;
+}
+
+.quick-tooltip-voice-chip[data-state="removed"] .quick-tooltip-voice-chip-dot {
+  background: rgba(255, 255, 255, 0.3);
+}
+
 .quick-tooltip-voice-chip[data-state="blocked_on_confirmation"]
   .quick-tooltip-voice-chip-dot {
   background: #ffd47e;
@@ -402,12 +500,57 @@ body,
   white-space: nowrap;
 }
 
+.quick-tooltip-voice-chip-text[data-editable] {
+  cursor: text;
+}
+
+.quick-tooltip-voice-chip-text[data-editable]:hover {
+  color: rgba(255, 255, 255, 1);
+}
+
+.quick-tooltip-voice-chip-edit {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.95);
+  caret-color: rgba(255, 255, 255, 0.95);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 0;
+}
+
+.quick-tooltip-voice-chip-remove {
+  border: none;
+  appearance: none;
+  -webkit-appearance: none;
+  font-family: inherit;
+  padding: 0;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.quick-tooltip-voice-chip-remove:hover {
+  color: #ffaaa4;
+  background: rgba(255, 255, 255, 0.08);
+}
+
 .quick-tooltip-voice-download {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 8px;
-  margin: 6px 4px 0;
+  margin: 0 4px;
 }
 
 .quick-tooltip-voice-download-text {
@@ -431,23 +574,23 @@ body,
   transition: width 160ms ease;
 }
 
+/* Transparent inner row — the composer behind it owns the frost. */
 .quick-tooltip-agent-row {
   position: relative;
   min-height: 42px;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 6px 5px 14px;
-  border-radius: 999px;
-  background: rgba(42, 45, 44, 0.46);
+  padding: 0 0 0 6px;
+  background: transparent;
   box-shadow: none;
   box-sizing: border-box;
-  overflow: hidden;
-  isolation: isolate;
 }
 
 :root[data-screenie-platform="windows"][data-screenie-mode="tooltip"]
-  .quick-tooltip-agent-row {
+  .quick-tooltip-agent-composer,
+:root[data-screenie-platform="windows"][data-screenie-mode="tooltip"]
+  .quick-tooltip-voice-feed {
   background:
     linear-gradient(
       145deg,
@@ -458,11 +601,6 @@ body,
     rgba(42, 45, 44, 0.64);
   -webkit-backdrop-filter: blur(30px) saturate(145%) brightness(0.88);
   backdrop-filter: blur(30px) saturate(145%) brightness(0.88);
-}
-
-.quick-tooltip-agent-row > :not(.screenie-inset-border) {
-  position: relative;
-  z-index: 1;
 }
 
 .quick-tooltip-agent-row input {
@@ -491,8 +629,6 @@ body,
   justify-content: flex-start;
   min-height: 22px;
   padding-left: 6px;
-  margin-top: -1px;
-  transform: translateY(-6px);
 }
 
 .quick-tooltip-agent-model-select {

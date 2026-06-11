@@ -12,6 +12,8 @@ import type {
   VoiceErrorPayload,
   VoiceLevelPayload,
   VoiceModelDownloadPayload,
+  VoiceModelName,
+  VoiceQueuePayload,
   VoiceStatusPayload,
   VoiceTaskPayload,
   VoiceUtterancePayload,
@@ -35,11 +37,15 @@ export type VoiceSession = {
   busy: boolean;
   micDenied: boolean;
   modelMissing: boolean;
+  /** Configured whisper model, for the download card's size text. */
+  modelName: VoiceModelName | null;
   /** Download progress 0-100, or null when no download is in flight. */
   downloadPct: number | null;
   /** Inline message for the voice area of the agent card (errors, auto-stop). */
   notice: string | null;
   chips: VoiceChip[];
+  /** True while the dispatcher holds queued tasks back (running one finishes). */
+  queuePaused: boolean;
   /**
    * Attach to the level-meter FILL element. Levels write straight to the
    * DOM (transform: scaleX) — never mirror rms into React state, that would
@@ -50,15 +56,22 @@ export type VoiceSession = {
   start: () => Promise<boolean>;
   stop: () => Promise<void>;
   downloadModel: () => Promise<void>;
+  setQueuePaused: (paused: boolean) => Promise<void>;
+  clearQueue: () => Promise<void>;
+  removeTask: (id: string) => Promise<void>;
+  /** Resolves true when the edit landed before the task started running. */
+  editTask: (id: string, text: string) => Promise<boolean>;
 };
 
 export function useVoiceSession(options: VoiceSessionOptions): VoiceSession {
   const [status, setStatus] = useState<VoiceBackendStatus>("idle");
   const [micDenied, setMicDenied] = useState(false);
   const [modelMissing, setModelMissing] = useState(false);
+  const [modelName, setModelName] = useState<VoiceModelName | null>(null);
   const [downloadPct, setDownloadPct] = useState<number | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [chips, setChips] = useState<VoiceChip[]>([]);
+  const [queuePaused, setQueuePausedState] = useState(false);
   const meterFillRef = useRef<HTMLDivElement | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
 
@@ -150,6 +163,10 @@ export function useVoiceSession(options: VoiceSessionOptions): VoiceSession {
       setDownloadPct(payload.pct);
     });
 
+    listen<VoiceQueuePayload>("voice:queue", (payload) => {
+      setQueuePausedState(payload.paused);
+    });
+
     listen<VoiceErrorPayload>("voice:error", (payload) => {
       switch (payload.code) {
         case "model_missing":
@@ -182,7 +199,9 @@ export function useVoiceSession(options: VoiceSessionOptions): VoiceSession {
         if (cancelled) return;
         setStatus(payload.status);
         setModelMissing(!payload.modelPresent);
+        setModelName(payload.config.model);
         setMicDenied(payload.micPermission === "denied");
+        setQueuePausedState(payload.queuePaused);
       })
       .catch((e) => {
         console.error("voice_get_status failed:", e);
@@ -230,6 +249,57 @@ export function useVoiceSession(options: VoiceSessionOptions): VoiceSession {
     }
   }, [clearNotice]);
 
+  const setQueuePaused = useCallback(async (paused: boolean) => {
+    // Optimistic; voice:queue confirms (and corrects on failure below).
+    setQueuePausedState(paused);
+    try {
+      await invoke("voice_queue_pause", { paused });
+    } catch (e) {
+      setQueuePausedState(!paused);
+      console.error("voice_queue_pause failed:", e);
+    }
+  }, []);
+
+  const clearQueue = useCallback(async () => {
+    // Chips flip to "removed" via the voice:task events the backend emits.
+    try {
+      await invoke("voice_queue_clear");
+    } catch (e) {
+      console.error("voice_queue_clear failed:", e);
+    }
+  }, []);
+
+  const removeTask = useCallback(
+    async (id: string) => {
+      try {
+        await invoke("voice_queue_remove", { id });
+      } catch (e) {
+        // "Task already started" — the chip will show running shortly.
+        showNotice(String(e));
+      }
+    },
+    [showNotice],
+  );
+
+  const editTask = useCallback(
+    async (id: string, text: string) => {
+      try {
+        await invoke("voice_queue_edit", { id, text });
+        // No event echoes a successful edit — mirror it into the chip here.
+        setChips((prev) =>
+          prev.map((chip) =>
+            chip.id === id ? { ...chip, text: text.trim() } : chip,
+          ),
+        );
+        return true;
+      } catch (e) {
+        showNotice(String(e));
+        return false;
+      }
+    },
+    [showNotice],
+  );
+
   const active = status !== "idle";
   const busy = chips.some(
     (chip) =>
@@ -244,12 +314,18 @@ export function useVoiceSession(options: VoiceSessionOptions): VoiceSession {
     busy,
     micDenied,
     modelMissing,
+    modelName,
     downloadPct,
     notice,
     chips,
+    queuePaused,
     meterFillRef,
     start,
     stop,
     downloadModel,
+    setQueuePaused,
+    clearQueue,
+    removeTask,
+    editTask,
   };
 }

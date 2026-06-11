@@ -101,10 +101,18 @@ pub struct VoiceTask {
     pub settings: AgentRunSettings,
 }
 
+/// Queue state guarded by ONE mutex: `paused` must be observed under the
+/// same lock the condvar waits on, or a resume could slip between the
+/// worker's pause check and its wait (lost wakeup).
+struct QueueInner {
+    tasks: VecDeque<VoiceTask>,
+    paused: bool,
+}
+
 /// Shared between the STT thread (producer via [`route`]) and the
 /// long-lived dispatcher thread (consumer). Outlives listening sessions.
 pub struct DispatchShared {
-    queue: Mutex<VecDeque<VoiceTask>>,
+    inner: Mutex<QueueInner>,
     wake: Condvar,
     /// Id of the task currently inside an agent run, for kill events.
     running_id: Mutex<Option<String>>,
@@ -118,7 +126,10 @@ pub struct DispatchShared {
 impl DispatchShared {
     pub fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(QueueInner {
+                tasks: VecDeque::new(),
+                paused: false,
+            }),
             wake: Condvar::new(),
             running_id: Mutex::new(None),
             kill_generation: std::sync::atomic::AtomicU64::new(0),
@@ -130,40 +141,87 @@ impl DispatchShared {
     }
 
     /// Kill path: bumps the generation and empties the queue atomically
-    /// (same lock), returning the dropped tasks in order.
+    /// (same lock), returning the dropped tasks in order. Deliberately
+    /// ignores pause — kill words must always work.
     pub fn kill_drain(&self) -> Vec<VoiceTask> {
-        let mut queue = lock_poison_safe(&self.queue);
+        let mut inner = lock_poison_safe(&self.inner);
         self.kill_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        queue.drain(..).collect()
+        inner.tasks.drain(..).collect()
     }
 
-    /// Blocks until a task is available; returns it with the kill
-    /// generation sampled under the same lock acquisition.
+    /// Blocks until a task is available AND dispatch is not paused; returns
+    /// it with the kill generation sampled under the same lock acquisition.
     fn pop_blocking(&self) -> (VoiceTask, u64) {
-        let mut queue = lock_poison_safe(&self.queue);
+        let mut inner = lock_poison_safe(&self.inner);
         loop {
-            if let Some(task) = queue.pop_front() {
-                let generation = self
-                    .kill_generation
-                    .load(std::sync::atomic::Ordering::SeqCst);
-                return (task, generation);
+            if !inner.paused {
+                if let Some(task) = inner.tasks.pop_front() {
+                    let generation = self
+                        .kill_generation
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    return (task, generation);
+                }
             }
-            queue = condvar_wait(&self.wake, queue);
+            inner = condvar_wait(&self.wake, inner);
         }
     }
 
     /// FIFO push, capped at [`QUEUE_CAP`]; the task is handed back on
     /// overflow so the caller can report exactly which utterance dropped.
+    /// Pushing while paused still queues — only dispatch is held back.
     pub fn try_push(&self, task: VoiceTask) -> Result<(), VoiceTask> {
-        let mut queue = lock_poison_safe(&self.queue);
-        if queue.len() >= QUEUE_CAP {
+        let mut inner = lock_poison_safe(&self.inner);
+        if inner.tasks.len() >= QUEUE_CAP {
             return Err(task);
         }
-        queue.push_back(task);
-        drop(queue);
+        inner.tasks.push_back(task);
+        drop(inner);
         self.wake.notify_one();
         Ok(())
+    }
+
+    /// Pauses/resumes dispatch. The task currently inside an agent run is
+    /// untouched — pause only stops the worker from popping the next one.
+    pub fn set_paused(&self, paused: bool) {
+        let mut inner = lock_poison_safe(&self.inner);
+        inner.paused = paused;
+        drop(inner);
+        if !paused {
+            self.wake.notify_all();
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        lock_poison_safe(&self.inner).paused
+    }
+
+    /// Drops every QUEUED task and returns them in order. Unlike
+    /// [`kill_drain`] this neither bumps the kill generation nor aborts the
+    /// running task — it is the UI's "clear queued" button, not a kill.
+    pub fn clear_queued(&self) -> Vec<VoiceTask> {
+        lock_poison_safe(&self.inner).tasks.drain(..).collect()
+    }
+
+    /// Removes one queued task by id. `None` means it already popped (or
+    /// never existed) — the caller should tell the user it's too late.
+    pub fn remove_queued(&self, id: &str) -> Option<VoiceTask> {
+        let mut inner = lock_poison_safe(&self.inner);
+        let idx = inner.tasks.iter().position(|t| t.id == id)?;
+        inner.tasks.remove(idx)
+    }
+
+    /// Rewrites the text of one queued task. False means it already popped
+    /// (or never existed).
+    pub fn edit_queued(&self, id: &str, text: &str) -> bool {
+        let mut inner = lock_poison_safe(&self.inner);
+        match inner.tasks.iter_mut().find(|t| t.id == id) {
+            Some(task) => {
+                task.text = text.to_string();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn running_task_id(&self) -> Option<String> {
@@ -581,6 +639,86 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert_eq!(shared.kill_generation(), before + 1);
         assert!(shared.kill_drain().is_empty());
+    }
+
+    #[test]
+    fn pause_blocks_pop_until_resume() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let shared = Arc::new(DispatchShared::new());
+        shared.set_paused(true);
+        shared.try_push(task("a")).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let (popped, _) = shared.pop_blocking();
+                tx.send(popped.id).unwrap();
+            })
+        };
+        // Paused: the worker must NOT pop even though a task is queued.
+        assert!(rx.recv_timeout(Duration::from_millis(150)).is_err());
+
+        shared.set_paused(false);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "a");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn push_while_paused_still_queues() {
+        let shared = DispatchShared::new();
+        shared.set_paused(true);
+        shared.try_push(task("a")).unwrap();
+        assert!(shared.is_paused());
+        assert_eq!(shared.clear_queued().len(), 1);
+    }
+
+    #[test]
+    fn clear_queued_does_not_bump_generation() {
+        let shared = DispatchShared::new();
+        shared.try_push(task("a")).unwrap();
+        shared.try_push(task("b")).unwrap();
+        let before = shared.kill_generation();
+        let cleared: Vec<String> = shared.clear_queued().into_iter().map(|t| t.id).collect();
+        assert_eq!(cleared, ["a", "b"]);
+        assert_eq!(shared.kill_generation(), before);
+        assert!(shared.clear_queued().is_empty());
+    }
+
+    #[test]
+    fn remove_queued_hits_only_the_given_id() {
+        let shared = DispatchShared::new();
+        shared.try_push(task("a")).unwrap();
+        shared.try_push(task("b")).unwrap();
+        shared.try_push(task("c")).unwrap();
+        assert_eq!(shared.remove_queued("b").map(|t| t.id), Some("b".into()));
+        assert!(shared.remove_queued("b").is_none());
+        assert!(shared.remove_queued("nope").is_none());
+        let order: Vec<String> = shared.clear_queued().into_iter().map(|t| t.id).collect();
+        assert_eq!(order, ["a", "c"]);
+    }
+
+    #[test]
+    fn edit_queued_rewrites_text_for_queued_ids_only() {
+        let shared = DispatchShared::new();
+        shared.try_push(task("a")).unwrap();
+        assert!(shared.edit_queued("a", "new text"));
+        assert!(!shared.edit_queued("gone", "x"));
+        let drained = shared.clear_queued();
+        assert_eq!(drained[0].text, "new text");
+    }
+
+    #[test]
+    fn kill_drain_works_while_paused() {
+        let shared = DispatchShared::new();
+        shared.set_paused(true);
+        shared.try_push(task("a")).unwrap();
+        let before = shared.kill_generation();
+        assert_eq!(shared.kill_drain().len(), 1);
+        assert_eq!(shared.kill_generation(), before + 1);
+        assert!(shared.is_paused(), "kill must not silently resume dispatch");
     }
 
     #[test]

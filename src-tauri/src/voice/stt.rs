@@ -75,8 +75,13 @@ impl SttEngine {
             .create_state()
             .map_err(|e| VoiceError::Stt(format!("create state: {e}")))?;
 
-        let mut params =
-            whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
+        // Beam search buys a real accuracy step over greedy on short
+        // commands; with Metal-accelerated turbo/base models the extra
+        // decode cost stays well under perceived latency.
+        let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: -1.0,
+        });
         params.set_language(Some("en"));
         params.set_translate(false);
         params.set_n_threads(self.n_threads);

@@ -210,7 +210,8 @@ const QUICK_TOOLTIP_FROST_REGION_SELECTOR = [
   ".quick-tooltip-shell",
   ".quick-tooltip-status-card",
   ".quick-tooltip-chat-panel",
-  ".quick-tooltip-agent-row",
+  ".quick-tooltip-agent-composer",
+  ".quick-tooltip-voice-feed",
   ".screenie-select-menu-portal",
 ].join(", ");
 const QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR =
@@ -218,8 +219,8 @@ const QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR =
 const QUICK_TOOLTIP_STATUS_MIN_HEIGHT = 82;
 const QUICK_TOOLTIP_STATUS_MAX_HEIGHT = 420;
 // Must match QUICK_TOOLTIP_AGENT_CARD_H / _MAX_H in src-tauri/src/lib.rs.
-const QUICK_TOOLTIP_AGENT_CARD_MIN_HEIGHT = 88;
-const QUICK_TOOLTIP_AGENT_CARD_MAX_HEIGHT = 300;
+const QUICK_TOOLTIP_AGENT_CARD_MIN_HEIGHT = 106;
+const QUICK_TOOLTIP_AGENT_CARD_MAX_HEIGHT = 340;
 
 const QUICK_TOOLTIP_DRAG_BLOCKERS =
   'button, input, textarea, select, a, [role="button"], [role="listbox"], .screenie-select, .screenie-select-menu-portal, .quick-tooltip-agent-card';
@@ -788,6 +789,21 @@ export default function QuickTooltip() {
     setQuickTooltipKeyboardMode(false).catch(() => {});
   }, [setQuickTooltipKeyboardMode]);
 
+  // Inline chip editing mirrors the main input's keyboard claim/restore:
+  // claim on focus; on exit, hand keys back to the target app only during a
+  // hands-free session (same condition as the input's onBlur).
+  const handleChipEditFocus = useCallback(() => {
+    setQuickTooltipKeyboardMode(true).catch(() => {});
+  }, [setQuickTooltipKeyboardMode]);
+
+  const handleChipEditBlur = useCallback(() => {
+    if (voiceActiveRef.current) {
+      restoreQuickTooltipKeyboardMode();
+    }
+    // Outside a hands-free session the open card keeps the keyboard —
+    // deliberately no-op.
+  }, [restoreQuickTooltipKeyboardMode]);
+
   const closeAgentInput = useCallback(() => {
     if (!agentInputOpenRef.current) return;
     agentInputOpenRef.current = false;
@@ -1304,121 +1320,141 @@ export default function QuickTooltip() {
             className="quick-tooltip-agent-form"
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <div className="quick-tooltip-agent-row">
-              <input
-                ref={agentInputRef}
-                value={agentGoal}
-                onChange={(e) => setAgentGoal(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    closeAgentInput();
-                  } else if (e.key === "Enter") {
-                    e.preventDefault();
+            <div className="quick-tooltip-agent-composer">
+              <div className="quick-tooltip-agent-row">
+                <input
+                  ref={agentInputRef}
+                  value={agentGoal}
+                  onChange={(e) => setAgentGoal(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      closeAgentInput();
+                    } else if (e.key === "Enter") {
+                      e.preventDefault();
+                      void submitAgentGoal();
+                    }
+                  }}
+                  onFocus={() => {
+                    // Clicking into the field always reclaims keystrokes —
+                    // covers both hands-free sessions (keys defaulted to the
+                    // target app) and the just-stopped-voice state.
+                    setQuickTooltipKeyboardMode(true).catch(() => {});
+                  }}
+                  onBlur={() => {
+                    if (voiceActiveRef.current) {
+                      restoreQuickTooltipKeyboardMode();
+                    }
+                  }}
+                  placeholder="Tell Screenie what to do"
+                  aria-label="Tell Screenie what to do"
+                />
+                <VoiceMicButton
+                  state={voiceMicState}
+                  onToggle={() => {
+                    void toggleVoice();
+                  }}
+                />
+                <button
+                  type="button"
+                  className="quick-tooltip-agent-submit screenie-send"
+                  onClick={() => {
                     void submitAgentGoal();
-                  }
-                }}
-                onFocus={() => {
-                  // Clicking into the field always reclaims keystrokes —
-                  // covers both hands-free sessions (keys defaulted to the
-                  // target app) and the just-stopped-voice state.
-                  setQuickTooltipKeyboardMode(true).catch(() => {});
-                }}
-                onBlur={() => {
-                  if (voiceActiveRef.current) {
-                    restoreQuickTooltipKeyboardMode();
-                  }
-                }}
-                placeholder="Tell Screenie what to do"
-                aria-label="Tell Screenie what to do"
-              />
-              <VoiceMicButton
-                state={voiceMicState}
-                onToggle={() => {
-                  void toggleVoice();
-                }}
-              />
-              <button
-                type="button"
-                className="quick-tooltip-agent-submit screenie-send"
-                onClick={() => {
-                  void submitAgentGoal();
-                }}
-                aria-label="Start agent task"
-                title="Start agent task"
-                disabled={!agentGoal.trim() || agentRunning || voice.busy}
-              >
-                <ArrowUp size={15} strokeWidth={2} aria-hidden />
-              </button>
-              <SvgInsetBorder radius={999} strokeAlpha={0.2} />
+                  }}
+                  aria-label="Start agent task"
+                  title="Start agent task"
+                  disabled={!agentGoal.trim() || agentRunning || voice.busy}
+                >
+                  <ArrowUp size={15} strokeWidth={2} aria-hidden />
+                </button>
+              </div>
+              {voice.active && (
+                <VoiceLevelMeter fillRef={voice.meterFillRef} />
+              )}
+              <div className="quick-tooltip-agent-model-row">
+                <div className="screenie-chat-model-select quick-tooltip-agent-model-select">
+                  <CustomDropdown
+                    value={providerInfo.model}
+                    options={modelOptions}
+                    onChange={updateModel}
+                    ariaLabel={`${providerInfo.label} agent model`}
+                    variant="ghost"
+                    disabled={agentRunning}
+                    placement="below"
+                    onOpenChange={setAgentModelMenuOpen}
+                    triggerLabel={
+                      <span className="quick-tooltip-agent-model-label">
+                        <span
+                          className={`screenie-model-dot ${
+                            providerInfo.cloud ? "cloud" : "local"
+                          }`}
+                        />
+                        <span className="quick-tooltip-agent-model-provider">
+                          {providerInfo.label}
+                        </span>
+                        <span className="quick-tooltip-agent-model-name">
+                          {activeModelLabel}
+                        </span>
+                      </span>
+                    }
+                  />
+                </div>
+                <div className="screenie-chat-model-select quick-tooltip-agent-autonomy-select">
+                  <CustomDropdown
+                    value={autonomy}
+                    options={AGENT_AUTONOMY_OPTIONS}
+                    onChange={updateAutonomy}
+                    ariaLabel="Agent autonomy"
+                    variant="ghost"
+                    disabled={agentRunning}
+                    placement="below"
+                    onOpenChange={setAgentModelMenuOpen}
+                    triggerLabel={
+                      <span className="quick-tooltip-agent-model-label">
+                        <ShieldCheck size={11} strokeWidth={1.9} aria-hidden />
+                        <span className="quick-tooltip-agent-model-name">
+                          {
+                            AGENT_AUTONOMY_OPTIONS.find(
+                              (option) => option.value === autonomy,
+                            )?.label
+                          }
+                        </span>
+                      </span>
+                    }
+                  />
+                </div>
+              </div>
+              <SvgInsetBorder radius={18} strokeAlpha={0.2} />
             </div>
-            {voice.active && <VoiceLevelMeter fillRef={voice.meterFillRef} />}
             {voice.notice && (
               <div className="quick-tooltip-voice-notice">{voice.notice}</div>
             )}
             {voice.modelMissing ? (
               <VoiceModelDownloadCard
                 pct={voice.downloadPct}
+                model={voice.modelName}
                 onDownload={() => {
                   void voice.downloadModel();
                 }}
               />
             ) : (
-              <VoiceTranscriptFeed chips={voice.chips} />
+              <VoiceTranscriptFeed
+                chips={voice.chips}
+                paused={voice.queuePaused}
+                onSetPaused={(paused) => {
+                  void voice.setQueuePaused(paused);
+                }}
+                onClear={() => {
+                  void voice.clearQueue();
+                }}
+                onRemove={(id) => {
+                  void voice.removeTask(id);
+                }}
+                onEdit={voice.editTask}
+                onEditFocus={handleChipEditFocus}
+                onEditBlur={handleChipEditBlur}
+              />
             )}
-            <div className="quick-tooltip-agent-model-row">
-              <div className="screenie-chat-model-select quick-tooltip-agent-model-select">
-                <CustomDropdown
-                  value={providerInfo.model}
-                  options={modelOptions}
-                  onChange={updateModel}
-                  ariaLabel={`${providerInfo.label} agent model`}
-                  variant="ghost"
-                  disabled={agentRunning}
-                  placement="below"
-                  onOpenChange={setAgentModelMenuOpen}
-                  triggerLabel={
-                    <span className="quick-tooltip-agent-model-label">
-                      <span
-                        className={`screenie-model-dot ${
-                          providerInfo.cloud ? "cloud" : "local"
-                        }`}
-                      />
-                      <span className="quick-tooltip-agent-model-provider">
-                        {providerInfo.label}
-                      </span>
-                      <span className="quick-tooltip-agent-model-name">
-                        {activeModelLabel}
-                      </span>
-                    </span>
-                  }
-                />
-              </div>
-              <div className="screenie-chat-model-select quick-tooltip-agent-autonomy-select">
-                <CustomDropdown
-                  value={autonomy}
-                  options={AGENT_AUTONOMY_OPTIONS}
-                  onChange={updateAutonomy}
-                  ariaLabel="Agent autonomy"
-                  variant="ghost"
-                  disabled={agentRunning}
-                  placement="below"
-                  onOpenChange={setAgentModelMenuOpen}
-                  triggerLabel={
-                    <span className="quick-tooltip-agent-model-label">
-                      <ShieldCheck size={11} strokeWidth={1.9} aria-hidden />
-                      <span className="quick-tooltip-agent-model-name">
-                        {
-                          AGENT_AUTONOMY_OPTIONS.find(
-                            (option) => option.value === autonomy,
-                          )?.label
-                        }
-                      </span>
-                    </span>
-                  }
-                />
-              </div>
-            </div>
           </div>
         </section>
       )}
