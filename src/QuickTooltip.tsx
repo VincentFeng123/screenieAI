@@ -870,14 +870,17 @@ export default function QuickTooltip() {
     return () => window.clearTimeout(id);
   }, [confirmation]);
 
-  // Auto-grow the goal textarea with its content (height: auto -> measure
-  // scrollHeight); the CSS max-height caps it, after which it scrolls. The
-  // form's ResizeObserver then grows the card + native window to follow.
+  // Auto-grow the goal textarea with its content. Collapse to 0 before
+  // reading scrollHeight so the measurement is pure content + padding —
+  // "auto" resolves differently for the placeholder vs real text in WebKit,
+  // which made the empty card a different height than the typed one. CSS
+  // min/max-height clamp the result (42px single line .. ~5 lines), and the
+  // form's ResizeObserver grows the card + native window to follow.
   useLayoutEffect(() => {
     if (!agentInputOpen) return;
     const el = agentInputRef.current;
     if (!el) return;
-    el.style.height = "auto";
+    el.style.height = "0px";
     el.style.height = `${el.scrollHeight}px`;
   }, [agentInputOpen, agentGoal]);
 

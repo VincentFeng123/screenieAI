@@ -615,12 +615,14 @@ body,
 }
 
 /* Auto-grown from JS (height = scrollHeight on every value change); the
-   11px vertical padding makes the one-line state exactly the row's 42px.
-   Past ~5 lines the max-height caps growth and the textarea scrolls. */
+   11px vertical padding makes the one-line state exactly the row's 42px,
+   and min-height pins BOTH the empty and the typed single-line state to
+   that same 42px. Past ~5 lines max-height caps growth and it scrolls. */
 .quick-tooltip-agent-row textarea {
   min-width: 0;
   flex: 1;
   height: 42px;
+  min-height: 42px;
   max-height: 122px;
   border: none;
   outline: none;
