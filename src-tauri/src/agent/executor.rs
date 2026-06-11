@@ -87,6 +87,10 @@ const DEFAULT_DESTRUCTIVE_KEYWORDS: &[&str] = &[
     "empty trash",
     "move to trash",
     "transfer",
+    // Posting/publishing publicly is hard to undo; word-boundary matching
+    // keeps "postpone"/"postal" from triggering.
+    "post",
+    "publish",
 ];
 const DEFAULT_DESTRUCTIVE_KEY_COMBOS: &[&str] = &[
     "cmd+delete",
