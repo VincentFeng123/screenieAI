@@ -1702,10 +1702,12 @@ async fn run_prepared_stub_agent(
         .local_http_grounder(resolved.grounder_config());
     let fallback_state = agent::VisionFallbackState::new();
     let base_observer = agent::MacObserver::new();
+    let mut vision_options = agent::VisionFallbackOptions::from(&resolved);
+    vision_options.visual_crosscheck = true;
     let observer = agent::VisionFallbackObserver::macos(
         base_observer.clone(),
         fallback_state.clone(),
-        agent::VisionFallbackOptions::from(&resolved),
+        vision_options,
     );
     let planner = agent::ContextAwareLlmPlanner::new(
         text_config,

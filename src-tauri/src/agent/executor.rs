@@ -338,6 +338,7 @@ impl From<&ResolvedStubAgentOptions> for VisionFallbackOptions {
             min_elements: options.vision_fallback_min_elements,
             min_window_area_points: options.vision_fallback_min_window_area_points,
             coordinate_fallback: options.vision_coordinate_fallback,
+            visual_crosscheck: false,
         }
     }
 }
@@ -1986,6 +1987,22 @@ where
                     );
                 }
             }
+        }
+
+        // Visual cross-check: one full-desktop capture attached to the
+        // planning observation. Only for steps that actually invoke the
+        // planner — batched follow-ups skip it — and a no-op when the
+        // observer has no cross-check or a replan context already set one.
+        if queued.is_empty() {
+            if let Err(err) = observer.prepare_planning_visual_context(&before) {
+                terminal_status = Some(AgentRunStatus::Failed);
+                failure_reason = Some(format!(
+                    "visual cross-check before step {} failed: {err}",
+                    step_number
+                ));
+                break;
+            }
+            observation_metadata = observer.observation_metadata();
         }
 
         let known_hints =
@@ -8093,6 +8110,12 @@ fn semantic_state_hash_with_metadata(
             )
         })
         .collect::<Vec<_>>();
+    // Only pure vision-grounding observations (no usable AX) fold the pixel
+    // hash into the semantic state: there the pixels ARE the state. With
+    // healthy AX (including the AxVision cross-check) the element tree alone
+    // decides stability and progress — a raw-pixel hash would make settle
+    // time out on every caret blink, clock tick, or video frame and would
+    // report every action as Progressed, neutering NoOp/loop detection.
     if metadata.source == ObservationSource::VisionGrounding {
         if let Some(hash) = metadata.visual_state_hash.as_deref() {
             records.push(format!("vision-grounding\u{1f}{hash}"));
@@ -14690,6 +14713,90 @@ mod tests {
     }
 
     #[test]
+    fn planning_visual_context_prepared_once_per_planned_step_not_for_batched() {
+        let planner = BatchingPlanner {
+            primary: Action::Type {
+                id: 7,
+                text: "hello".into(),
+            },
+            followups: vec![Action::Key {
+                combo: "Return".into(),
+            }],
+            calls: Rc::new(Cell::new(0)),
+        };
+        let field = text_field(7, "Search");
+        let mut typed = field.clone();
+        typed.value = Some("hello".into());
+        typed.refresh_signature();
+        let observer = FakeObserver::new(vec![
+            Ok(vec![field]),
+            Ok(vec![typed]),
+            Ok(vec![element(9, "Results")]),
+        ])
+        .with_set_values(vec![Ok(true)]);
+        let prepare_calls = observer.prepare_visual_calls.clone();
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(3),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(report.steps.len(), 3);
+        assert_eq!(
+            prepare_calls.get(),
+            2,
+            "type and Done are planned (capture each); the batched Return is not"
+        );
+    }
+
+    #[test]
+    fn planning_visual_context_failure_fails_the_run_with_the_capture_reason() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")])])
+            .with_prepare_visual_results(vec![Err(ObservationError::AxReadFailed(
+                "visual cross-check capture failed: no screen recording grant".into(),
+            ))]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(2),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        let reason = report.failure_reason.unwrap();
+        assert!(reason.contains("visual cross-check before step 1 failed"));
+        assert!(reason.contains("no screen recording grant"));
+    }
+
+    #[test]
     fn three_field_form_fill_batches_on_one_model_call() {
         let planner_calls = Rc::new(Cell::new(0));
         let planner = BatchingPlanner {
@@ -15410,6 +15517,8 @@ mod tests {
         menu_tree_paths: RefCell<Vec<Vec<String>>>,
         change_signals: RefCell<VecDeque<Box<dyn UiChangeSignal>>>,
         scroll_contexts: RefCell<VecDeque<Option<ScrollContext>>>,
+        prepare_visual_calls: Rc<Cell<u32>>,
+        prepare_visual_results: RefCell<VecDeque<Result<(), ObservationError>>>,
     }
 
     impl FakeObserver {
@@ -15438,7 +15547,17 @@ mod tests {
                 menu_tree_paths: RefCell::new(Vec::new()),
                 change_signals: RefCell::new(VecDeque::new()),
                 scroll_contexts: RefCell::new(VecDeque::new()),
+                prepare_visual_calls: Rc::new(Cell::new(0)),
+                prepare_visual_results: RefCell::new(VecDeque::new()),
             }
+        }
+
+        fn with_prepare_visual_results(
+            self,
+            results: Vec<Result<(), ObservationError>>,
+        ) -> Self {
+            *self.prepare_visual_results.borrow_mut() = results.into();
+            self
         }
 
         fn with_change_signals(self, signals: Vec<Box<dyn UiChangeSignal>>) -> Self {
@@ -15600,6 +15719,18 @@ mod tests {
 
         fn vision_fallback_context(&self) -> Option<VisionFallbackContext> {
             self.vision_context.borrow().clone()
+        }
+
+        fn prepare_planning_visual_context(
+            &self,
+            _ax: &[Element],
+        ) -> Result<(), ObservationError> {
+            self.prepare_visual_calls
+                .set(self.prepare_visual_calls.get() + 1);
+            self.prepare_visual_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(()))
         }
     }
 

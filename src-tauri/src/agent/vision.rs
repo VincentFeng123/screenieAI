@@ -13,9 +13,15 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Cursor;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 const DEFAULT_VISION_FALLBACK_MIN_ELEMENTS: u32 = 3;
 const DEFAULT_VISION_FALLBACK_MIN_WINDOW_AREA_POINTS: f64 = 120_000.0;
+const MAX_CROSSCHECK_CAPTURE_DIMENSION: u32 = 1568;
+/// One bounded retry for the planning cross-check capture: xcap can
+/// transiently fail (or return nothing) during Space transitions and
+/// display sleep/wake, which must not kill an otherwise healthy run.
+const CROSSCHECK_CAPTURE_RETRY_DELAY_MS: u64 = 200;
 const MAX_VISION_CANDIDATES: usize = 80;
 const MARK_FONT: &[u8] = include_bytes!("../../assets/fonts/NotoSans-Bold.ttf");
 const FNV_1A_64_OFFSET: u64 = 0xcbf29ce484222325;
@@ -26,6 +32,7 @@ pub(crate) struct VisionFallbackOptions {
     pub min_elements: u32,
     pub min_window_area_points: f64,
     pub coordinate_fallback: bool,
+    pub visual_crosscheck: bool,
 }
 
 impl Default for VisionFallbackOptions {
@@ -34,6 +41,7 @@ impl Default for VisionFallbackOptions {
             min_elements: DEFAULT_VISION_FALLBACK_MIN_ELEMENTS,
             min_window_area_points: DEFAULT_VISION_FALLBACK_MIN_WINDOW_AREA_POINTS,
             coordinate_fallback: false,
+            visual_crosscheck: false,
         }
     }
 }
@@ -44,6 +52,7 @@ impl Default for VisionFallbackOptions {
 pub enum ObservationSource {
     #[default]
     Ax,
+    AxVision,
     VisionMarks,
     VisionCoordinate,
     VisionGrounding,
@@ -99,6 +108,15 @@ pub trait ObservationMetadataProvider {
         _trigger_reason: &str,
     ) -> Result<Option<Vec<Element>>, ObservationError> {
         Ok(None)
+    }
+
+    /// Attach planning-time visual context (the full-desktop cross-check
+    /// capture) for the observation the planner is about to see. Called by
+    /// the agent loop exactly once per planned step — never from settle
+    /// polls or post-action verification reads, which would re-capture the
+    /// desktop several times per step for nothing. Default: no-op.
+    fn prepare_planning_visual_context(&self, _ax: &[Element]) -> Result<(), ObservationError> {
+        Ok(())
     }
 }
 
@@ -188,6 +206,7 @@ impl VisionFallbackContext {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VisionFallbackMode {
+    CrossCheck,
     Marks,
     Grounding,
 }
@@ -239,6 +258,13 @@ pub(crate) trait VisionWindowCapturer {
         let capture = self.capture_window(&window)?;
         let info = window_info.with_capture_size(capture.width(), capture.height());
         Ok(Some((capture, info)))
+    }
+
+    fn capture_crosscheck_surface(
+        &self,
+        focused_pid: Option<i32>,
+    ) -> Result<Option<(RgbaImage, FocusedWindowInfo)>, ObservationError> {
+        self.capture_observation_surface(focused_pid)
     }
 }
 
@@ -317,6 +343,12 @@ where
             Ok(ax) => ax,
             Err(err) => return self.observe_ax_error_fallback(err),
         };
+        // The visual cross-check capture is deliberately NOT taken here:
+        // observe() runs on every settle poll and on post-action
+        // verification, where a fresh multi-monitor capture per call is
+        // wasted work and pixel churn (caret blink, clocks, video) would
+        // poison the stability hash. The agent loop calls
+        // prepare_planning_visual_context() once per planned step instead.
         if ax
             .iter()
             .any(|element| element.source == ElementSource::Web)
@@ -448,6 +480,84 @@ where
     ) -> Result<Option<Vec<Element>>, ObservationError> {
         self.observe_marked_visual_context(ax.to_vec(), trigger_reason.to_string())
     }
+
+    fn prepare_planning_visual_context(&self, ax: &[Element]) -> Result<(), ObservationError> {
+        if !self.options.visual_crosscheck {
+            return Ok(());
+        }
+        // A visual-replan (marks) or grounding context set during this
+        // step's observation already carries an image; the cross-check must
+        // not clobber it.
+        if self.state.context().is_some() {
+            return Ok(());
+        }
+        let trigger_reason = if ax
+            .iter()
+            .any(|element| element.source == ElementSource::Web)
+        {
+            "ax-web+screen-crosscheck"
+        } else {
+            "ax+screen-crosscheck"
+        };
+
+        let started = Instant::now();
+        let mut last_failure: Option<ObservationError> = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(CROSSCHECK_CAPTURE_RETRY_DELAY_MS));
+            }
+            match self.capture_crosscheck_surface() {
+                Ok(Some((capture, info))) => {
+                    // An all-black desktop capture almost always means a
+                    // broken Screen Recording grant (TCC is per-signature;
+                    // rebuilds break it) — retry once, then fail closed
+                    // below rather than hand the planner a black image with
+                    // "do not act blindly" instructions.
+                    if crate::capture::rgba_is_blank(&capture) {
+                        last_failure = Some(ObservationError::AxReadFailed(
+                            "visual cross-check capture was blank; the macOS Screen Recording permission for ScreenieAI is likely broken — re-grant it in System Settings > Privacy & Security".into(),
+                        ));
+                        continue;
+                    }
+                    self.observe_crosscheck(
+                        ax.to_vec(),
+                        capture,
+                        info,
+                        trigger_reason.to_string(),
+                    )?;
+                    if let Some(context) = self.state.context() {
+                        eprintln!(
+                            "[screenie] agent visual cross-check ok size={}x{} ms={} trigger={}",
+                            context.capture_width,
+                            context.capture_height,
+                            started.elapsed().as_millis(),
+                            trigger_reason
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {
+                    last_failure = Some(ObservationError::AxReadFailed(
+                        "visual cross-check capture was unavailable; check the macOS Screen Recording permission for ScreenieAI".into(),
+                    ));
+                }
+                Err(err) => {
+                    last_failure = Some(ObservationError::AxReadFailed(format!(
+                        "visual cross-check capture failed: {err}; check the macOS Screen Recording permission for ScreenieAI"
+                    )));
+                }
+            }
+        }
+
+        // Fail closed: with the cross-check enabled the planner must not act
+        // on AX alone when the promised pixels are missing — a broken Screen
+        // Recording grant would otherwise turn into silent blind clicking.
+        // The error names the permission so the run report does too.
+        self.state.clear();
+        Err(last_failure.unwrap_or_else(|| {
+            ObservationError::AxReadFailed("visual cross-check capture failed".into())
+        }))
+    }
 }
 
 impl<O, C, D> VisionFallbackObserver<O, C, D>
@@ -456,6 +566,46 @@ where
     C: VisionWindowCapturer,
     D: VisionCandidateDetector,
 {
+    // Blank-capture detection happens in prepare_planning_visual_context
+    // (the only caller), which fails closed instead of attaching a black
+    // image.
+    fn observe_crosscheck(
+        &self,
+        ax: Vec<Element>,
+        capture: RgbaImage,
+        info: FocusedWindowInfo,
+        trigger_reason: String,
+    ) -> Result<Vec<Element>, ObservationError> {
+        let (capture, info) = downscale_crosscheck_capture(capture, info);
+        let image_png_b64 = png_b64(&capture)?;
+        let visual_state_hash = image_state_hash(&capture, &info);
+        let detector_kind = "ax+screen-crosscheck";
+        let metadata = crosscheck_observation_metadata(
+            ax.len(),
+            &trigger_reason,
+            &info,
+            detector_kind,
+            visual_state_hash,
+        );
+        self.state.set_context(
+            VisionFallbackContext {
+                mode: VisionFallbackMode::CrossCheck,
+                image_png_b64,
+                capture_width: info.width_pixels,
+                capture_height: info.height_pixels,
+                window_origin_x: info.origin_x,
+                window_origin_y: info.origin_y,
+                scale_factor: sane_scale(info.scale_factor),
+                candidate_count: ax.len(),
+                trigger_reason,
+                detector_kind: detector_kind.into(),
+                element_pixel_bounds: BTreeMap::new(),
+            },
+            metadata,
+        );
+        Ok(ax)
+    }
+
     fn observe_grounding_fallback(
         &self,
         ax: Vec<Element>,
@@ -708,6 +858,14 @@ where
         let focused_pid = focused.as_ref().and_then(|app| app.pid);
         self.capturer.capture_observation_surface(focused_pid)
     }
+
+    fn capture_crosscheck_surface(
+        &self,
+    ) -> Result<Option<(RgbaImage, FocusedWindowInfo)>, ObservationError> {
+        let focused = self.base.focused_app().ok();
+        let focused_pid = focused.as_ref().and_then(|app| app.pid);
+        self.capturer.capture_crosscheck_surface(focused_pid)
+    }
 }
 
 impl FocusedWindowInfo {
@@ -718,6 +876,25 @@ impl FocusedWindowInfo {
             scale_factor: sane_scale(self.scale_factor),
         }
     }
+}
+
+fn downscale_crosscheck_capture(
+    image: RgbaImage,
+    info: FocusedWindowInfo,
+) -> (RgbaImage, FocusedWindowInfo) {
+    let long = image.width().max(image.height());
+    if long <= MAX_CROSSCHECK_CAPTURE_DIMENSION {
+        return (image, info);
+    }
+
+    let scale = f64::from(MAX_CROSSCHECK_CAPTURE_DIMENSION) / f64::from(long);
+    let width = ((f64::from(image.width()) * scale).round().max(1.0)) as u32;
+    let height = ((f64::from(image.height()) * scale).round().max(1.0)) as u32;
+    let resized = DynamicImage::ImageRgba8(image)
+        .resize_exact(width, height, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let info = info.with_capture_size(width, height);
+    (resized, info)
 }
 
 fn window_capture_compatible(context: &VisionFallbackContext, info: &FocusedWindowInfo) -> bool {
@@ -775,6 +952,26 @@ fn observation_metadata(
         }),
         detector_kind: Some(detector_kind.to_string()),
         visual_state_hash: None,
+    }
+}
+
+fn crosscheck_observation_metadata(
+    ax_count: usize,
+    trigger_reason: &str,
+    info: &FocusedWindowInfo,
+    detector_kind: &str,
+    visual_state_hash: String,
+) -> ObservationMetadata {
+    ObservationMetadata {
+        source: ObservationSource::AxVision,
+        candidate_count: Some(ax_count as u32),
+        trigger_reason: Some(trigger_reason.to_string()),
+        capture_size: Some(CaptureSize {
+            width: info.width_pixels,
+            height: info.height_pixels,
+        }),
+        detector_kind: Some(detector_kind.to_string()),
+        visual_state_hash: Some(visual_state_hash),
     }
 }
 
@@ -1489,6 +1686,89 @@ impl VisionWindowCapturer for XcapWindowCapturer {
         };
         Ok(Some((image, info)))
     }
+
+    fn capture_crosscheck_surface(
+        &self,
+        _focused_pid: Option<i32>,
+    ) -> Result<Option<(RgbaImage, FocusedWindowInfo)>, ObservationError> {
+        let monitors = xcap::Monitor::all().map_err(|err| {
+            ObservationError::AxReadFailed(format!("xcap monitor list failed: {err}"))
+        })?;
+        let mut captures = Vec::with_capacity(monitors.len());
+        for monitor in monitors {
+            let image = monitor.capture_image().map_err(|err| {
+                ObservationError::AxReadFailed(format!("xcap monitor capture failed: {err}"))
+            })?;
+            captures.push(XcapMonitorCapture {
+                x: monitor.x().unwrap_or(0) as f64,
+                y: monitor.y().unwrap_or(0) as f64,
+                width: monitor.width().unwrap_or(image.width()).max(1),
+                height: monitor.height().unwrap_or(image.height()).max(1),
+                image,
+            });
+        }
+        Ok(compose_xcap_monitor_captures(captures))
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct XcapMonitorCapture {
+    x: f64,
+    y: f64,
+    width: u32,
+    height: u32,
+    image: RgbaImage,
+}
+
+#[cfg(target_os = "macos")]
+fn compose_xcap_monitor_captures(
+    captures: Vec<XcapMonitorCapture>,
+) -> Option<(RgbaImage, FocusedWindowInfo)> {
+    let mut iter = captures
+        .iter()
+        .filter(|capture| capture.width > 0 && capture.height > 0);
+    let first = iter.next()?;
+    let mut min_x = first.x.floor();
+    let mut min_y = first.y.floor();
+    let mut max_x = (first.x + first.width as f64).ceil();
+    let mut max_y = (first.y + first.height as f64).ceil();
+    for capture in iter {
+        min_x = min_x.min(capture.x.floor());
+        min_y = min_y.min(capture.y.floor());
+        max_x = max_x.max((capture.x + capture.width as f64).ceil());
+        max_y = max_y.max((capture.y + capture.height as f64).ceil());
+    }
+
+    let canvas_w = (max_x - min_x).round().max(1.0) as u32;
+    let canvas_h = (max_y - min_y).round().max(1.0) as u32;
+    let mut canvas = RgbaImage::from_pixel(canvas_w, canvas_h, Rgba([0, 0, 0, 255]));
+    for capture in captures {
+        if capture.width == 0 || capture.height == 0 {
+            continue;
+        }
+        let resized = DynamicImage::ImageRgba8(capture.image)
+            .resize_exact(
+                capture.width,
+                capture.height,
+                image::imageops::FilterType::Triangle,
+            )
+            .to_rgba8();
+        image::imageops::overlay(
+            &mut canvas,
+            &resized,
+            (capture.x.floor() - min_x) as i64,
+            (capture.y.floor() - min_y) as i64,
+        );
+    }
+
+    let info = FocusedWindowInfo {
+        origin_x: min_x,
+        origin_y: min_y,
+        width_pixels: canvas.width(),
+        height_pixels: canvas.height(),
+        scale_factor: 1.0,
+    };
+    Some((canvas, info))
 }
 
 #[cfg(test)]
@@ -1806,6 +2086,51 @@ mod tests {
         assert_ne!(*image.get_pixel(45, 45), chip);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn xcap_crosscheck_composition_covers_negative_monitor_offsets() {
+        let captures = vec![
+            XcapMonitorCapture {
+                x: 0.0,
+                y: 0.0,
+                width: 100,
+                height: 50,
+                image: RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255])),
+            },
+            XcapMonitorCapture {
+                x: -40.0,
+                y: 20.0,
+                width: 40,
+                height: 40,
+                image: RgbaImage::from_pixel(1, 1, Rgba([0, 255, 0, 255])),
+            },
+        ];
+
+        let (image, info) = compose_xcap_monitor_captures(captures).unwrap();
+
+        assert_eq!((image.width(), image.height()), (140, 60));
+        assert_eq!((info.origin_x, info.origin_y), (-40.0, 0.0));
+        assert_eq!(*image.get_pixel(0, 20), Rgba([0, 255, 0, 255]));
+        assert_eq!(*image.get_pixel(40, 0), Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn crosscheck_downscale_caps_long_edge() {
+        let image = RgbaImage::from_pixel(2000, 1000, Rgba([255, 255, 255, 255]));
+        let info = FocusedWindowInfo {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width_pixels: image.width(),
+            height_pixels: image.height(),
+            scale_factor: 1.0,
+        };
+
+        let (image, info) = downscale_crosscheck_capture(image, info);
+
+        assert_eq!((image.width(), image.height()), (1568, 784));
+        assert_eq!((info.width_pixels, info.height_pixels), (1568, 784));
+    }
+
     #[test]
     fn usable_ax_skips_vision_grounding() {
         let state = VisionFallbackState::new();
@@ -1831,6 +2156,185 @@ mod tests {
         assert_eq!(obs[0].source, ElementSource::Ax);
         assert!(state.context().is_none());
         assert_eq!(state.metadata().source, ObservationSource::Ax);
+    }
+
+    #[test]
+    fn usable_ax_with_crosscheck_keeps_ax_and_attaches_visual_context() {
+        let state = VisionFallbackState::new();
+        let capturer = FakeCapturer::large();
+        let capture_calls = capturer.capture_calls.clone();
+        let observer = VisionFallbackObserver::new(
+            FakeBaseObserver::new(vec![Ok(vec![element(1), element(2), element(3)])]),
+            capturer,
+            FakeDetector::new(vec![Rect {
+                x: 220.0,
+                y: 16.0,
+                width: 300.0,
+                height: 36.0,
+            }]),
+            state.clone(),
+            VisionFallbackOptions {
+                visual_crosscheck: true,
+                ..VisionFallbackOptions::default()
+            },
+        );
+
+        let obs = observer.observe().unwrap();
+
+        assert_eq!(obs.len(), 3);
+        // observe() itself never captures — settle polls and verification
+        // reads must stay cheap; only the planning hook pays for pixels.
+        assert_eq!(capture_calls.get(), 0);
+        assert_eq!(state.metadata().source, ObservationSource::Ax);
+
+        observer.prepare_planning_visual_context(&obs).unwrap();
+
+        assert_eq!(capture_calls.get(), 1);
+        assert!(obs.iter().all(|element| element.source == ElementSource::Ax));
+        assert_eq!(state.metadata().source, ObservationSource::AxVision);
+        assert_eq!(state.metadata().candidate_count, Some(3));
+        assert_eq!(
+            state.metadata().trigger_reason.as_deref(),
+            Some("ax+screen-crosscheck")
+        );
+        assert!(state.metadata().visual_state_hash.is_some());
+        let context = state.context().unwrap();
+        assert_eq!(context.mode, VisionFallbackMode::CrossCheck);
+        assert_eq!(context.candidate_count, 3);
+        assert!(context.element_pixel_bounds.is_empty());
+        assert!(!context.image_png_b64.is_empty());
+    }
+
+    #[test]
+    fn usable_ax_with_crosscheck_fails_closed_when_capture_is_unavailable() {
+        let state = VisionFallbackState::new();
+        let observer = VisionFallbackObserver::new(
+            FakeBaseObserver::new(vec![Ok(vec![element(1), element(2), element(3)])]),
+            MissingCapturer,
+            FakeDetector::new(Vec::new()),
+            state.clone(),
+            VisionFallbackOptions {
+                visual_crosscheck: true,
+                ..VisionFallbackOptions::default()
+            },
+        );
+
+        let obs = observer.observe().unwrap();
+        assert_eq!(obs.len(), 3);
+
+        let err = observer.prepare_planning_visual_context(&obs).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("visual cross-check capture was unavailable"));
+        assert!(state.context().is_none());
+        assert_eq!(state.metadata().source, ObservationSource::Ax);
+    }
+
+    #[test]
+    fn crosscheck_capture_retries_once_after_transient_failure() {
+        let state = VisionFallbackState::new();
+        let inner = FakeCapturer::large();
+        let capture_calls = inner.capture_calls.clone();
+        let observer = VisionFallbackObserver::new(
+            FakeBaseObserver::new(Vec::new()),
+            FlakyCapturer {
+                inner,
+                failures_remaining: Cell::new(1),
+            },
+            FakeDetector::new(Vec::new()),
+            state.clone(),
+            VisionFallbackOptions {
+                visual_crosscheck: true,
+                ..VisionFallbackOptions::default()
+            },
+        );
+
+        observer
+            .prepare_planning_visual_context(&[element(1), element(2), element(3)])
+            .unwrap();
+
+        assert_eq!(capture_calls.get(), 1);
+        assert_eq!(
+            state.context().map(|context| context.mode),
+            Some(VisionFallbackMode::CrossCheck)
+        );
+    }
+
+    #[test]
+    fn crosscheck_gives_up_after_repeated_transient_failures() {
+        let state = VisionFallbackState::new();
+        let observer = VisionFallbackObserver::new(
+            FakeBaseObserver::new(Vec::new()),
+            FlakyCapturer {
+                inner: FakeCapturer::large(),
+                failures_remaining: Cell::new(2),
+            },
+            FakeDetector::new(Vec::new()),
+            state.clone(),
+            VisionFallbackOptions {
+                visual_crosscheck: true,
+                ..VisionFallbackOptions::default()
+            },
+        );
+
+        let err = observer
+            .prepare_planning_visual_context(&[element(1)])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("transient capture hiccup"));
+        assert!(err.to_string().contains("Screen Recording"));
+        assert!(state.context().is_none());
+    }
+
+    #[test]
+    fn blank_crosscheck_capture_fails_closed_with_permission_hint() {
+        let state = VisionFallbackState::new();
+        let observer = VisionFallbackObserver::new(
+            FakeBaseObserver::new(Vec::new()),
+            BlankCapturer {
+                info: FakeCapturer::large().info,
+            },
+            FakeDetector::new(Vec::new()),
+            state.clone(),
+            VisionFallbackOptions {
+                visual_crosscheck: true,
+                ..VisionFallbackOptions::default()
+            },
+        );
+
+        let err = observer
+            .prepare_planning_visual_context(&[element(1), element(2), element(3)])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("blank"));
+        assert!(err.to_string().contains("Screen Recording"));
+        assert!(state.context().is_none());
+        assert_eq!(state.metadata().source, ObservationSource::Ax);
+    }
+
+    #[test]
+    fn web_element_press_forwards_to_base_observer() {
+        let state = VisionFallbackState::new();
+        let base = FakeBaseObserver::new(Vec::new());
+        let pressed = base.pressed_element_ids.clone();
+        let observer = VisionFallbackObserver::new(
+            base,
+            FakeCapturer::large(),
+            FakeDetector::new(Vec::new()),
+            state,
+            VisionFallbackOptions::default(),
+        );
+
+        assert!(observer.perform_press(&web_element(7)).unwrap());
+        assert_eq!(*pressed.borrow(), vec![7]);
+
+        // Vision-derived synthetic elements still fall back to synthetic
+        // input without touching the base observer.
+        let mut synthetic = element(9);
+        synthetic.source = ElementSource::VisionDetected;
+        assert!(!observer.perform_press(&synthetic).unwrap());
+        assert_eq!(*pressed.borrow(), vec![7]);
     }
 
     #[test]
@@ -2126,6 +2630,7 @@ mod tests {
     struct FakeBaseObserver {
         observations: RefCell<VecDeque<Result<Vec<Element>, ObservationError>>>,
         offers_change_signal: bool,
+        pressed_element_ids: Rc<RefCell<Vec<u32>>>,
     }
 
     impl FakeBaseObserver {
@@ -2133,6 +2638,7 @@ mod tests {
             Self {
                 observations: RefCell::new(observations.into()),
                 offers_change_signal: false,
+                pressed_element_ids: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
@@ -2153,6 +2659,11 @@ mod tests {
         fn change_signal(&self) -> Option<Box<dyn UiChangeSignal>> {
             self.offers_change_signal
                 .then(|| Box::new(NeverChangeSignal) as Box<dyn UiChangeSignal>)
+        }
+
+        fn perform_press(&self, el: &Element) -> Result<bool, String> {
+            self.pressed_element_ids.borrow_mut().push(el.id);
+            Ok(true)
         }
     }
 
@@ -2221,6 +2732,108 @@ mod tests {
                 self.info.width_pixels,
                 self.info.height_pixels,
                 Rgba([255, 255, 255, 255]),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct MissingCapturer;
+
+    impl VisionWindowCapturer for MissingCapturer {
+        type Window = ();
+
+        fn focused_window(
+            &self,
+            _focused_pid: Option<i32>,
+        ) -> Result<Option<Self::Window>, ObservationError> {
+            Ok(None)
+        }
+
+        fn window_info(
+            &self,
+            _window: &Self::Window,
+        ) -> Result<FocusedWindowInfo, ObservationError> {
+            Err(ObservationError::AxReadFailed("no window".into()))
+        }
+
+        fn capture_window(&self, _window: &Self::Window) -> Result<RgbaImage, ObservationError> {
+            Err(ObservationError::AxReadFailed("no capture".into()))
+        }
+    }
+
+    /// Errors the cross-check capture N times, then delegates to an inner
+    /// FakeCapturer — models xcap's transient failures (Space transitions,
+    /// display wake).
+    struct FlakyCapturer {
+        inner: FakeCapturer,
+        failures_remaining: Cell<u32>,
+    }
+
+    impl VisionWindowCapturer for FlakyCapturer {
+        type Window = ();
+
+        fn focused_window(
+            &self,
+            _focused_pid: Option<i32>,
+        ) -> Result<Option<Self::Window>, ObservationError> {
+            Ok(Some(()))
+        }
+
+        fn window_info(
+            &self,
+            window: &Self::Window,
+        ) -> Result<FocusedWindowInfo, ObservationError> {
+            self.inner.window_info(window)
+        }
+
+        fn capture_window(&self, window: &Self::Window) -> Result<RgbaImage, ObservationError> {
+            self.inner.capture_window(window)
+        }
+
+        fn capture_crosscheck_surface(
+            &self,
+            focused_pid: Option<i32>,
+        ) -> Result<Option<(RgbaImage, FocusedWindowInfo)>, ObservationError> {
+            if self.failures_remaining.get() > 0 {
+                self.failures_remaining.set(self.failures_remaining.get() - 1);
+                return Err(ObservationError::AxReadFailed(
+                    "transient capture hiccup".into(),
+                ));
+            }
+            self.inner.capture_crosscheck_surface(focused_pid)
+        }
+    }
+
+    /// Always returns an all-black capture — models a broken Screen
+    /// Recording grant, where the legacy capture API yields blank frames
+    /// instead of erroring.
+    #[derive(Clone)]
+    struct BlankCapturer {
+        info: FocusedWindowInfo,
+    }
+
+    impl VisionWindowCapturer for BlankCapturer {
+        type Window = ();
+
+        fn focused_window(
+            &self,
+            _focused_pid: Option<i32>,
+        ) -> Result<Option<Self::Window>, ObservationError> {
+            Ok(Some(()))
+        }
+
+        fn window_info(
+            &self,
+            _window: &Self::Window,
+        ) -> Result<FocusedWindowInfo, ObservationError> {
+            Ok(self.info.clone())
+        }
+
+        fn capture_window(&self, _window: &Self::Window) -> Result<RgbaImage, ObservationError> {
+            Ok(RgbaImage::from_pixel(
+                self.info.width_pixels,
+                self.info.height_pixels,
+                Rgba([0, 0, 0, 255]),
             ))
         }
     }
