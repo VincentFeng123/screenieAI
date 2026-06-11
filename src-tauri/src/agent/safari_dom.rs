@@ -8,6 +8,8 @@ const DOM_EXTRACTION_JS: &str = r#"(function(){const ATTR='data-agent-id';const 
 
 const DOM_REFRESH_JS_PREFIX: &str = r#"(function(agentId){const ATTR='data-agent-id';const viewportWidth=window.innerWidth||document.documentElement.clientWidth||0;const viewportHeight=window.innerHeight||document.documentElement.clientHeight||0;const scrollX=window.scrollX||0;const scrollY=window.scrollY||0;const scroller=document.scrollingElement||document.documentElement;const scrollWidth=(scroller&&scroller.scrollWidth)||0;const scrollHeight=(scroller&&scroller.scrollHeight)||0;function textOf(el){return (el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();}function byIdList(value){return String(value||'').split(/\s+/).map(id=>document.getElementById(id)).filter(Boolean).map(textOf).filter(Boolean).join(' ');}function labelFor(el){const aria=el.getAttribute('aria-label');if(aria&&aria.trim())return aria.trim();const labelled=byIdList(el.getAttribute('aria-labelledby'));if(labelled)return labelled;const id=el.id;if(id){const label=document.querySelector('label[for="'+CSS.escape(id)+'"]');if(label){const text=textOf(label);if(text)return text;}}if(el.labels&&el.labels.length){const text=Array.from(el.labels).map(textOf).filter(Boolean).join(' ');if(text)return text;}for(const attr of ['title','placeholder','alt','name']){const value=el.getAttribute(attr);if(value&&value.trim())return value.trim();}const text=textOf(el);if(text)return text;return el.id||el.tagName.toLowerCase();}function inputType(el){return (el.getAttribute('type')||'text').toLowerCase();}function isEditable(el){return el.isContentEditable||el.getAttribute('contenteditable')===''||el.getAttribute('contenteditable')==='true';}function disabled(el){return !!el.disabled||String(el.getAttribute('aria-disabled')||'').toLowerCase()==='true';}function roleAttr(el){return (el.getAttribute('role')||'').toLowerCase();}function clipRect(rect){const left=Math.max(0,Math.min(viewportWidth,rect.left));const top=Math.max(0,Math.min(viewportHeight,rect.top));const right=Math.max(0,Math.min(viewportWidth,rect.right));const bottom=Math.max(0,Math.min(viewportHeight,rect.bottom));return {x:left,y:top,width:right-left,height:bottom-top};}function visibleRect(el){const rects=Array.from(el.getClientRects()).map(clipRect).filter(r=>r.width>=2&&r.height>=2);if(!rects.length)return null;const first=rects[0];let left=first.x,top=first.y,right=first.x+first.width,bottom=first.y+first.height;for(const r of rects.slice(1)){left=Math.min(left,r.x);top=Math.min(top,r.y);right=Math.max(right,r.x+r.width);bottom=Math.max(bottom,r.y+r.height);}return {x:left,y:top,width:right-left,height:bottom-top};}function visibleStyle(el){const style=window.getComputedStyle(el);return style&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity||'1')!==0;}function unobscured(el,rect){const x=Math.max(0,Math.min(viewportWidth-1,rect.x+rect.width/2));const y=Math.max(0,Math.min(viewportHeight-1,rect.y+rect.height/2));const hit=document.elementFromPoint(x,y);return !hit||hit===el||el.contains(hit)||hit.contains(el);}function labelProxyRect(el){if(el.tagName.toLowerCase()!=='input')return null;const t=inputType(el);if(t!=='radio'&&t!=='checkbox')return null;if(!el.labels||!el.labels.length)return null;for(const lab of Array.from(el.labels)){if(!visibleStyle(lab))continue;const r=visibleRect(lab);if(!r||r.width<2||r.height<2)continue;if(!unobscured(lab,r))continue;return r;}return null;}const el=document.querySelector('['+ATTR+'="'+CSS.escape(agentId)+'"]');if(!el)return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,scrollX:scrollX,scrollY:scrollY,scrollWidth:scrollWidth,scrollHeight:scrollHeight,elements:[]});let rect=null;if(visibleStyle(el)){rect=visibleRect(el);if(rect&&(rect.width<2||rect.height<2))rect=null;if(rect&&!unobscured(el,rect))rect=null;}if(!rect)rect=labelProxyRect(el);if(!rect)return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,scrollX:scrollX,scrollY:scrollY,scrollWidth:scrollWidth,scrollHeight:scrollHeight,elements:[]});const tag=el.tagName.toLowerCase();const type=tag==='input'?inputType(el):'';let value=null;if(tag==='input'&&(type==='radio'||type==='checkbox'))value=el.checked?'checked':'unchecked';else if((tag==='input'||tag==='textarea')&&type!=='password'&&typeof el.value==='string'&&el.value.trim())value=el.value;return JSON.stringify({innerWidth:viewportWidth,innerHeight:viewportHeight,scrollX:scrollX,scrollY:scrollY,scrollWidth:scrollWidth,scrollHeight:scrollHeight,elements:[{agentId:agentId,tag,inputType:type,role:roleAttr(el),name:labelFor(el),value,rect,disabled:disabled(el),focused:document.activeElement===el,contentEditable:isEditable(el),multiline:tag==='textarea'||el.getAttribute('aria-multiline')==='true'}]});})("#;
 
+const DOM_PRESS_JS_PREFIX: &str = r#"(function(agentId){const ATTR='data-agent-id';const viewportWidth=window.innerWidth||document.documentElement.clientWidth||0;const viewportHeight=window.innerHeight||document.documentElement.clientHeight||0;function disabled(el){return !!el.disabled||String(el.getAttribute('aria-disabled')||'').toLowerCase()==='true';}function visibleStyle(el){const style=window.getComputedStyle(el);return style&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity||'1')!==0;}function clipRect(rect){const left=Math.max(0,Math.min(viewportWidth,rect.left));const top=Math.max(0,Math.min(viewportHeight,rect.top));const right=Math.max(0,Math.min(viewportWidth,rect.right));const bottom=Math.max(0,Math.min(viewportHeight,rect.bottom));return {x:left,y:top,width:right-left,height:bottom-top};}function visibleRect(el){const rects=Array.from(el.getClientRects()).map(clipRect).filter(r=>r.width>=2&&r.height>=2);if(!rects.length)return null;const first=rects[0];let left=first.x,top=first.y,right=first.x+first.width,bottom=first.y+first.height;for(const r of rects.slice(1)){left=Math.min(left,r.x);top=Math.min(top,r.y);right=Math.max(right,r.x+r.width);bottom=Math.max(bottom,r.y+r.height);}return {x:left,y:top,width:right-left,height:bottom-top};}function unobscured(el,rect){const x=Math.max(0,Math.min(viewportWidth-1,rect.x+rect.width/2));const y=Math.max(0,Math.min(viewportHeight-1,rect.y+rect.height/2));const hit=document.elementFromPoint(x,y);return !hit||hit===el||el.contains(hit)||hit.contains(el);}const el=document.querySelector('['+ATTR+'="'+CSS.escape(agentId)+'"]');if(!el)return JSON.stringify({pressed:false,reason:'missing'});if(disabled(el))return JSON.stringify({pressed:false,reason:'disabled'});if(!visibleStyle(el))return JSON.stringify({pressed:false,reason:'not visible'});const rect=visibleRect(el);if(!rect)return JSON.stringify({pressed:false,reason:'no visible rect'});if(!unobscured(el,rect))return JSON.stringify({pressed:false,reason:'center obscured'});try{if(typeof el.focus==='function')el.focus({preventScroll:true});}catch(e){try{el.focus();}catch(_){}}el.click();return JSON.stringify({pressed:true});})("#;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SafariDomPayload {
@@ -46,6 +48,14 @@ pub(crate) struct SafariDomElement {
     pub content_editable: bool,
     #[serde(default)]
     pub multiline: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SafariDomPressResult {
+    pressed: bool,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -119,7 +129,36 @@ pub(crate) fn refresh_safari_dom_element(
         }))
 }
 
+pub(crate) fn press_safari_dom_element(agent_id: &str) -> Result<bool, ObservationError> {
+    let js = format!(
+        "{}{})",
+        DOM_PRESS_JS_PREFIX,
+        serde_json::to_string(agent_id).map_err(|err| {
+            ObservationError::SafariDomReadFailed(format!(
+                "Safari DOM press failed: could not encode element id: {err}"
+            ))
+        })?
+    );
+    let raw = run_safari_javascript(&js, "Safari DOM press failed")?;
+    let result: SafariDomPressResult = serde_json::from_str(raw.trim()).map_err(|err| {
+        ObservationError::SafariDomReadFailed(format!(
+            "Safari DOM press failed: invalid press JSON: {err}"
+        ))
+    })?;
+    if !result.pressed {
+        if let Some(reason) = result.reason {
+            eprintln!("[screenie] agent safari-dom press declined: {reason}");
+        }
+    }
+    Ok(result.pressed)
+}
+
 fn run_safari_dom_script(js: &str) -> Result<SafariDomPayload, ObservationError> {
+    let stdout = run_safari_javascript(js, "Safari DOM read failed")?;
+    parse_payload(stdout.trim())
+}
+
+fn run_safari_javascript(js: &str, failure_context: &str) -> Result<String, ObservationError> {
     let script = format!(
         "tell application \"Safari\" to do JavaScript {} in current tab of front window",
         applescript_string(js)
@@ -130,7 +169,7 @@ fn run_safari_dom_script(js: &str) -> Result<SafariDomPayload, ObservationError>
         .output()
         .map_err(|err| {
             ObservationError::SafariDomReadFailed(format!(
-                "Safari DOM read failed: could not run osascript: {err}"
+                "{failure_context}: could not run osascript: {err}"
             ))
         })?;
 
@@ -141,8 +180,7 @@ fn run_safari_dom_script(js: &str) -> Result<SafariDomPayload, ObservationError>
         ));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_payload(stdout.trim())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub(crate) fn parse_payload(json: &str) -> Result<SafariDomPayload, ObservationError> {
@@ -788,6 +826,13 @@ mod tests {
         }
         assert!(DOM_REFRESH_JS_PREFIX.contains("if(rect&&!unobscured(el,rect))rect=null;"));
         assert!(DOM_REFRESH_JS_PREFIX.contains("if(!unobscured(lab,r))continue;"));
+    }
+
+    #[test]
+    fn press_js_checks_center_hit_before_clicking_element() {
+        assert!(DOM_PRESS_JS_PREFIX.contains("document.elementFromPoint"));
+        assert!(DOM_PRESS_JS_PREFIX.contains("unobscured(el,rect)"));
+        assert!(DOM_PRESS_JS_PREFIX.contains("el.click()"));
     }
 
     #[test]

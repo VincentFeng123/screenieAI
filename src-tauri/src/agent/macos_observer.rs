@@ -692,18 +692,23 @@ impl ScreenObserver for MacObserver {
     }
 
     fn perform_press(&self, el: &Element) -> Result<bool, String> {
-        let Some(PlatformElementHandle::MacAx { key }) = el.platform_handle.as_ref() else {
-            return Ok(false);
-        };
-        let Some(handle) = self.handles.get(*key) else {
-            return Ok(false);
-        };
-        let action = CFString::new("AXPress");
-        let err = unsafe { AXUIElementPerformAction(handle, action.as_concrete_TypeRef()) };
-        // Any non-success means no press happened, so the synthetic-click
-        // fallback is always safe; a press that "succeeded" without effect is
-        // caught by the caller's post-action verification.
-        Ok(err == AX_ERROR_SUCCESS)
+        match el.platform_handle.as_ref() {
+            Some(PlatformElementHandle::MacAx { key }) => {
+                let Some(handle) = self.handles.get(*key) else {
+                    return Ok(false);
+                };
+                let action = CFString::new("AXPress");
+                let err = unsafe { AXUIElementPerformAction(handle, action.as_concrete_TypeRef()) };
+                // Any non-success means no press happened, so the synthetic-click
+                // fallback is always safe; a press that "succeeded" without effect is
+                // caught by the caller's post-action verification.
+                Ok(err == AX_ERROR_SUCCESS)
+            }
+            Some(PlatformElementHandle::SafariDom { agent_id }) => {
+                safari_dom::press_safari_dom_element(agent_id).map_err(|err| err.to_string())
+            }
+            None => Ok(false),
+        }
     }
 
     fn set_value(&self, el: &Element, text: &str) -> Result<bool, String> {

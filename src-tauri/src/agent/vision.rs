@@ -386,10 +386,11 @@ where
         }
     }
 
-    // Semantic actions only make sense on real AX elements; vision-derived
-    // synthetic elements have no platform handle, so they fall back cleanly.
+    // Semantic actions only make sense on elements with a platform handle
+    // (AX nodes and Safari DOM nodes); vision-derived synthetic elements
+    // have none, so they fall back cleanly to the synthetic-input path.
     fn perform_press(&self, el: &Element) -> Result<bool, String> {
-        if el.source == ElementSource::Ax {
+        if matches!(el.source, ElementSource::Ax | ElementSource::Web) {
             self.base.perform_press(el)
         } else {
             Ok(false)

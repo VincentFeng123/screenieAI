@@ -448,6 +448,7 @@ pub enum AgentRunStatus {
 #[serde(rename_all = "camelCase")]
 pub enum ActionMechanism {
     AxPress,
+    DomClick,
     AxSetValue,
     MenuPress,
     SyntheticClick,
@@ -3571,21 +3572,24 @@ where
                 }
             }
 
-            // Rung 3 of the action ladder: semantic AX actions before
-            // synthetic input. Attempt 1 only — an AXPress/AXSetValue whose
+            // Rung 3 of the action ladder: semantic target actions before
+            // synthetic input. Attempt 1 only — a semantic press/set whose
             // verification shows no effect falls back to the synthetic path
             // on the retry attempt.
             let mut ax_semantic_mechanism: Option<ActionMechanism> = None;
             if attempt == 1 && !options.execution_policy.is_dry_run() {
-                if ax_press_eligible(&prepared) {
+                if semantic_press_eligible(&prepared) {
                     if let Some(element) = prepared.target_element.as_ref() {
                         match observer.perform_press(element) {
                             Ok(true) => {
-                                ax_semantic_mechanism = Some(ActionMechanism::AxPress);
+                                ax_semantic_mechanism = Some(match element.source {
+                                    ElementSource::Web => ActionMechanism::DomClick,
+                                    _ => ActionMechanism::AxPress,
+                                });
                             }
                             Ok(false) => {}
                             Err(err) => eprintln!(
-                                "[screenie] agent step {} ax-press failed; falling back to synthetic click: {err}",
+                                "[screenie] agent step {} semantic press failed; falling back to synthetic click: {err}",
                                 step_number
                             ),
                         }
@@ -6658,15 +6662,16 @@ const AX_PRESS_ROLES: &[&str] = &[
     "AXLink",
 ];
 
-/// AXPress replaces a synthetic single click only on control-like roles.
+/// Semantic press replaces a synthetic single click only on control-like roles.
 /// Clicks on text-entry roles and sliders are focus/caret intents where
-/// AXPress is wrong or unsupported.
-fn ax_press_eligible(prepared: &PreparedAction) -> bool {
+/// press actions are wrong or unsupported.
+fn semantic_press_eligible(prepared: &PreparedAction) -> bool {
     if !matches!(prepared.kind, PreparedKind::Click { times: 1 }) {
         return false;
     }
     prepared.target_element.as_ref().is_some_and(|element| {
-        element.source == ElementSource::Ax && AX_PRESS_ROLES.contains(&element.role.as_str())
+        matches!(element.source, ElementSource::Ax | ElementSource::Web)
+            && AX_PRESS_ROLES.contains(&element.role.as_str())
     })
 }
 
@@ -14047,6 +14052,47 @@ mod tests {
     }
 
     #[test]
+    fn web_press_replaces_synthetic_click_and_records_dom_mechanism() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observer = FakeObserver::new(vec![
+            Ok(vec![web_button(1, "Buy")]),
+            Ok(vec![element(2, "Checkout")]),
+        ])
+        .with_presses(vec![Ok(true)]);
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &StubPlanner::single(Action::Click { id: 1 }),
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(1),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(report.steps[0].executed);
+        assert_eq!(report.steps[0].mechanism, Some(ActionMechanism::DomClick));
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::Progressed
+        );
+        assert_eq!(*observer.pressed_element_ids.borrow(), vec![1]);
+        assert!(
+            events.borrow().is_empty(),
+            "DOM click must not move the cursor or click synthetically"
+        );
+    }
+
+    #[test]
     fn ax_press_no_op_falls_back_to_synthetic_click_on_retry() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let clicks = Rc::new(Cell::new(0));
@@ -16753,6 +16799,25 @@ mod tests {
         Element::new(
             id,
             "AXTextField".into(),
+            name.into(),
+            None,
+            Rect {
+                x: 20.0,
+                y: 20.0,
+                width: 80.0,
+                height: 30.0,
+            },
+            true,
+            false,
+            CoordinateSpace::AxPoints,
+            ElementSource::Web,
+        )
+    }
+
+    fn web_button(id: u32, name: &str) -> Element {
+        Element::new(
+            id,
+            "AXButton".into(),
             name.into(),
             None,
             Rect {
