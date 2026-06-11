@@ -505,7 +505,7 @@ export default function QuickTooltip() {
   const runSeqRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
-  const agentInputRef = useRef<HTMLInputElement>(null);
+  const agentInputRef = useRef<HTMLTextAreaElement>(null);
   const statusCardRef = useRef<HTMLElement>(null);
   const agentInputOpenRef = useRef(false);
   const agentFormRef = useRef<HTMLDivElement>(null);
@@ -869,6 +869,17 @@ export default function QuickTooltip() {
     }, 30_000);
     return () => window.clearTimeout(id);
   }, [confirmation]);
+
+  // Auto-grow the goal textarea with its content (height: auto -> measure
+  // scrollHeight); the CSS max-height caps it, after which it scrolls. The
+  // form's ResizeObserver then grows the card + native window to follow.
+  useLayoutEffect(() => {
+    if (!agentInputOpen) return;
+    const el = agentInputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [agentInputOpen, agentGoal]);
 
   // The agent card grows with the voice feed (statusHeight pattern): the
   // form is content-sized, the measurement drives both the CSS var and the
@@ -1322,15 +1333,17 @@ export default function QuickTooltip() {
           >
             <div className="quick-tooltip-agent-composer">
               <div className="quick-tooltip-agent-row">
-                <input
+                <textarea
                   ref={agentInputRef}
                   value={agentGoal}
+                  rows={1}
                   onChange={(e) => setAgentGoal(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Escape") {
                       e.preventDefault();
                       closeAgentInput();
-                    } else if (e.key === "Enter") {
+                    } else if (e.key === "Enter" && !e.shiftKey) {
+                      // Shift+Enter inserts a newline; plain Enter submits.
                       e.preventDefault();
                       void submitAgentGoal();
                     }

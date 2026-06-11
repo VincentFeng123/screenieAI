@@ -577,17 +577,25 @@ body,
 
 /* Transparent inner row — the composer behind it owns the frost.
    Symmetric side padding: composer 8px + row 6px = 14px inset on both the
-   placeholder text and the send button. */
+   placeholder text and the send button. Bottom-aligned so the mic/send
+   buttons stay anchored while the textarea grows upward line by line. */
 .quick-tooltip-agent-row {
   position: relative;
   min-height: 42px;
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 8px;
   padding: 0 6px;
   background: transparent;
   box-shadow: none;
   box-sizing: border-box;
+}
+
+/* (42px single-line row − 30px button) / 2 keeps the buttons visually
+   centered in the one-line state. */
+.quick-tooltip-agent-row .quick-tooltip-voice-btn,
+.quick-tooltip-agent-row .quick-tooltip-agent-submit {
+  margin-bottom: 6px;
 }
 
 :root[data-screenie-platform="windows"][data-screenie-mode="tooltip"]
@@ -606,22 +614,29 @@ body,
   backdrop-filter: blur(30px) saturate(145%) brightness(0.88);
 }
 
-.quick-tooltip-agent-row input {
+/* Auto-grown from JS (height = scrollHeight on every value change); the
+   11px vertical padding makes the one-line state exactly the row's 42px.
+   Past ~5 lines the max-height caps growth and the textarea scrolls. */
+.quick-tooltip-agent-row textarea {
   min-width: 0;
   flex: 1;
-  height: 30px;
+  height: 42px;
+  max-height: 122px;
   border: none;
   outline: none;
+  resize: none;
+  overflow-y: auto;
   background: transparent;
   color: rgba(255, 255, 255, 0.95);
   caret-color: rgba(255, 255, 255, 0.95);
   font: inherit;
   font-size: 14px;
   line-height: 20px;
-  padding: 0;
+  padding: 11px 0;
+  box-sizing: border-box;
 }
 
-.quick-tooltip-agent-row input::placeholder {
+.quick-tooltip-agent-row textarea::placeholder {
   color: rgba(255, 255, 255, 0.42);
 }
 
