@@ -871,18 +871,40 @@ export default function QuickTooltip() {
   }, [confirmation]);
 
   // Auto-grow the goal textarea with its content. Collapse to 0 before
-  // reading scrollHeight so the measurement is pure content + padding —
-  // "auto" resolves differently for the placeholder vs real text in WebKit,
-  // which made the empty card a different height than the typed one. CSS
+  // reading scrollHeight so the measurement is pure content + padding. CSS
   // min/max-height clamp the result (42px single line .. ~5 lines), and the
   // form's ResizeObserver grows the card + native window to follow.
-  useLayoutEffect(() => {
-    if (!agentInputOpen) return;
+  const syncAgentInputHeight = useCallback(() => {
     const el = agentInputRef.current;
     if (!el) return;
     el.style.height = "0px";
     el.style.height = `${el.scrollHeight}px`;
-  }, [agentInputOpen, agentGoal]);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!agentInputOpen) return;
+    syncAgentInputHeight();
+  }, [agentInputOpen, agentGoal, syncAgentInputHeight]);
+
+  // The card mounts while the native window is still pill-width, so the
+  // first measurement can see a WRAPPED placeholder (two lines -> 62px) and
+  // never correct itself once the window widens. Re-sync whenever the
+  // textarea's width changes; ignore the observer's echoes of our own
+  // height writes.
+  useLayoutEffect(() => {
+    if (!agentInputOpen) return;
+    const el = agentInputRef.current;
+    if (!el) return;
+    let lastWidth = el.clientWidth;
+    const ro = new ResizeObserver(() => {
+      const width = el.clientWidth;
+      if (width === lastWidth) return;
+      lastWidth = width;
+      syncAgentInputHeight();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [agentInputOpen, syncAgentInputHeight]);
 
   // The agent card grows with the voice feed (statusHeight pattern): the
   // form is content-sized, the measurement drives both the CSS var and the
@@ -949,18 +971,46 @@ export default function QuickTooltip() {
     }
   }, [voice, restoreQuickTooltipKeyboardMode, setQuickTooltipKeyboardMode]);
 
+  // Which way the card's dropdown menus open, decided by the toolbar's
+  // position on its monitor (only Rust knows that): "below" grows the
+  // native window downward as before; "above" keeps the window as-is and
+  // the menu overlays the card upward. Re-queried when the card opens, the
+  // card height changes, and on every menu open/close (covers a toolbar
+  // dragged while the card was open).
+  const [agentMenuPlacement, setAgentMenuPlacement] = useState<"below" | "above">(
+    "below",
+  );
+  useEffect(() => {
+    if (!agentInputOpen) return;
+    let cancelled = false;
+    invoke<string>("quick_tooltip_menu_direction", { agentCardHeight })
+      .then((direction) => {
+        if (cancelled) return;
+        setAgentMenuPlacement(direction === "above" ? "above" : "below");
+      })
+      .catch((e) => {
+        console.error("quick_tooltip_menu_direction failed:", e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentInputOpen, agentCardHeight, agentModelMenuOpen]);
+
   useEffect(() => {
     invoke("resize_quick_tooltip", {
       expanded: chatVisible,
       agentInputOpen,
-      agentModelMenuOpen,
+      // An upward-opening menu needs no extra window: growing would jump
+      // the whole toolbar up (the monitor clamp) — the exact thing the
+      // "above" placement avoids.
+      agentModelMenuOpen: agentModelMenuOpen && agentMenuPlacement === "below",
       statusOpen: hasStatus,
       statusHeight: hasStatus ? statusHeight : undefined,
       agentCardHeight: agentInputOpen ? agentCardHeight : undefined,
     }).catch((e) => {
         console.error("resize_quick_tooltip failed:", e);
     });
-  }, [agentCardHeight, agentInputOpen, agentModelMenuOpen, chatVisible, hasStatus, statusHeight]);
+  }, [agentCardHeight, agentInputOpen, agentMenuPlacement, agentModelMenuOpen, chatVisible, hasStatus, statusHeight]);
 
   useEffect(() => {
     if (!chatVisible) return;
@@ -1396,7 +1446,7 @@ export default function QuickTooltip() {
                     ariaLabel={`${providerInfo.label} agent model`}
                     variant="ghost"
                     disabled={agentRunning}
-                    placement="below"
+                    placement={agentMenuPlacement}
                     onOpenChange={setAgentModelMenuOpen}
                     triggerLabel={
                       <span className="quick-tooltip-agent-model-label">
@@ -1423,7 +1473,7 @@ export default function QuickTooltip() {
                     ariaLabel="Agent autonomy"
                     variant="ghost"
                     disabled={agentRunning}
-                    placement="below"
+                    placement={agentMenuPlacement}
                     onOpenChange={setAgentModelMenuOpen}
                     triggerLabel={
                       <span className="quick-tooltip-agent-model-label">

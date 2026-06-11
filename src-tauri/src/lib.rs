@@ -3930,6 +3930,29 @@ async fn start_capture(app: AppHandle, window: WebviewWindow) -> Result<(), Stri
     Ok(())
 }
 
+/// Which way the agent card's dropdown menus should open: "below" when the
+/// menu-grown window still fits between the toolbar and the monitor's
+/// bottom edge, "above" otherwise. The webview can't know where its window
+/// sits on screen, so React asks before rendering the menu (and skips the
+/// with-menu window growth entirely for "above").
+#[tauri::command]
+fn quick_tooltip_menu_direction(
+    window: WebviewWindow,
+    agent_card_height: Option<f64>,
+) -> Result<&'static str, String> {
+    require_window(&window, "quick_tooltip")?;
+    let Some(position) = quick_tooltip_current_logical_position(&window) else {
+        return Ok("below");
+    };
+    let Some(monitor) = window.current_monitor().ok().flatten() else {
+        return Ok("below");
+    };
+    let size = QuickTooltipSize::agent_input_with_menu(agent_card_height);
+    let (_, y, _, h) = monitor_logical_rect(&monitor);
+    let fits_below = position.y as f64 + size.height + QUICK_TOOLTIP_SCREEN_PAD <= y + h;
+    Ok(if fits_below { "below" } else { "above" })
+}
+
 #[tauri::command]
 fn resize_quick_tooltip(
     window: WebviewWindow,
@@ -4595,6 +4618,7 @@ pub fn run() {
         repeat_last_capture,
         start_capture,
         resize_quick_tooltip,
+        quick_tooltip_menu_direction,
         add_history_entry,
         list_history,
         delete_history_entry,
