@@ -606,9 +606,10 @@ pub(crate) fn openai_strictify(schema: &Value) -> Value {
                     "type" | "enum" | "minimum" | "maximum" | "minItems" | "maxItems" => {
                         out.insert(key.clone(), entry.clone());
                     }
-                    // required/additionalProperties are regenerated below;
-                    // everything else (maxLength, ...) is unsupported in
-                    // strict mode and dropped.
+                    // required/additionalProperties are regenerated below.
+                    // Everything else (maxLength, ...) is dropped: length
+                    // caps are enforced client-side by the parser's
+                    // truncation, so the strict schema doesn't need them.
                     _ => {}
                 }
             }
@@ -623,8 +624,10 @@ pub(crate) fn openai_strictify(schema: &Value) -> Value {
     }
 }
 
-/// Strict mode's documented optional-field emulation: union the property's
-/// type with "null" (enum value lists stay untouched).
+/// Strict mode's optional-field emulation: union the property's type with
+/// "null". An enum value list is a closed set, so when the property carries
+/// one, null is appended there too — the model omits an optional field by
+/// emitting literal null, which must itself be a legal enum member.
 fn null_union_type(property: &mut Value) {
     let Some(map) = property.as_object_mut() else {
         return;
@@ -641,7 +644,12 @@ fn null_union_type(property: &mut Value) {
                 }
             }
         }
-        _ => {}
+        _ => return,
+    }
+    if let Some(Value::Array(values)) = map.get_mut("enum") {
+        if !values.iter().any(Value::is_null) {
+            values.push(Value::Null);
+        }
     }
 }
 
@@ -974,17 +982,21 @@ mod tests {
         );
 
         // Originally-required properties keep their plain type; optional ones
-        // become nullable, with enum value lists untouched (the documented
-        // strict-mode optional-field emulation).
+        // become nullable. An optional property's enum gains null — the enum
+        // is a closed set and literal null is how the model omits the field.
         assert_eq!(strict["properties"]["reason"]["type"], json!("string"));
         assert_eq!(strict["properties"]["action"]["type"], json!("string"));
+        assert_eq!(
+            strict["properties"]["action"]["enum"],
+            json!(["click", "done"])
+        );
         assert_eq!(
             strict["properties"]["scope"]["type"],
             json!(["string", "null"])
         );
         assert_eq!(
             strict["properties"]["scope"]["enum"],
-            json!(["screen", "window"])
+            json!(["screen", "window", null])
         );
         assert_eq!(
             strict["properties"]["id"]["type"],

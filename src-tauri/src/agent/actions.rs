@@ -651,6 +651,18 @@ mod tests {
         );
     }
 
+    /// The target-intent contract is registry-driven (the parser consults
+    /// requires_target_name); pin which actions carry it.
+    #[test]
+    fn target_name_contract_covers_exactly_the_id_targeted_actions() {
+        let flagged: Vec<&str> = ACTIONS
+            .iter()
+            .filter(|spec| spec.requires_target_name)
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(flagged, vec!["click", "doubleClick", "type"]);
+    }
+
     /// Provider drift guard: the OpenAI strict schema is derived mechanically
     /// from the planner schema, so it must cover every registry action and
     /// the target-intent fields. This was a live bug — the previous

@@ -1584,12 +1584,11 @@ pub(crate) fn parse_planner_decision(
     // The target-intent contract: an id-targeted action must echo the name
     // the planner read for that id, so the executor can refuse to act when
     // the id and the stated intent disagree. Batch followups stay tolerant.
-    if target_name.is_none()
-        && matches!(
-            action,
-            Action::Click { .. } | Action::DoubleClick { .. } | Action::Type { .. }
-        )
-    {
+    // The registry flags which actions carry the contract.
+    let requires_target_name = super::actions::canonical_name_for(&raw.action)
+        .and_then(super::actions::spec_for)
+        .is_some_and(|spec| spec.requires_target_name);
+    if target_name.is_none() && requires_target_name {
         return Err(
             "click, doubleClick, and type require target_name: copy the chosen id's element name exactly as listed in the observation"
                 .into(),
