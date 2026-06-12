@@ -44,6 +44,9 @@ rubato = "0.16"
 # Agent target-intent gate + text-targeted resolution: Jaro-Winkler scoring
 # for fuzzy label matching (tiny, zero transitive deps).
 strsim = "0.11"
+# Perception index (see/read/look): bundled so FTS5 is guaranteed and there
+# is no system-SQLite version skew; the only SQL storage in the app.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-global-shortcut = "~2.3"

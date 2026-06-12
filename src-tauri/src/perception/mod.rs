@@ -11,9 +11,11 @@
 pub mod ax;
 pub mod geometry;
 pub mod ids;
+pub mod index;
 
 pub use geometry::RectPt;
 pub use ids::{ElementRow, ResolvedElement};
+pub use index::{ElementQuery, SnapshotMeta};
 
 /// Namespaces the resolver understands enough to redirect: `ax:` is handled
 /// here, `dom:` (browser extension) and `vis:` (vision marks) get a typed
