@@ -45,6 +45,9 @@ pub struct WalkConfig {
     pub descend_web_areas: bool,
     pub walk_timeout: Duration,
     pub messaging_timeout_secs: f32,
+    /// Write the Electron `AXManualAccessibility` unlock before walking.
+    /// Off for known browsers — their web content is the `dom:` channel's.
+    pub unlock_electron: bool,
 }
 
 impl Default for WalkConfig {
@@ -56,6 +59,7 @@ impl Default for WalkConfig {
             descend_web_areas: false,
             walk_timeout: Duration::from_secs(2),
             messaging_timeout_secs: 0.25,
+            unlock_electron: true,
         }
     }
 }
@@ -174,13 +178,7 @@ pub fn walk_window(window: ffi::AxElementRef, config: &WalkConfig) -> WalkOutcom
         let class = classify::classify(&role, &actions);
         let actionable = classify::is_actionable(class, &actions);
 
-        let value = if secure {
-            read.value.is_some().then(|| REDACTED_VALUE.to_string())
-        } else {
-            read.value
-                .clone()
-                .map(|v| truncate_chars(&v, VALUE_TRUNCATE_CHARS))
-        };
+        let value = carried_value(read.value.as_deref(), secure);
 
         outcome.elements.push(AxElement {
             eid: String::new(),
@@ -222,13 +220,60 @@ pub fn walk_window(window: ffi::AxElementRef, config: &WalkConfig) -> WalkOutcom
 /// Messaging timeout for window acquisition only: a just-launched app's AX
 /// server can take most of a second to answer its first request.
 const WINDOW_ACQUIRE_TIMEOUT_SECS: f32 = 1.0;
+/// After a fresh Electron unlock the app builds its AX tree lazily; settle,
+/// then re-walk on a widening ladder while the tree still looks locked.
+const ELECTRON_UNLOCK_SETTLE: Duration = Duration::from_millis(150);
+const ELECTRON_UNLOCK_RETRIES: &[Duration] =
+    &[Duration::from_millis(400), Duration::from_millis(900)];
+const LOCKED_TREE_ELEMENT_COUNT: usize = 15;
+
+/// Electron apps hide their AX tree until `AXManualAccessibility` is
+/// written on the app element — the same unlock the agent's observer
+/// performs. Deliberately NOT `AXEnhancedUserInterface`: that is the
+/// VoiceOver flag, Safari/WebKit honor it by building their heavyweight
+/// a11y tree (measured 114ms → 2.3s walks), and modern Electron accepts
+/// the manual attribute alone. Once per pid per process lifetime; native
+/// apps reject the write silently. Returns whether this call unlocked.
+fn unlock_electron_ax(app: &ffi::AxElementRef, pid: i32) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static UNLOCKED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    let mut unlocked = UNLOCKED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if !unlocked.insert(pid) {
+        return false;
+    }
+    ffi::set_bool_attribute(app, "AXManualAccessibility", true)
+}
 
 /// Walk an app's focused window (or its first window when no focus).
 pub fn walk_app_focused_window(pid: i32, config: &WalkConfig) -> Option<WalkOutcome> {
     let app = ffi::app_element(pid, WINDOW_ACQUIRE_TIMEOUT_SECS)?;
+    let freshly_unlocked = config.unlock_electron && unlock_electron_ax(&app, pid);
+    if freshly_unlocked {
+        std::thread::sleep(ELECTRON_UNLOCK_SETTLE);
+    }
     let window = ffi::focused_window(&app)?;
     ffi::set_messaging_timeout(&app, config.messaging_timeout_secs);
-    Some(walk_window(window, config))
+    let mut outcome = walk_window(window, config);
+    if freshly_unlocked {
+        // The unlock takes effect asynchronously in the target app; while
+        // the walk still returns a locked skeleton, widen the wait once
+        // per rung. Later sees (C3 freshness) catch stragglers.
+        for delay in ELECTRON_UNLOCK_RETRIES {
+            if outcome.elements.len() >= LOCKED_TREE_ELEMENT_COUNT {
+                break;
+            }
+            std::thread::sleep(*delay);
+            let Some(window) = ffi::focused_window(&app) else {
+                break;
+            };
+            outcome = walk_window(window, config);
+        }
+    }
+    Some(outcome)
 }
 
 /// All windows of an app, walked under one shared element budget.
@@ -236,15 +281,23 @@ pub fn walk_app_windows(pid: i32, config: &WalkConfig) -> Vec<WalkOutcome> {
     let Some(app) = ffi::app_element(pid, WINDOW_ACQUIRE_TIMEOUT_SECS) else {
         return Vec::new();
     };
+    if config.unlock_electron && unlock_electron_ax(&app, pid) {
+        std::thread::sleep(ELECTRON_UNLOCK_SETTLE);
+    }
     ffi::set_messaging_timeout(&app, config.messaging_timeout_secs);
+    // Element budget AND wall clock are shared across all windows: a slow
+    // multi-window app costs at most one walk_timeout total, not N of them.
+    let deadline = Instant::now() + config.walk_timeout;
     let mut remaining = config.element_budget;
     let mut outcomes = Vec::new();
     for window in ffi::windows(&app) {
-        if remaining == 0 {
+        let remaining_time = deadline.saturating_duration_since(Instant::now());
+        if remaining == 0 || remaining_time.is_zero() {
             break;
         }
         let window_config = WalkConfig {
             element_budget: remaining,
+            walk_timeout: remaining_time,
             ..*config
         };
         let outcome = walk_window(window, &window_config);
@@ -311,6 +364,17 @@ fn capped_children(mut children: Vec<ffi::AxElementRef>, cap: usize) -> Vec<ffi:
     }
     kept.reverse();
     kept
+}
+
+/// What of an element's value enters the index: redacted for secure fields
+/// and everything beneath one (C6), char-safe truncated otherwise. The raw
+/// value of a secure field never leaves this function.
+fn carried_value(raw: Option<&str>, secure: bool) -> Option<String> {
+    match (raw, secure) {
+        (Some(_), true) => Some(REDACTED_VALUE.to_string()),
+        (Some(value), false) => Some(truncate_chars(value, VALUE_TRUNCATE_CHARS)),
+        (None, _) => None,
+    }
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -412,5 +476,25 @@ mod tests {
     fn number_formatting() {
         assert_eq!(format_number(3.0), "3");
         assert_eq!(format_number(0.5), "0.5");
+    }
+
+    #[test]
+    fn secure_values_redact_and_normal_values_truncate() {
+        // The raw secret never survives, regardless of length or content.
+        assert_eq!(
+            carried_value(Some("hunter2"), true).as_deref(),
+            Some(REDACTED_VALUE)
+        );
+        // Secure inheritance is the caller's flag; a value-less secure field
+        // stays value-less (no phantom redaction marker).
+        assert_eq!(carried_value(None, true), None);
+        assert_eq!(
+            carried_value(Some("plain"), false).as_deref(),
+            Some("plain")
+        );
+        let long = "x".repeat(400);
+        let kept = carried_value(Some(&long), false).unwrap();
+        assert_eq!(kept.chars().count(), VALUE_TRUNCATE_CHARS + 1);
+        assert!(kept.ends_with('…'));
     }
 }

@@ -91,15 +91,16 @@ impl Store {
             .map_err(|err| PerceptionError::Index(format!("open index db: {err}")))?;
         super::schema::migrate(&conn)
             .map_err(|err| PerceptionError::Index(format!("migrate index db: {err}")))?;
-        let startup_purge = purge(&conn, now_ms());
+        let startup_purge = purge(&conn, now_ms(), &frames_dir);
         if let Err(err) = startup_purge {
             eprintln!("[screenie] perception index startup purge failed: {err}");
         }
 
         let (sender, receiver) = mpsc::channel::<Job>();
+        let writer_frames_dir = frames_dir.clone();
         std::thread::Builder::new()
             .name("screenie-perception-store".into())
-            .spawn(move || writer_loop(conn, receiver))
+            .spawn(move || writer_loop(conn, receiver, writer_frames_dir))
             .map_err(|err| PerceptionError::Index(format!("spawn store writer: {err}")))?;
 
         Ok(Self {
@@ -166,12 +167,12 @@ impl Store {
     }
 }
 
-fn writer_loop(mut conn: Connection, receiver: mpsc::Receiver<Job>) {
+fn writer_loop(mut conn: Connection, receiver: mpsc::Receiver<Job>, frames_dir: PathBuf) {
     while let Ok(job) = receiver.recv() {
         match job {
             Job::Ingest { meta, rows, ack } => {
                 let result = ingest_txn(&mut conn, &meta, &rows)
-                    .and_then(|_| retain_window(&conn, &meta))
+                    .and_then(|_| retain_window(&conn, &meta, &frames_dir))
                     .map_err(|err| err.to_string());
                 let _ = ack.send(result);
             }
@@ -289,7 +290,11 @@ fn ingest_txn(
 
 /// Keep only the newest [`RETAIN_PER_WINDOW`] snapshots of this snapshot's
 /// window, deleting evicted rows' PNGs and FTS entries.
-fn retain_window(conn: &Connection, meta: &SnapshotMeta) -> rusqlite::Result<()> {
+fn retain_window(
+    conn: &Connection,
+    meta: &SnapshotMeta,
+    frames_dir: &Path,
+) -> rusqlite::Result<()> {
     let evicted: Vec<(String, Option<String>, Option<String>)> = {
         let mut stmt = conn.prepare_cached(
             "SELECT id, raw_png, marked_png FROM snapshots
@@ -306,11 +311,11 @@ fn retain_window(conn: &Connection, meta: &SnapshotMeta) -> rusqlite::Result<()>
             .collect::<rusqlite::Result<_>>()?;
         collected
     };
-    delete_snapshots(conn, &evicted)
+    delete_snapshots(conn, &evicted, frames_dir)
 }
 
 /// Startup retention: hard 24h expiry.
-fn purge(conn: &Connection, now_ms: i64) -> rusqlite::Result<()> {
+fn purge(conn: &Connection, now_ms: i64, frames_dir: &Path) -> rusqlite::Result<()> {
     let cutoff = now_ms - RETAIN_MAX_AGE_MS;
     let expired: Vec<(String, Option<String>, Option<String>)> = {
         let mut stmt =
@@ -322,12 +327,13 @@ fn purge(conn: &Connection, now_ms: i64) -> rusqlite::Result<()> {
             .collect::<rusqlite::Result<_>>()?;
         collected
     };
-    delete_snapshots(conn, &expired)
+    delete_snapshots(conn, &expired, frames_dir)
 }
 
 fn delete_snapshots(
     conn: &Connection,
     snapshots: &[(String, Option<String>, Option<String>)],
+    frames_dir: &Path,
 ) -> rusqlite::Result<()> {
     for (id, raw_png, marked_png) in snapshots {
         // CASCADE removes elements; FTS has no FK support, delete explicitly.
@@ -337,8 +343,13 @@ fn delete_snapshots(
         )?;
         conn.execute("DELETE FROM snapshots WHERE id = ?1", params![id])?;
         for png in [raw_png, marked_png].into_iter().flatten() {
-            // PNGs live with their rows (C6 retention); missing files are fine.
-            let _ = std::fs::remove_file(png);
+            // PNGs live with their rows (C6 retention); missing files are
+            // fine. Containment guard: only paths under the frames dir are
+            // ever deleted, so a corrupted/foreign row can't aim retention
+            // at arbitrary files.
+            if Path::new(png).starts_with(frames_dir) {
+                let _ = std::fs::remove_file(png);
+            }
         }
     }
     Ok(())

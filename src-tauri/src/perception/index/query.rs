@@ -189,7 +189,7 @@ impl Reader {
             where_sql.push_str(
                 " AND eid IN (SELECT eid FROM elements_fts WHERE elements_fts MATCH ? AND snapshot_id = ?)",
             );
-            args.push(Box::new(text.clone()));
+            args.push(Box::new(fts_literal_query(text)));
             args.push(Box::new(snapshot_id.to_string()));
         }
 
@@ -282,20 +282,10 @@ impl Reader {
     }
 
     /// Every element row of a snapshot in tree order — the annotation
-    /// renderer's input (internal; not limit-clamped like `query`).
+    /// renderer's input (internal; bounded by the walker's element budget,
+    /// not the structured-read limit). Always `ORDER BY rowid` so the
+    /// fallback matches the registry's in-memory row order exactly.
     pub fn all_rows(&self, snapshot_id: &str) -> Result<Vec<ElementRow>, PerceptionError> {
-        let result = self.query(
-            snapshot_id,
-            &ElementQuery {
-                limit: MAX_READ_LIMIT,
-                ..ElementQuery::default()
-            },
-        )?;
-        if result.total <= u64::from(MAX_READ_LIMIT) {
-            return Ok(result.rows);
-        }
-        // Above the structured cap: pull the full set directly (bounded by
-        // the walker's own element budget).
         let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let mut stmt = conn
             .prepare_cached(
@@ -395,6 +385,17 @@ impl Reader {
         }
         result
     }
+}
+
+/// FTS5 treats bare punctuation as query syntax, so ordinary agent text
+/// like `sign-in (beta)` would abort the read. Each whitespace token is
+/// wrapped as a quoted literal (inner quotes doubled), making `text` a
+/// plain AND-of-terms match. Power syntax belongs to `read_sql`.
+fn fts_literal_query(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn open_read_only(db_path: &Path) -> Result<Connection, PerceptionError> {
@@ -562,6 +563,41 @@ mod tests {
             actionable.rows[0].frame,
             RectPt::new(10.0, 20.0, 30.0, 40.0)
         );
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn text_filter_treats_punctuation_as_literal() {
+        let (base, _store, reader) = seeded();
+        // FTS5 would abort on bare hyphens/parens/quotes as query syntax;
+        // the literal-token quoting must keep these as plain reads.
+        for text in [
+            "sign-in (beta)",
+            "github.com/",
+            "say \"hi\"",
+            "*lead",
+            "value : x",
+        ] {
+            let result = reader.query(
+                "ax:querysnap",
+                &ElementQuery {
+                    text: Some(text.into()),
+                    ..ElementQuery::default()
+                },
+            );
+            assert!(result.is_ok(), "text {text:?} errored: {result:?}");
+        }
+        // And matching still works through the quoting.
+        let hit = reader
+            .query(
+                "ax:querysnap",
+                &ElementQuery {
+                    text: Some("github".into()),
+                    ..ElementQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hit.total, 1);
         std::fs::remove_dir_all(base).ok();
     }
 

@@ -61,6 +61,13 @@ extern "C" {
     fn AXIsProcessTrusted() -> Boolean;
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> Boolean;
     fn AXUIElementCreateApplication(pid: Pid) -> AXUIElementRef;
+    fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    fn AXUIElementCopyElementAtPosition(
+        application: AXUIElementRef,
+        x: f32,
+        y: f32,
+        element: *mut AXUIElementRef,
+    ) -> i32;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
@@ -73,6 +80,11 @@ extern "C" {
         values: *mut CFArrayRef,
     ) -> i32;
     fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> i32;
+    fn AXUIElementSetAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        value: CFTypeRef,
+    ) -> i32;
     fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_seconds: f32) -> i32;
     fn AXValueGetType(value: AXValueRef) -> i32;
     fn AXValueGetTypeID() -> CFTypeID;
@@ -414,6 +426,42 @@ pub fn role_of(element: &AxElementRef) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Set a boolean AX attribute (the Electron `AXManualAccessibility` /
+/// `AXEnhancedUserInterface` unlock). Returns whether the app accepted it.
+pub fn set_bool_attribute(element: &AxElementRef, attribute: &str, value: bool) -> bool {
+    use core_foundation::boolean::CFBoolean;
+    let name = CFString::new(attribute);
+    let flag = if value {
+        CFBoolean::true_value()
+    } else {
+        CFBoolean::false_value()
+    };
+    let err = unsafe {
+        AXUIElementSetAttributeValue(
+            element.raw(),
+            name.as_concrete_TypeRef(),
+            flag.as_CFTypeRef(),
+        )
+    };
+    if std::env::var_os("SCREENIE_PERCEPTION_DEBUG").is_some() {
+        eprintln!("[screenie] perception set {attribute}={value} -> {err}");
+    }
+    err == AX_ERROR_SUCCESS
+}
+
+/// System-wide AX hit test: the deepest element under a global point. Used
+/// by the hit-test harness to validate that an indexed frame's center still
+/// lands on the element it came from.
+pub fn hit_test(x: f64, y: f64) -> Option<AxElementRef> {
+    let system = Cf::owned(unsafe { AXUIElementCreateSystemWide() })?;
+    let mut out: AXUIElementRef = std::ptr::null();
+    let err = unsafe { AXUIElementCopyElementAtPosition(system.0, x as f32, y as f32, &mut out) };
+    if err != AX_ERROR_SUCCESS {
+        return None;
+    }
+    Cf::owned(out).map(AxElementRef::from_cf)
 }
 
 /// CGWindowID of an AX window element via the private `_AXUIElementGetWindow`.

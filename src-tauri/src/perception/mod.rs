@@ -34,10 +34,39 @@ use serde::{Deserialize, Serialize, Serializer};
 pub enum SeeScope {
     #[default]
     FrontmostWindow,
-    /// One app by pid (bundle ids resolve to pids at the command layer).
-    App { pid: i32 },
+    /// One app by pid. `bundle` (when known) drives the browser check that
+    /// decides whether web areas are boundaries or walked content.
+    App {
+        pid: i32,
+        #[serde(default)]
+        bundle: Option<String>,
+    },
     /// All on-screen windows, element budget shared across them.
     Screen,
+}
+
+/// Browsers whose web content the `dom:` namespace (browser extension path)
+/// owns — their AXWebAreas are recorded as boundaries. Everything else
+/// (Electron and friends) gets its web areas walked: no DOM channel can
+/// exist for them.
+pub const BROWSER_BUNDLES: &[&str] = &[
+    "com.apple.Safari",
+    "com.google.Chrome",
+    "org.mozilla.firefox",
+    "com.microsoft.edgemac",
+    "company.thebrowser.Browser",
+    "com.brave.Browser",
+    "com.operasoftware.Opera",
+    "com.vivaldi.Vivaldi",
+];
+
+/// `None` (unknown bundle) is treated as not-a-browser: descending a web
+/// area needlessly costs budget; treating a browser's page as unreachable
+/// costs the task.
+pub fn is_known_browser(bundle: Option<&str>) -> bool {
+    bundle
+        .map(|bundle| BROWSER_BUNDLES.iter().any(|known| known == &bundle))
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

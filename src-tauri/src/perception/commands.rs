@@ -109,7 +109,7 @@ pub fn see_impl(base_dir: &Path, opts: &SeeOptions) -> Result<SeeResult, Percept
 
     let frontmost = crate::agent::frontmost_application_info().ok().flatten();
     let (pid, app_bundle, app_name) = match &opts.scope {
-        SeeScope::App { pid } => (*pid, None, None),
+        SeeScope::App { pid, bundle } => (*pid, bundle.clone(), None),
         SeeScope::FrontmostWindow | SeeScope::Screen => {
             let app = frontmost.ok_or(PerceptionError::NoTarget)?;
             let pid = app.pid.ok_or(PerceptionError::NoTarget)?;
@@ -117,12 +117,24 @@ pub fn see_impl(base_dir: &Path, opts: &SeeOptions) -> Result<SeeResult, Percept
         }
     };
 
+    // Browsers keep web areas as dom:-owned boundaries and never get the
+    // Electron unlock write; for everything else (Electron apps) the web
+    // area IS the app — walk it.
+    let is_browser = crate::perception::is_known_browser(app_bundle.as_deref());
     let config = walker::WalkConfig {
         element_budget: opts.element_budget.clamp(50, 5000),
         max_depth: opts.max_depth.clamp(2, 60),
-        descend_web_areas: opts.descend_web_areas,
+        descend_web_areas: opts.descend_web_areas || !is_browser,
+        unlock_electron: !is_browser,
         ..walker::WalkConfig::default()
     };
+    // The change counter is read BEFORE the walk on purpose (C3): a change
+    // landing mid-walk bumps the live counter past this stamped value, so
+    // the next read re-sees. Reading it after the walk would stamp the
+    // during-walk change as already-seen and the half-stale snapshot would
+    // read as fresh forever.
+    let change_counter = crate::agent::perception_change_counter();
+
     // Screen scope walks every window of the frontmost app under the shared
     // budget (each as its own snapshot) and reports on the focused one;
     // walking every app on screen is deferred to the multi-app milestone.
@@ -139,8 +151,6 @@ pub fn see_impl(base_dir: &Path, opts: &SeeOptions) -> Result<SeeResult, Percept
             "no walkable AX window for pid {pid}"
         )));
     }
-
-    let change_counter = crate::agent::perception_change_counter();
     let mut primary: Option<SeeResult> = None;
     for outcome in outcomes {
         let rows = ids::assign_rows(&outcome);
@@ -182,7 +192,10 @@ pub fn see_impl(base_dir: &Path, opts: &SeeOptions) -> Result<SeeResult, Percept
             .collect();
         let header = SnapHeader {
             snapshot_id: snapshot_id.clone(),
-            app: app_bundle.clone().or_else(|| app_name.clone()),
+            // Bundle id only: app= is an unquoted token in the grammar and
+            // localized app names can contain spaces; read's header uses the
+            // same source so see and read stay consistent.
+            app: app_bundle.clone(),
             window_title: outcome.window_title.clone(),
             frame: outcome.window_frame,
             scale: 1.0,
@@ -244,7 +257,24 @@ fn ensure_fresh_snapshot(
                 return Ok((snapshot_id.to_string(), false));
             }
             // The window's latest, but dirty / changed since the walk:
-            // transparently re-see.
+            // transparently re-see — and re-see the window the id REFERS
+            // TO, not whatever is frontmost now (the user may have switched
+            // apps between the agent's see and this read). The bundle rides
+            // along so the browser/web-boundary decision stays correct.
+            let index = index::init(base_dir)?;
+            if let Some(header) = index.reader.snapshot_header(snapshot_id)? {
+                if let Some(header_pid) = header.app_pid {
+                    let pinned = SeeOptions {
+                        scope: crate::perception::SeeScope::App {
+                            pid: header_pid,
+                            bundle: header.app_bundle,
+                        },
+                        ..opts.clone()
+                    };
+                    let seen = see_impl(base_dir, &pinned)?;
+                    return Ok((seen.snapshot_id, true));
+                }
+            }
         } else {
             // Not in the hot registry: serve from the index if it exists
             // (historical read), else it's unknown.

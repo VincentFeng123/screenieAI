@@ -21,6 +21,8 @@ fn main() {
     let mut app_name: Option<String> = None;
     let mut budget: usize = 1500;
     let mut do_look = false;
+    let mut do_hit_test = false;
+    let mut do_unset_enhanced = false;
     let mut sql: Option<String> = None;
     let mut index_arg = 0;
     while index_arg < args.len() {
@@ -41,6 +43,11 @@ fn main() {
                     .unwrap_or(1500);
             }
             "--look" => do_look = true,
+            "--hit-test" => do_hit_test = true,
+            // Maintenance: clear a stray AXEnhancedUserInterface=true (the
+            // VoiceOver flag) left on an app — it makes WebKit walks ~20x
+            // slower while set.
+            "--unset-enhanced-ui" => do_unset_enhanced = true,
             "--sql" => {
                 index_arg += 1;
                 sql = args.get(index_arg).cloned();
@@ -70,9 +77,42 @@ fn main() {
         std::process::exit(2);
     };
 
+    // Bundle id from the binary path (…/Name.app/Contents/MacOS/bin) so the
+    // browser/web-boundary decision matches the in-app frontmost path.
+    let bundle = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()
+        .and_then(|output| {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let app_root = path.split(".app/").next().map(|p| format!("{p}.app"))?;
+            let plist = format!("{app_root}/Contents/Info");
+            let value = Command::new("defaults")
+                .args(["read", &plist, "CFBundleIdentifier"])
+                .output()
+                .ok()?;
+            let bundle = String::from_utf8_lossy(&value.stdout).trim().to_string();
+            (!bundle.is_empty()).then_some(bundle)
+        });
+    if let Some(bundle) = &bundle {
+        println!("(bundle: {bundle})");
+    }
+
+    if do_unset_enhanced {
+        use screenieai_lib::perception::ax::ffi;
+        match ffi::app_element(pid, 1.0) {
+            Some(app) => {
+                let cleared = ffi::set_bool_attribute(&app, "AXEnhancedUserInterface", false);
+                println!("AXEnhancedUserInterface=false on pid {pid}: {cleared}");
+            }
+            None => eprintln!("no app element for pid {pid}"),
+        }
+        return;
+    }
+
     let base = std::env::temp_dir().join("screenie-see-probe");
     let opts = SeeOptions {
-        scope: SeeScope::App { pid },
+        scope: SeeScope::App { pid, bundle },
         element_budget: budget,
         ..SeeOptions::default()
     };
@@ -178,6 +218,71 @@ fn main() {
             }
             Err(err) => println!("\nlook failed: {err}"),
         }
+    }
+
+    // --- hit-test harness -------------------------------------------------------
+    // Resolves sampled actionable elements through the same resolve() path
+    // the executor uses, then AX hit-tests each click point and checks the
+    // hit element's frame still contains it. Read-only: nothing is pressed
+    // (press-vs-click agreement needs supervised manual QA — it mutates the
+    // target app).
+    if do_hit_test {
+        use screenieai_lib::perception::ax::ffi;
+        use screenieai_lib::perception::ids;
+
+        let read = read_impl(
+            &base,
+            &ElementQuery {
+                snapshot_id: Some(seen.snapshot_id.clone()),
+                actionable_only: true,
+                limit: 200,
+                ..ElementQuery::default()
+            },
+        )
+        .expect("hit-test read");
+        let eids: Vec<String> = read
+            .text
+            .lines()
+            .skip(1)
+            .filter(|line| line.starts_with("ax:"))
+            .filter_map(|line| line.split_whitespace().next().map(|eid| eid.to_string()))
+            .take(20)
+            .collect();
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for eid in &eids {
+            let Ok(resolved) = ids::resolve(eid, &seen.snapshot_id, true) else {
+                continue;
+            };
+            total += 1;
+            let (cx, cy) = resolved.click_point;
+            let contained = ffi::hit_test(cx, cy)
+                .and_then(|hit| {
+                    let attrs = ffi::copy_attributes(&hit, &["AXPosition", "AXSize"], 0).ok()?;
+                    let mut position = None;
+                    let mut size = None;
+                    for (index, attr) in attrs.into_iter().enumerate() {
+                        match (index, attr) {
+                            (0, ffi::AttrValue::Point(x, y)) => position = Some((x, y)),
+                            (1, ffi::AttrValue::Size(w, h)) => size = Some((w, h)),
+                            _ => {}
+                        }
+                    }
+                    let (x, y) = position?;
+                    let (w, h) = size?;
+                    Some(cx >= x && cx < x + w && cy >= y && cy < y + h)
+                })
+                .unwrap_or(false);
+            if contained {
+                hits += 1;
+            } else {
+                println!("  miss: {eid} center=({cx:.0},{cy:.0})");
+            }
+        }
+        println!(
+            "\n=== hit-test ({}/{} centers land on a hit element containing them) ===",
+            hits, total
+        );
     }
 
     // --- perf gates -----------------------------------------------------------
