@@ -10,6 +10,7 @@ mod observer;
 #[cfg(target_os = "macos")]
 mod page_reader;
 mod planner;
+mod playbooks;
 #[cfg(target_os = "macos")]
 mod safari_dom;
 mod search;

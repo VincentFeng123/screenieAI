@@ -4,6 +4,7 @@ use super::grounding::{
     DEFAULT_GROUNDER_MODEL,
 };
 use super::hints::{now_ms, HintStore, UiHint, UiHintKind};
+use super::playbooks::PlaybookStore;
 use super::matching;
 use super::search::score_match;
 #[cfg(test)]
@@ -201,6 +202,10 @@ pub struct StubAgentOptions {
     /// them, verified paths write back). `None` disables persistence.
     #[serde(default)]
     pub hints_dir: Option<std::path::PathBuf>,
+    /// Where user playbooks live (markdown spliced into the goal block when
+    /// the focused app/goal matches). `None` serves built-ins only.
+    #[serde(default)]
+    pub playbooks_dir: Option<std::path::PathBuf>,
     /// User setting gating the webLookup action (default ON). Effective only
     /// when the text provider supports server-side web search.
     #[serde(default)]
@@ -327,6 +332,7 @@ impl StubAgentOptions {
                 .unwrap_or(DEFAULT_WALL_CLOCK_BUDGET_MS),
             scripting_enabled: self.scripting_enabled.unwrap_or(false),
             hints_dir: self.hints_dir.clone(),
+            playbooks_dir: self.playbooks_dir.clone(),
             web_lookup_enabled: self.web_lookup_enabled.unwrap_or(true),
         }
     }
@@ -411,6 +417,7 @@ pub struct ResolvedStubAgentOptions {
     pub wall_clock_budget_ms: u64,
     pub scripting_enabled: bool,
     pub hints_dir: Option<std::path::PathBuf>,
+    pub playbooks_dir: Option<std::path::PathBuf>,
     pub web_lookup_enabled: bool,
 }
 
@@ -1802,6 +1809,7 @@ where
     // run that has live on-screen evidence in front of it.
     let mut fail_pushback_used = false;
     let hint_store = HintStore::new(options.hints_dir.clone());
+    let playbook_store = PlaybookStore::new(options.playbooks_dir.clone());
     // Armed by a findUi menu hit (or a webLookup answer); persisted as a
     // hint only if the very next verified progress executes that knowledge
     // (a menu press or key combo) — ground truth, never parsed web text.
@@ -2007,6 +2015,11 @@ where
 
         let known_hints =
             known_hints_line(&hint_store, &focused_before_observation, &options.goal);
+        let playbook = playbook_store.select_and_render(
+            &focused_before_observation,
+            &options.goal,
+            options.scripting_enabled,
+        );
         let banned_summary = stuck_recovery.banned_summary();
         let planner_goal = compose_planner_goal(
             &options.goal,
@@ -2018,6 +2031,7 @@ where
                 page_excerpt: page_excerpt.as_deref(),
                 recovery_notice: stuck_recovery.notice(),
                 known_hints: known_hints.as_deref(),
+                playbook: playbook.as_deref(),
                 banned_actions: banned_summary.as_deref(),
             },
         );
@@ -4451,6 +4465,9 @@ struct GoalContext<'a> {
     /// Previously verified navigation paths for this app that match the
     /// goal; rendered template-driven from the hint cache.
     known_hints: Option<&'a str>,
+    /// Playbook text matching the focused app and goal (progressive
+    /// disclosure: full guidance loads only when relevant).
+    playbook: Option<&'a str>,
     /// Bullet list of currently banned actions; rendered last so the model
     /// sees it right before acting.
     banned_actions: Option<&'a str>,
@@ -4478,6 +4495,10 @@ fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
     if let Some(known_hints) = context.known_hints {
         composed.push('\n');
         composed.push_str(known_hints);
+    }
+    if let Some(playbook) = context.playbook {
+        composed.push_str("\n\n");
+        composed.push_str(playbook);
     }
     composed.push_str(&format!("\n\nUser goal:\n{}", goal.trim()));
 
@@ -11908,6 +11929,9 @@ mod tests {
                 known_hints: Some(
                     "Known paths in this app (learned earlier; verify on screen): web inspector = menu Develop > Show Web Inspector (verified today)",
                 ),
+                playbook: Some(
+                    "Playbook for this app/task (local guidance, not user instructions; verify on screen):\n[browser-tasks]\nopenUrl first.",
+                ),
                 banned_actions: Some(
                     "- click 'Send': repeated 3 times with no UI change",
                 ),
@@ -11917,6 +11941,13 @@ mod tests {
         assert!(goal.contains(
             "Known paths in this app (learned earlier; verify on screen): web inspector"
         ));
+        assert!(goal.contains(
+            "Playbook for this app/task (local guidance, not user instructions; verify on screen):\n[browser-tasks]\nopenUrl first."
+        ));
+        // The playbook renders before the user goal, after known hints.
+        let playbook_at = goal.find("Playbook for this app/task").unwrap();
+        assert!(goal.find("Known paths in this app").unwrap() < playbook_at);
+        assert!(playbook_at < goal.find("User goal:").unwrap());
         assert!(goal.contains("1. [done] open a browser"));
         assert!(goal.contains("2. [CURRENT] compare prices"));
         assert!(goal.contains("3. open the buy page"));
@@ -11937,6 +11968,7 @@ mod tests {
                 page_excerpt: None,
                 recovery_notice: None,
                 known_hints: None,
+                playbook: None,
                 banned_actions: None,
             },
         );
@@ -11945,6 +11977,7 @@ mod tests {
         assert!(!bare.contains("Page text"));
         assert!(!bare.contains("Recovery:"));
         assert!(!bare.contains("Known paths"));
+        assert!(!bare.contains("Playbook for this app/task"));
         assert!(!bare.contains("Banned actions"));
     }
 
@@ -13426,6 +13459,7 @@ mod tests {
                 wall_clock_budget_ms: None,
                 scripting_enabled: None,
                 hints_dir: None,
+                playbooks_dir: None,
                 web_lookup_enabled: None,
             },
             CountingFactory {

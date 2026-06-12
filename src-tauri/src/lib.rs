@@ -1476,6 +1476,10 @@ fn prepare_stub_agent_run(
     options.hints_dir = app_data_dir(app)
         .ok()
         .map(|dir| dir.join("agent").join("hints"));
+    // User playbooks (built-ins always available); same degradation rule.
+    options.playbooks_dir = app_data_dir(app)
+        .ok()
+        .map(|dir| dir.join("agent").join("playbooks"));
     let state = app.state::<AppState>();
     state.agent_abort.reset();
     let _ = drain_pending_agent_confirmations(&state);
