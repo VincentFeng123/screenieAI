@@ -14,6 +14,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AlertTriangle,
   ArrowUp,
+  Bookmark,
   Bot,
   Camera,
   MessageCircle,
@@ -180,6 +181,17 @@ type AgentSavedClip = {
   format: string;
   durationMs: number;
   bytes?: number;
+};
+
+// Mirrors agent::MemoryEntry (camelCase serde).
+type AgentSavedMemory = {
+  id: string;
+  goalSummary: string;
+  appKey?: string | null;
+  remember: string;
+  outcome: string;
+  steps: number;
+  createdAtMs: number;
 };
 
 function clipFileName(path: string): string {
@@ -499,6 +511,9 @@ export default function QuickTooltip() {
   const [agentStatus, setAgentStatus] = useState<AgentStepUpdate | null>(null);
   const [recordingActive, setRecordingActive] = useState(false);
   const [savedClip, setSavedClip] = useState<AgentSavedClip | null>(null);
+  const [savedMemory, setSavedMemory] = useState<AgentSavedMemory | null>(
+    null,
+  );
   const [confirmation, setConfirmation] =
     useState<AgentConfirmationRequest | null>(null);
   const [question, setQuestion] = useState<AgentQuestionRequest | null>(null);
@@ -552,7 +567,7 @@ export default function QuickTooltip() {
     [modelOptions, providerInfo.model],
   );
   const hasStatus = Boolean(
-    error || confirmation || question || agentRunning || savedClip,
+    error || confirmation || question || agentRunning || savedClip || savedMemory,
   );
   const chatVisible = expanded && !hasStatus;
   const voiceMicState: VoiceMicState = voice.micDenied
@@ -768,6 +783,30 @@ export default function QuickTooltip() {
       })
       .catch((e) => {
         console.error("agent clip listener failed:", e);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    getCurrentWindow()
+      .listen<AgentSavedMemory>("agent-memory-saved", (event) => {
+        if (cancelled || !event.payload?.id) return;
+        setSavedMemory(event.payload);
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      })
+      .catch((e) => {
+        console.error("agent memory listener failed:", e);
       });
     return () => {
       cancelled = true;
@@ -1214,8 +1253,9 @@ export default function QuickTooltip() {
     setAgentRunning(true);
     setAgentStatus(null);
     setError(null);
-    // A new run replaces the previous run's saved-clip card.
+    // A new run replaces the previous run's saved-clip and memory cards.
     setSavedClip(null);
+    setSavedMemory(null);
     try {
       await invoke("start_agent_task", {
         goal,
@@ -1650,6 +1690,43 @@ export default function QuickTooltip() {
                   }}
                 >
                   Reveal in Finder
+                </button>
+              </div>
+            </div>
+          ) : savedMemory ? (
+            <div className="quick-tooltip-clip">
+              <div className="quick-tooltip-status-heading">
+                <Bookmark size={14} strokeWidth={1.9} aria-hidden />
+                <span>Saved to memory</span>
+                <button
+                  type="button"
+                  className="quick-tooltip-status-close"
+                  onClick={() => setSavedMemory(null)}
+                  aria-label="Dismiss saved memory"
+                  title="Dismiss"
+                >
+                  <X size={13} strokeWidth={2} aria-hidden />
+                </button>
+              </div>
+              <div className="quick-tooltip-clip-row">
+                <span
+                  className="quick-tooltip-clip-name"
+                  title={savedMemory.remember}
+                >
+                  {savedMemory.remember}
+                </span>
+                <button
+                  type="button"
+                  className="quick-tooltip-confirm-btn"
+                  onClick={() => {
+                    const id = savedMemory.id;
+                    setSavedMemory(null);
+                    invoke("delete_agent_memory", { id }).catch((e) => {
+                      console.error("delete_agent_memory failed:", e);
+                    });
+                  }}
+                >
+                  Forget
                 </button>
               </div>
             </div>

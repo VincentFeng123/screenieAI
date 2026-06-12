@@ -1046,6 +1046,14 @@ impl agent::ConfirmationRequester for TauriConfirmationRequester {
         }
     }
 
+    fn notify_memory_saved(&self, entry: &agent::MemoryEntry) {
+        // Audit card: every cross-run memory write surfaces in the tooltip
+        // with a Forget path; never blocks the run finishing.
+        if let Err(err) = self.window.emit("agent-memory-saved", entry.clone()) {
+            eprintln!("[screenie] emit agent memory saved failed: {err}");
+        }
+    }
+
     async fn request_confirmation(
         &self,
         request: agent::AgentConfirmationRequest,
@@ -3958,6 +3966,42 @@ fn set_playbook_enabled(
     playbook_store(&app)?.set_enabled(&name, enabled)
 }
 
+fn memory_store(app: &AppHandle) -> Result<agent::MemoryStore, String> {
+    Ok(agent::MemoryStore::new(Some(
+        app_data_dir(app)?.join("agent").join("memory"),
+    )))
+}
+
+#[tauri::command]
+fn list_agent_memory(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<Vec<agent::MemoryEntry>, String> {
+    require_window(&window, "main")?;
+    Ok(memory_store(&app)?.list())
+}
+
+#[tauri::command]
+fn delete_agent_memory(app: AppHandle, window: WebviewWindow, id: String) -> Result<(), String> {
+    // The audit card's Forget button lives in the quick tooltip; the
+    // settings list lives in main.
+    if window.label() != "main" && window.label() != "quick_tooltip" {
+        return Err("command not allowed from this window".into());
+    }
+    if memory_store(&app)?.delete(&id) {
+        Ok(())
+    } else {
+        Err(format!("no memory entry '{id}'"))
+    }
+}
+
+#[tauri::command]
+fn clear_agent_memory(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    require_window(&window, "main")?;
+    memory_store(&app)?.clear();
+    Ok(())
+}
+
 /// Frontend has finished a capture cycle and wants to remember the rect for
 /// the "repeat last" hotkey. Stored on the frontend in localStorage; this
 /// function only handles the Rust-side flag that says "the next capture
@@ -4623,6 +4667,9 @@ pub fn run() {
         write_playbook,
         delete_playbook,
         set_playbook_enabled,
+        list_agent_memory,
+        delete_agent_memory,
+        clear_agent_memory,
         crop_capture,
         refresh_overlay_backdrop_capture,
         refresh_overlay_capture,

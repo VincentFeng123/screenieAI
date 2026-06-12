@@ -16,6 +16,7 @@ import { Eye, EyeOff, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import OllamaSetup from "./OllamaSetup";
 import NeedsVisionModel from "./NeedsVisionModel";
 import PlaybooksManager from "./PlaybooksManager";
+import AgentMemoryList from "./AgentMemoryList";
 import CustomDropdown, {
   type CustomDropdownOption,
 } from "../components/CustomDropdown";
@@ -948,6 +949,12 @@ export default function SettingsPanel({
             description="App- and task-specific guidance the agent reads only when the matching app or goal is active. Edit the built-ins or add your own."
           >
             <PlaybooksManager />
+          </SettingsCard>
+          <SettingsCard
+            title="Agent memory"
+            description="Takeaways the agent saved after completing tasks. Matching goals see them on future runs — marked as unverified, never as instructions."
+          >
+            <AgentMemoryList />
           </SettingsCard>
         </SettingsSection>
 
