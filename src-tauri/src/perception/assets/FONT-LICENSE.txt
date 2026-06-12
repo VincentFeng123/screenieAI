@@ -1,0 +1,4 @@
+chip-font.ttf is KaTeX_SansSerif-Bold from the KaTeX project (https://katex.org),
+licensed under the SIL Open Font License 1.1 (https://scripts.sil.org/OFL).
+Embedded for set-of-marks label chips so annotation never depends on system
+font lookup. Only ASCII alphanumerics, ":" and "." are required of it.

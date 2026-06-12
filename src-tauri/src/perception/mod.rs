@@ -8,6 +8,7 @@
 //! through [`ids`]'s resolver, which rejects stale or wrong-namespace refs
 //! with typed errors.
 
+pub mod annotate;
 pub mod ax;
 pub mod geometry;
 pub mod ids;
