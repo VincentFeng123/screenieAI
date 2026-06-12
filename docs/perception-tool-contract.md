@@ -1,12 +1,38 @@
 # Perception layer — tool contract for the agent operating prompt
 
-This is the insert the build spec's appendix calls for: once the operating
-prompt (the "brain") exists, replace its tool-contract placeholders with the
-blocks below. The backend half is implemented in `src-tauri/src/perception/`
-and exposed as the Tauri commands `perception_see`, `perception_read`,
-`perception_read_sql`, `perception_look`, `perception_resolve` (and as the
-in-process API `perception::commands::{see_impl, read_impl, look_impl}` +
+This was the insert the build spec's appendix called for; the operating
+prompt now exists and carries this contract. The backend half is implemented
+in `src-tauri/src/perception/` and exposed as the Tauri commands
+`perception_see`, `perception_read`, `perception_read_sql`, `perception_look`,
+`perception_resolve` (and as the in-process API
+`perception::commands::{see_impl, read_impl, look_impl}` +
 `perception::ids::resolve` for the agent loop).
+
+## Agent-loop wiring (shipped)
+
+- `read` and `look` are registry actions (`agent/actions.rs`, appended after
+  `fail` — the schema enum order is byte-pinned). The prose rules live in
+  `build_system_prompt` (`agent/planner.rs`); the blocks below remain the
+  reference text.
+- Model-facing fields: `read(text?, roles?, actionable_only?, limit?, snap?)`
+  and `look(snap?)`. `region`/`focused_only` are deliberately NOT exposed to
+  the model (raw coordinates are rejected by the action contract; both stay
+  available on the `perception_read` command). `read_sql` stays a
+  command-only power tool, never a model action.
+- Acting on an element: `click`/`doubleClick`/`type` accept `eid` (+
+  optional `snap`, defaulting to the latest read's snapshot) as an
+  alternative to the observation `id`; `target_name` is still required. The
+  executor resolves through `resolve_perception_target` and rewrites to the
+  id form, so every existing gate (safety, confirmation, intent, preflight)
+  applies unchanged.
+- The loop perceives through the `PerceptionTools` seam
+  (`agent/perception_tools.rs`); `read`'s SNAP block is rendered into the
+  planner's goal context under "Element index", `look`'s marked PNG rides
+  the captureFrame attachment path.
+- `StaleSnapshot` on an eid action triggers a transparent re-read; the
+  element is re-acquired in the fresh snapshot by fingerprint when exactly
+  one row matches, otherwise the fresh block replaces the goal context and
+  the planner re-picks with current ids.
 
 ```
 ### read — structured perception (default sense)

@@ -1740,6 +1740,8 @@ async fn run_prepared_stub_agent(
         window: window.clone(),
         session: std::cell::RefCell::new(None),
     };
+    // Same base dir as the perception_* commands: <app_data>/perception/.
+    let perception_tools = agent::IndexPerceptionTools::new(app_data_dir(&app).ok());
     let confirmations = TauriConfirmationRequester { app, window };
     let report = agent::run_stub_agent_loop_with_grounder(
         &observer,
@@ -1750,6 +1752,7 @@ async fn run_prepared_stub_agent(
         &confirmations,
         &grounder,
         &capture_engine,
+        &perception_tools,
         abort.as_ref(),
     )
     .await;

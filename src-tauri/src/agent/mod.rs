@@ -10,6 +10,7 @@ mod memory;
 mod observer;
 #[cfg(target_os = "macos")]
 mod page_reader;
+mod perception_tools;
 mod planner;
 mod playbooks;
 #[cfg(target_os = "macos")]
@@ -30,6 +31,7 @@ pub use executor::{
     UserAnswerOutcome, UserAnswerStatus, VerificationReport, VerificationStatus,
 };
 pub(crate) use capture_tools::CaptureEngine;
+pub(crate) use perception_tools::IndexPerceptionTools;
 pub(crate) use grounding::GrounderManager;
 pub use grounding::{GroundingMode, GroundingPixel, GroundingReport};
 #[cfg(target_os = "macos")]

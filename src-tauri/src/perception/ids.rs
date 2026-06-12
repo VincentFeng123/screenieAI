@@ -58,6 +58,7 @@ pub struct ResolvedElement {
     pub snapshot_id: String,
     pub role: String,
     pub title: Option<String>,
+    pub descr: Option<String>,
     pub value: Option<String>,
     /// Global screen points, top-left origin — CGEvent space (C5).
     pub frame: RectPt,
@@ -321,6 +322,7 @@ pub fn resolve(
         snapshot_id: snapshot_id.to_string(),
         role: row.role.clone(),
         title: row.title.clone(),
+        descr: row.descr.clone(),
         value: row.value.clone(),
         frame: row.frame,
         click_point: row.frame.center(),

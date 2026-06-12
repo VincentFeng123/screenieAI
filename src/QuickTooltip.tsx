@@ -332,6 +332,8 @@ function formatAgentAction(action: AgentAction): string {
   if (action.action === "webSearch")
     return action.query ? `Search "${action.query}"` : "Search the web";
   if (action.action === "readPage") return "Read page";
+  if (action.action === "read") return "Read on-screen elements";
+  if (action.action === "look") return "Capture an annotated screenshot";
   if (action.action === "menu" && action.path) return `Menu: ${action.path.join(" → ")}`;
   if (action.action === "ask") return "Ask you a question";
   if (action.action === "applescript") return "Run AppleScript";
