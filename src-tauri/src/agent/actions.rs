@@ -459,6 +459,48 @@ mod tests {
         assert_eq!(schema_action_enum(), model_action_names());
     }
 
+    /// Byte-stability pin: the generated enum must keep the exact historical
+    /// order, or provider request bodies shift and the Anthropic prompt
+    /// cache is busted. Append new actions at the end of ACTIONS only.
+    #[test]
+    fn schema_action_enum_order_is_pinned() {
+        assert_eq!(
+            schema_action_enum(),
+            [
+                "activateApp",
+                "click",
+                "clickText",
+                "doubleClick",
+                "type",
+                "key",
+                "menu",
+                "scroll",
+                "wait",
+                "openUrl",
+                "webSearch",
+                "readPage",
+                "findUi",
+                "webLookup",
+                "ask",
+                "applescript",
+                "shortcut",
+                "moveToTrash",
+                "captureFrame",
+                "recordClip",
+                "startRecording",
+                "stopRecording",
+                "capturePermission",
+                "done",
+                "fail"
+            ]
+        );
+        assert_eq!(
+            planner_response_schema()["properties"]["next"]["items"]["properties"]["action"]
+                ["enum"],
+            serde_json::json!(["click", "type", "key", "scroll", "wait"])
+        );
+    }
+
     #[test]
     fn registry_batchables_match_next_enum_and_batchable_followup() {
         let next_enum: Vec<String> = planner_response_schema()["properties"]["next"]["items"]
@@ -492,7 +534,7 @@ mod tests {
         for spec in ACTIONS {
             assert_eq!(
                 action_specific_fields(spec.name),
-                Some(&field_names(spec)[..]),
+                Some(field_names(spec)),
                 "{}: registry fields drifted from action_specific_fields",
                 spec.name
             );

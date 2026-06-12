@@ -1420,7 +1420,7 @@ pub(crate) fn planner_response_schema() -> Value {
             "reason": { "type": "string", "maxLength": MAX_REASON_CHARS },
             "action": {
                 "type": "string",
-                "enum": ["activateApp", "click", "clickText", "doubleClick", "type", "key", "menu", "scroll", "wait", "openUrl", "webSearch", "readPage", "findUi", "webLookup", "ask", "applescript", "shortcut", "moveToTrash", "captureFrame", "recordClip", "startRecording", "stopRecording", "capturePermission", "done", "fail"]
+                "enum": super::actions::model_action_names()
             },
             "scope": { "type": "string", "enum": ["screen", "window"] },
             "seconds": { "type": "integer", "minimum": 1, "maximum": MAX_RECORD_CLIP_SECONDS },
@@ -1470,7 +1470,7 @@ pub(crate) fn planner_response_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["click", "type", "key", "scroll", "wait"]
+                    "enum": super::actions::batchable_action_names()
                 },
                 "id": { "type": "integer", "minimum": 0 },
                 "text": { "type": "string" },
@@ -1606,9 +1606,15 @@ pub(crate) fn parse_planner_decision(
 }
 
 fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result<Action, String> {
+    // One registry-driven whitelist check covers every known action; unknown
+    // names skip it so the match below still reports "unknown action".
+    if let Some(spec) =
+        super::actions::canonical_name_for(&raw.action).and_then(super::actions::spec_for)
+    {
+        reject_fields(raw, FieldSet::from_spec(spec))?;
+    }
     let action = match raw.action.as_str() {
         "activateApp" | "activate_app" => {
-            reject_fields(raw, FieldSet::APP)?;
             let app = require_string("app", raw.app.as_deref())?.trim();
             if app.is_empty() {
                 return Err("app is required".into());
@@ -1618,13 +1624,11 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
         }
         "click" => {
-            reject_fields(raw, FieldSet::ID)?;
             let id = require_id(raw)?;
             validate_id_exists(id, obs)?;
             Action::Click { id }
         }
         "clickText" | "click_text" => {
-            reject_fields(raw, FieldSet::TEXT_ROLE_NTH)?;
             let text = require_string("text", raw.text.as_deref())?.to_string();
             Action::ClickByText {
                 text,
@@ -1633,13 +1637,11 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
         }
         "doubleClick" | "double_click" => {
-            reject_fields(raw, FieldSet::ID)?;
             let id = require_id(raw)?;
             validate_id_exists(id, obs)?;
             Action::DoubleClick { id }
         }
         "type" => {
-            reject_fields(raw, FieldSet::ID_TEXT)?;
             let id = require_id(raw)?;
             validate_id_exists(id, obs)?;
             Action::Type {
@@ -1648,13 +1650,11 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
         }
         "key" => {
-            reject_fields(raw, FieldSet::COMBO)?;
             let combo = require_string("combo", raw.combo.as_deref())?.to_string();
             validate_key_combo(&combo)?;
             Action::Key { combo }
         }
         "menu" => {
-            reject_fields(raw, FieldSet::PATH)?;
             let path = raw
                 .path
                 .clone()
@@ -1677,46 +1677,38 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             Action::Menu { path }
         }
         "scroll" => {
-            reject_fields(raw, FieldSet::DX_DY)?;
             let (dx, dy) = parse_scroll_axes(raw)?;
             Action::Scroll { dx, dy }
         }
         "wait" => {
-            reject_fields(raw, FieldSet::MS)?;
             Action::Wait {
                 ms: raw.ms.ok_or_else(|| "wait requires ms".to_string())?,
             }
         }
         "openUrl" | "open_url" => {
-            reject_fields(raw, FieldSet::URL)?;
             Action::OpenUrl {
                 url: require_string("url", raw.url.as_deref())?.to_string(),
             }
         }
         "webSearch" | "web_search" => {
-            reject_fields(raw, FieldSet::QUERY)?;
             Action::WebSearch {
                 query: require_string("query", raw.query.as_deref())?.to_string(),
             }
         }
         "readPage" | "read_page" => {
-            reject_fields(raw, FieldSet::NONE)?;
             Action::ReadPage
         }
         "findUi" | "find_ui" => {
-            reject_fields(raw, FieldSet::QUERY)?;
             Action::FindUi {
                 query: require_string("query", raw.query.as_deref())?.to_string(),
             }
         }
         "webLookup" | "web_lookup" => {
-            reject_fields(raw, FieldSet::QUERY)?;
             Action::WebLookup {
                 query: require_string("query", raw.query.as_deref())?.to_string(),
             }
         }
         "ask" => {
-            reject_fields(raw, FieldSet::QUESTION)?;
             let question = normalize_optional_field(raw.question.as_deref(), MAX_QUESTION_CHARS)
                 .ok_or_else(|| "ask requires question".to_string())?;
             let options = raw
@@ -1732,7 +1724,6 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             Action::Ask { question, options }
         }
         "applescript" | "apple_script" | "osascript" => {
-            reject_fields(raw, FieldSet::SCRIPT)?;
             let script = require_string("script", raw.script.as_deref())?.to_string();
             if script.chars().count() > MAX_SCRIPT_CHARS {
                 return Err(format!(
@@ -1742,7 +1733,6 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             Action::AppleScript { script }
         }
         "shortcut" | "run_shortcut" | "runShortcut" => {
-            reject_fields(raw, FieldSet::SHORTCUT)?;
             Action::RunShortcut {
                 name: require_string("name", raw.name.as_deref())?.to_string(),
                 input: raw
@@ -1752,19 +1742,16 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
         }
         "moveToTrash" | "move_to_trash" => {
-            reject_fields(raw, FieldSet::FILE)?;
             Action::MoveToTrash {
                 path: require_string("file", raw.file.as_deref())?.to_string(),
             }
         }
         "captureFrame" | "capture_frame" => {
-            reject_fields(raw, FieldSet::SCOPE)?;
             Action::CaptureFrame {
                 scope: parse_capture_scope(raw.scope.as_deref())?,
             }
         }
         "recordClip" | "record_clip" => {
-            reject_fields(raw, FieldSet::SECONDS_SCOPE)?;
             let seconds = raw
                 .seconds
                 .ok_or_else(|| "recordClip requires seconds".to_string())?;
@@ -1780,25 +1767,20 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
         }
         "startRecording" | "start_recording" => {
-            reject_fields(raw, FieldSet::SCOPE)?;
             Action::StartRecording {
                 scope: parse_capture_scope(raw.scope.as_deref())?,
             }
         }
         "stopRecording" | "stop_recording" => {
-            reject_fields(raw, FieldSet::NONE)?;
             Action::StopRecording
         }
         "capturePermission" | "capture_permission" => {
-            reject_fields(raw, FieldSet::NONE)?;
             Action::CapturePermission
         }
         "done" => {
-            reject_fields(raw, FieldSet::NONE)?;
             Action::Done
         }
         "fail" => {
-            reject_fields(raw, FieldSet::REASON_DETAIL)?;
             Action::Fail {
                 reason: require_string("reason_detail", raw.reason_detail.as_deref())?.to_string(),
             }
@@ -2417,71 +2399,23 @@ const DROPPABLE_ACTION_FIELDS: &[&str] = &[
     "seconds",
 ];
 
-/// Which scoped fields each action legitimately uses. `None` for unknown
-/// action names so the "unknown action" error stays intact.
-pub(crate) fn action_specific_fields(action: &str) -> Option<&'static [&'static str]> {
-    Some(match action {
-        "activateApp" | "activate_app" => &["app"],
-        "click" | "doubleClick" | "double_click" => &["id"],
-        "clickText" | "click_text" => &["text", "role", "nth"],
-        "type" => &["id", "text"],
-        "key" => &["combo"],
-        "menu" => &["path"],
-        "scroll" => &["dx", "dy"],
-        "wait" => &["ms"],
-        "openUrl" | "open_url" => &["url"],
-        "webSearch" | "web_search" => &["query"],
-        "findUi" | "find_ui" => &["query"],
-        "webLookup" | "web_lookup" => &["query"],
-        "readPage" | "read_page" | "done" => &[],
-        "ask" => &["question", "options"],
-        "applescript" | "apple_script" | "osascript" => &["script"],
-        "shortcut" | "run_shortcut" | "runShortcut" => &["name", "input"],
-        "moveToTrash" | "move_to_trash" => &["file"],
-        "captureFrame" | "capture_frame" => &["scope"],
-        "recordClip" | "record_clip" => &["seconds", "scope"],
-        "startRecording" | "start_recording" => &["scope"],
-        "stopRecording" | "stop_recording" | "capturePermission" | "capture_permission" => &[],
-        "fail" => &["reason_detail"],
-        _ => return None,
-    })
+/// Which scoped fields each action legitimately uses, from the registry.
+/// `None` for unknown action names so the "unknown action" error stays
+/// intact. Accepts canonical names and registry aliases.
+pub(crate) fn action_specific_fields(action: &str) -> Option<Vec<&'static str>> {
+    let canonical = super::actions::canonical_name_for(action)?;
+    super::actions::spec_for(canonical).map(super::actions::field_names)
 }
 
-fn canonical_action_name(action: &str) -> String {
+/// Canonical name for any registry-accepted spelling; unknown names pass
+/// through trimmed so the parser's "unknown action" error names what the
+/// model actually said. The registry forbids an alias shadowing another
+/// action's canonical name (the historic "shortcut" -> "key" collision).
+pub(crate) fn canonical_action_name(action: &str) -> String {
     let normalized = action.trim();
-    match normalized.to_ascii_lowercase().as_str() {
-        "left_click" | "leftclick" | "click_element" | "tap" => "click".into(),
-        "clicktext" | "click_text" | "click_by_text" | "clickbytext" | "click_label" => {
-            "clickText".into()
-        }
-        "type_text" | "input" | "input_text" | "enter_text" | "set_text" | "settext" => {
-            "type".into()
-        }
-        // "shortcut" must NOT alias to "key": it is itself a canonical action
-        // (RunShortcut) and the prompt teaches {"action":"shortcut","name":...}.
-        "press" | "press_key" | "hotkey" | "keypress" | "key_press" => "key".into(),
-        "menu_click" | "menuclick" | "click_menu" | "menu_item" | "menuitem" | "select_menu"
-        | "menu_select" => "menu".into(),
-        "ask_user" | "askuser" | "ask_human" | "question" => "ask".into(),
-        "run_applescript" | "runapplescript" | "run_script" => "applescript".into(),
-        "delete_file" | "trash_file" | "trash" => "moveToTrash".into(),
-        "finish" | "complete" | "end" | "stop" | "terminate" => "done".into(),
-        "open_url" | "openurl" | "navigate" | "goto" | "go_to_url" => "openUrl".into(),
-        "web_search" | "websearch" | "search" => "webSearch".into(),
-        "find_ui" | "findui" | "search_ui" | "find_element" | "findelement" => "findUi".into(),
-        "web_lookup" | "weblookup" | "lookup" => "webLookup".into(),
-        "read_page" | "readpage" | "read" => "readPage".into(),
-        "capture_frame" | "captureframe" | "screenshot" | "take_screenshot" | "capture_screen" => {
-            "captureFrame".into()
-        }
-        "record_clip" | "recordclip" | "record_video" | "record_screen" => "recordClip".into(),
-        "start_recording" | "startrecording" => "startRecording".into(),
-        "stop_recording" | "stoprecording" => "stopRecording".into(),
-        "capture_permission" | "capturepermission" | "check_permissions" => {
-            "capturePermission".into()
-        }
-        _ => normalized.to_string(),
-    }
+    super::actions::canonical_name_for(normalized)
+        .map(str::to_string)
+        .unwrap_or_else(|| normalized.to_string())
 }
 
 fn normalize_optional_field(value: Option<&str>, max_chars: usize) -> Option<String> {
@@ -2704,64 +2638,6 @@ impl FieldSet {
         scope: false,
         seconds: false,
     };
-    const SCOPE: Self = Self {
-        scope: true,
-        ..Self::NONE
-    };
-    const SECONDS_SCOPE: Self = Self {
-        seconds: true,
-        scope: true,
-        ..Self::NONE
-    };
-    const TEXT_ROLE_NTH: Self = Self {
-        text: true,
-        role: true,
-        nth: true,
-        ..Self::NONE
-    };
-    const PATH: Self = Self {
-        path: true,
-        ..Self::NONE
-    };
-    const QUESTION: Self = Self {
-        question: true,
-        options: true,
-        ..Self::NONE
-    };
-    const SCRIPT: Self = Self {
-        script: true,
-        ..Self::NONE
-    };
-    const SHORTCUT: Self = Self {
-        name: true,
-        input: true,
-        ..Self::NONE
-    };
-    const FILE: Self = Self {
-        file: true,
-        ..Self::NONE
-    };
-    const URL: Self = Self {
-        url: true,
-        ..Self::NONE
-    };
-    const QUERY: Self = Self {
-        query: true,
-        ..Self::NONE
-    };
-    const ID: Self = Self {
-        id: true,
-        ..Self::NONE
-    };
-    const APP: Self = Self {
-        app: true,
-        ..Self::NONE
-    };
-    const ID_TEXT: Self = Self {
-        id: true,
-        text: true,
-        ..Self::NONE
-    };
     const TARGET: Self = Self {
         target: true,
         ..Self::NONE
@@ -2769,10 +2645,6 @@ impl FieldSet {
     const TARGET_TEXT: Self = Self {
         target: true,
         text: true,
-        ..Self::NONE
-    };
-    const COMBO: Self = Self {
-        combo: true,
         ..Self::NONE
     };
     const DX_DY: Self = Self {
@@ -2788,6 +2660,43 @@ impl FieldSet {
         reason_detail: true,
         ..Self::NONE
     };
+
+    /// Whitelist for a registry action. The hand-kept consts above remain
+    /// only for the legacy grounding-target parser, whose contract is
+    /// deliberately separate from the registry.
+    fn from_spec(spec: &super::actions::ActionSpec) -> Self {
+        let mut set = Self::NONE;
+        for field in spec.fields {
+            match field.name {
+                "app" => set.app = true,
+                "id" => set.id = true,
+                "target" => set.target = true,
+                "x" => set.x = true,
+                "y" => set.y = true,
+                "text" => set.text = true,
+                "combo" => set.combo = true,
+                "path" => set.path = true,
+                "question" => set.question = true,
+                "options" => set.options = true,
+                "script" => set.script = true,
+                "name" => set.name = true,
+                "input" => set.input = true,
+                "file" => set.file = true,
+                "dx" => set.dx = true,
+                "dy" => set.dy = true,
+                "ms" => set.ms = true,
+                "url" => set.url = true,
+                "query" => set.query = true,
+                "reason_detail" => set.reason_detail = true,
+                "role" => set.role = true,
+                "nth" => set.nth = true,
+                "scope" => set.scope = true,
+                "seconds" => set.seconds = true,
+                other => unreachable!("registry field '{other}' has no FieldSet flag"),
+            }
+        }
+        set
+    }
 }
 
 #[derive(Debug, Deserialize)]
