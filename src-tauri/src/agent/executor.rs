@@ -11,6 +11,7 @@ use super::search::score_match;
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
 use super::capture_tools::CaptureEngine;
+use super::perception_tools::{PerceptionReadQuery, PerceptionTools};
 use super::types::{
     intersect_rects, is_secure_text_role, normalize_signature_name, Action, CaptureScope,
     CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider, MenuPressOutcome,
@@ -1336,6 +1337,11 @@ impl<F: InputBackendFactory> ActionExecutor<F> {
                     "capture actions are executed through the capture engine".into(),
                 ));
             }
+            PreparedKind::PerceptionRead { .. } | PreparedKind::PerceptionLook { .. } => {
+                return Err(ExecutionError::Input(
+                    "perception actions are executed through the perception index".into(),
+                ));
+            }
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
             | PreparedKind::FindUi { .. }
@@ -1764,16 +1770,17 @@ where
         confirmations,
         &NoopGrounder,
         &crate::agent::capture_tools::NoopCaptureEngine,
+        &crate::agent::perception_tools::NoopPerceptionTools,
         abort,
     )
     .await
 }
 
 // One parameter per collaborating subsystem (observer, planner, input,
-// calibration, confirmations, grounder, capture, abort) — bundling them into
-// a struct would only move the argument list.
+// calibration, confirmations, grounder, capture, perception, abort) —
+// bundling them into a struct would only move the argument list.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_stub_agent_loop_with_grounder<O, P, F, C, Q, G, E>(
+pub(crate) async fn run_stub_agent_loop_with_grounder<O, P, F, C, Q, G, E, T>(
     observer: &O,
     planner: &P,
     options: StubAgentOptions,
@@ -1782,6 +1789,7 @@ pub(crate) async fn run_stub_agent_loop_with_grounder<O, P, F, C, Q, G, E>(
     confirmations: &Q,
     grounder: &G,
     capture: &E,
+    perception: &T,
     abort: &AgentAbortState,
 ) -> AgentRunReport
 where
@@ -1792,6 +1800,7 @@ where
     Q: ConfirmationRequester,
     G: Grounder + ?Sized,
     E: CaptureEngine + ?Sized,
+    T: PerceptionTools + ?Sized,
 {
     let adaptive_step_budget = options.max_steps.is_none();
     let adaptive_wall_clock = options.wall_clock_budget_ms.is_none();
@@ -1837,6 +1846,11 @@ where
     let mut current_milestone = 0_usize;
     let mut notes: Vec<String> = Vec::new();
     let mut page_excerpt: Option<String> = None;
+    // Latest perception read handed to the planner: the serialized SNAP
+    // block (rendered into the goal context) and its snapshot id — the
+    // default scope for eid targets that omit `snap`.
+    let mut perception_block: Option<String> = None;
+    let mut perception_snapshot: Option<String> = None;
     // One corrective re-ask per run before a planner-emitted fail is
     // accepted: a stale training prior ("X does not exist") must not kill a
     // run that has live on-screen evidence in front of it.
@@ -2096,6 +2110,7 @@ where
                 current_milestone,
                 notes: &notes,
                 page_excerpt: page_excerpt.as_deref(),
+                perception_block: perception_block.as_deref(),
                 recovery_notice: stuck_recovery.notice(),
                 known_hints: known_hints.as_deref(),
                 memory_context: memory_context.as_deref(),
@@ -2359,7 +2374,115 @@ where
                         }
                     }
                 }
+
+                // Perception eid targets resolve here (C4) — against the
+                // snapshot named by the planner (or its latest read), never
+                // the integer-id observation. The resolved element joins the
+                // preparation observation as a synthetic entry and the
+                // action is rewritten to its id form, so every existing gate
+                // (safety, confirmation, intent, preflight) applies
+                // unchanged. A stale snapshot transparently re-reads and
+                // re-acquires the element by fingerprint when unambiguous;
+                // otherwise the fresh SNAP block replaces the goal context
+                // and the planner re-picks with current ids.
+                let mut perception_synthetic: Option<Element> = None;
+                if let Some((eid, explicit_snap)) = perception_eid_ref(&action) {
+                    let resolution = match explicit_snap.or_else(|| perception_snapshot.clone()) {
+                        None => Err(
+                            "no element-index snapshot in context; emit read first or include snap"
+                                .to_string(),
+                        ),
+                        Some(snap) => {
+                            match resolve_perception_target(&before, &eid, &snap, false) {
+                                Ok(element) => Ok(element),
+                                Err(ExecutionError::StaleSnapshot(stale)) => {
+                                    refresh_stale_perception_target(
+                                        perception,
+                                        &before,
+                                        &eid,
+                                        &stale,
+                                        &mut perception_block,
+                                        &mut perception_snapshot,
+                                    )
+                                    .await
+                                }
+                                Err(other) => Err(other.to_string()),
+                            }
+                        }
+                    };
+                    match resolution {
+                        Ok(element) => {
+                            eprintln!(
+                                "[screenie] agent step {} resolve epoch={} via=eid expected=\"{}\" resolved=\"{}\"",
+                                step_number, observation_epoch, eid, element.name
+                            );
+                            // Like clickText, history records the original
+                            // eid form — the rewritten synthetic id is
+                            // epoch-scoped and meaningless to the planner.
+                            click_text_original = Some(decision.action.clone());
+                            action = rewrite_eid_action(&action, element.id);
+                            perception_synthetic = Some(element);
+                        }
+                        Err(reason) => {
+                            eprintln!(
+                                "[screenie] agent step {} eid-unresolved: {reason}",
+                                step_number
+                            );
+                            if duplicate_rejections < MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP {
+                                planning_history.push(PlannerHistoryEntry::new(
+                                    action.clone(),
+                                    planner_reason.clone(),
+                                    format!("rejected without execution: {reason}"),
+                                ));
+                                step_rejection_lines.push(format!("- {eid}: {reason}"));
+                                attempt_goal =
+                                    compose_attempt_goal(&planner_goal, &step_rejection_lines);
+                                duplicate_rejections = duplicate_rejections.saturating_add(1);
+                                continue;
+                            }
+                            // Rejection cap: charge a failed step and let the
+                            // loop replan. No ban — eids are snapshot-scoped,
+                            // so a banned ref would outlive its meaning.
+                            history.push(PlannerHistoryEntry::new(
+                                action.clone(),
+                                planner_reason.clone(),
+                                format!("rejected without execution: {reason}"),
+                            ));
+                            let step = AgentStepReport {
+                                step: step_number,
+                                action,
+                                planner_reason: Some(planner_reason),
+                                target: None,
+                                click_point: None,
+                                click_preflight: None,
+                                execution_policy: options.execution_policy,
+                                executed: false,
+                                mechanism: None,
+                                duration_ms: None,
+                                safety_gate: None,
+                                confirmation: None,
+                                verification: VerificationReport::skipped_no_change_expected(),
+                                settle_status,
+                                calibration: None,
+                                observation_source: observation_metadata.source,
+                                vision_candidate_count: observation_metadata.candidate_count,
+                                vision_trigger_reason: observation_metadata
+                                    .trigger_reason
+                                    .clone(),
+                                vision_capture_size: observation_metadata.capture_size,
+                                vision_detector_kind: observation_metadata.detector_kind.clone(),
+                                grounding: None,
+                                failure_reason: Some(reason),
+                            };
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            continue 'steps;
+                        }
+                    }
+                }
                 let mut preparation_observation = before.clone();
+                if let Some(synthetic) = perception_synthetic.take() {
+                    preparation_observation.push(synthetic);
+                }
                 let grounding_plan = GroundedActionPlan::from_action(&action);
                 let mut grounding_report = None;
                 if let Some(plan) = grounding_plan.as_ref() {
@@ -2707,6 +2830,146 @@ where
                             format!("read page: {preview}")
                         }
                         Err(err) => format!("readPage failed: {err}"),
+                    }
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::PerceptionRead { query } => {
+                // Read-only like readPage: queries the element index without
+                // touching the UI (stale snapshots re-see automatically —
+                // C3). The SNAP block replaces the goal-context element
+                // index; the step result stays a compact pointer to it.
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: read skipped".to_string()
+                } else {
+                    match perception.read(query).await {
+                        Ok(feed) => {
+                            step.executed = true;
+                            step.mechanism = Some(ActionMechanism::UiSearch);
+                            let text = format!(
+                                "read SNAP {}: {} of {} element(s) under 'Element index' in your prompt{}{}",
+                                feed.snapshot_id,
+                                feed.returned,
+                                feed.total,
+                                if feed.refreshed { " (re-captured)" } else { "" },
+                                if (feed.returned as u64) < feed.total {
+                                    "; read again with narrower filters for the rest"
+                                } else {
+                                    ""
+                                },
+                            );
+                            perception_snapshot = Some(feed.snapshot_id);
+                            perception_block = Some(feed.block);
+                            text
+                        }
+                        Err(err) => format!("read failed: {err}"),
+                    }
+                };
+                history.push(PlannerHistoryEntry::new(
+                    action.clone(),
+                    planner_reason.clone(),
+                    result_text,
+                ));
+                if step.executed {
+                    apply_pending_milestone(
+                        &mut pending_milestone_done,
+                        &mut current_milestone,
+                        &milestones,
+                        step_number,
+                    );
+                }
+                commit_step(confirmations, &mut steps, step, step_started);
+                continue 'steps;
+            }
+            PreparedKind::PerceptionLook { snap } => {
+                let snap = snap.clone();
+                // Like captureFrame: no input events, but it DOES write
+                // local PNGs — stamp an explicit Allow and let AskEverything
+                // users approve it.
+                step.safety_gate = Some(capture_allow_gate(
+                    "set-of-marks capture only writes local image files",
+                    &focused_before_observation,
+                ));
+                if options.execution_policy == ExecutionPolicy::AskEverything {
+                    let wait_started = Instant::now();
+                    let outcome = confirmations
+                        .request_confirmation(
+                            AgentConfirmationRequest {
+                                action: action.clone(),
+                                target: None,
+                                reason: "capture an annotated screenshot of the indexed window"
+                                    .to_string(),
+                            },
+                            confirmation_timeout,
+                            abort,
+                        )
+                        .await;
+                    user_wait_time += wait_started.elapsed();
+                    step.confirmation = Some(outcome.clone());
+                    match outcome.status {
+                        ConfirmationStatus::Approved => {}
+                        ConfirmationStatus::Aborted => {
+                            step.failure_reason = Some("agent aborted".into());
+                            terminal_status = Some(AgentRunStatus::Aborted);
+                            failure_reason = Some("agent aborted".into());
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            break;
+                        }
+                        ConfirmationStatus::Denied
+                        | ConfirmationStatus::TimedOut
+                        | ConfirmationStatus::Unavailable => {
+                            history.push(PlannerHistoryEntry::new(
+                                action.clone(),
+                                planner_reason.clone(),
+                                "user declined the look capture; continue without it or ask"
+                                    .to_string(),
+                            ));
+                            commit_step(confirmations, &mut steps, step, step_started);
+                            continue 'steps;
+                        }
+                    }
+                }
+                let result_text = if options.execution_policy.is_dry_run() {
+                    "dry-run: look skipped".to_string()
+                } else {
+                    match perception.look(snap.as_deref()).await {
+                        Ok(feed) => {
+                            step.executed = true;
+                            step.mechanism = Some(ActionMechanism::Capture);
+                            let text = format!(
+                                "look SNAP {}: marked frame attached to your next prompt ({} marks{}); box labels are element ids — act with eid + snap",
+                                feed.snapshot_id,
+                                feed.marks_drawn,
+                                if feed.marks_capped > 0 {
+                                    ", densest areas capped"
+                                } else {
+                                    ""
+                                },
+                            );
+                            planner.attach_capture(PlannerCaptureAttachment {
+                                image_png_b64: feed.marked_png_b64,
+                                width: feed.width,
+                                height: feed.height,
+                                scope_label: "indexed window, set-of-marks: box labels are element ids for this SNAP",
+                            });
+                            perception_snapshot = Some(feed.snapshot_id);
+                            text
+                        }
+                        Err(err) => format!("look failed: {err}"),
                     }
                 };
                 history.push(PlannerHistoryEntry::new(
@@ -4576,11 +4839,16 @@ fn confirmation_approval_key(
     reason: &str,
 ) -> Option<ConfirmationApprovalKey> {
     let action_kind = match action {
-        Action::Click { .. } | Action::ClickTarget { .. } | Action::ClickByText { .. } => {
-            "click".to_string()
-        }
-        Action::DoubleClick { .. } | Action::DoubleClickTarget { .. } => "doubleClick".to_string(),
-        Action::Type { text, .. } | Action::TypeTarget { text, .. } => {
+        Action::Click { .. }
+        | Action::ClickTarget { .. }
+        | Action::ClickByText { .. }
+        | Action::ClickEid { .. } => "click".to_string(),
+        Action::DoubleClick { .. }
+        | Action::DoubleClickTarget { .. }
+        | Action::DoubleClickEid { .. } => "doubleClick".to_string(),
+        Action::Type { text, .. }
+        | Action::TypeTarget { text, .. }
+        | Action::TypeEid { text, .. } => {
             format!("type:{}", normalize_text_for_match(text))
         }
         Action::TypeFocused { text } => format!("typeFocused:{}", normalize_text_for_match(text)),
@@ -4593,6 +4861,8 @@ fn confirmation_approval_key(
         Action::OpenUrl { url } => format!("openUrl:{}", url.trim()),
         Action::WebSearch { query } => format!("webSearch:{}", query.trim()),
         Action::ReadPage => "readPage".into(),
+        Action::Read { .. } => "read".into(),
+        Action::Look { .. } => "look".into(),
         Action::FindUi { query } => format!("findUi:{}", normalize_text_for_match(query)),
         Action::WebLookup { query } => format!("webLookup:{}", normalize_text_for_match(query)),
         Action::Ask { question, .. } => format!("ask:{}", question.trim()),
@@ -4627,6 +4897,8 @@ struct GoalContext<'a> {
     current_milestone: usize,
     notes: &'a [String],
     page_excerpt: Option<&'a str>,
+    /// Serialized SNAP block from the latest perception read.
+    perception_block: Option<&'a str>,
     recovery_notice: Option<&'a str>,
     /// Previously verified navigation paths for this app that match the
     /// goal; rendered template-driven from the hint cache.
@@ -4716,6 +4988,13 @@ fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
             "\n\nPage text (from your last readPage/webSearch; save anything important with \"note\"):\n",
         );
         composed.push_str(excerpt);
+    }
+
+    if let Some(block) = context.perception_block {
+        composed.push_str(
+            "\n\nElement index (from your last read; ids are valid ONLY with this SNAP id — act by passing eid + snap to click/doubleClick/type, with target_name copied from the line's label):\n",
+        );
+        composed.push_str(block);
     }
 
     if let Some(notice) = context.recovery_notice {
@@ -5363,6 +5642,34 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
             }))
         }
         Action::ReadPage => Ok(PreparedAction::without_target(PreparedKind::ReadPage)),
+        Action::Read {
+            text,
+            roles,
+            actionable_only,
+            limit,
+            snap,
+        } => Ok(PreparedAction::without_target(
+            PreparedKind::PerceptionRead {
+                query: PerceptionReadQuery {
+                    text: text.clone(),
+                    roles: roles.clone(),
+                    actionable_only: *actionable_only,
+                    limit: *limit,
+                    snapshot_id: snap.clone(),
+                },
+            },
+        )),
+        Action::Look { snap } => Ok(PreparedAction::without_target(
+            PreparedKind::PerceptionLook { snap: snap.clone() },
+        )),
+        // eid targets are resolved to Click/Type{id} in the planning loop
+        // (the perception twin of resolve_click_by_text); reaching
+        // preparation unresolved is an internal error, never an input path.
+        Action::ClickEid { eid, .. }
+        | Action::DoubleClickEid { eid, .. }
+        | Action::TypeEid { eid, .. } => Err(ExecutionError::Input(format!(
+            "eid target {eid} must resolve through the perception index before preparation"
+        ))),
         Action::FindUi { query } => Ok(PreparedAction::without_target(PreparedKind::FindUi {
             query: validated_search_query("findUi", query)?,
         })),
@@ -5618,8 +5925,6 @@ fn target_element_by_id(obs: &[Element], id: u32) -> Result<Element, ExecutionEr
 /// re-perceive instead of failing the action; the resolved element becomes
 /// a synthetic observation entry in the same global-top-left point space
 /// every click path already uses.
-#[cfg(target_os = "macos")]
-#[allow(dead_code)] // call sites arrive with the operating-prompt planner wiring
 fn resolve_perception_target(
     obs: &[Element],
     eid: &str,
@@ -5636,9 +5941,12 @@ fn resolve_perception_target(
     Ok(Element::new(
         next_synthetic_id(obs),
         resolved.role.clone(),
+        // Same label source as the SNAP line grammar (title else descr), so
+        // the planner's echoed target_name matches what it read.
         resolved
             .title
             .clone()
+            .or_else(|| resolved.descr.clone())
             .unwrap_or_else(|| resolved.eid.clone()),
         resolved.value.clone(),
         Rect {
@@ -5652,6 +5960,94 @@ fn resolve_perception_target(
         CoordinateSpace::AxPoints,
         ElementSource::Ax,
     ))
+}
+
+/// The eid+snap form of an id-targeted action, if any.
+fn perception_eid_ref(action: &Action) -> Option<(String, Option<String>)> {
+    match action {
+        Action::ClickEid { eid, snap }
+        | Action::DoubleClickEid { eid, snap }
+        | Action::TypeEid { eid, snap, .. } => Some((eid.clone(), snap.clone())),
+        _ => None,
+    }
+}
+
+/// Rewrite a resolved eid action to its observation-id form, preserving
+/// kind and payload.
+fn rewrite_eid_action(action: &Action, id: u32) -> Action {
+    match action {
+        Action::ClickEid { .. } => Action::Click { id },
+        Action::DoubleClickEid { .. } => Action::DoubleClick { id },
+        Action::TypeEid { text, .. } => Action::Type {
+            id,
+            text: text.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// StaleSnapshot recovery (C3+C4): transparently re-read, then re-acquire
+/// the element in the fresh snapshot by fingerprint. Fingerprints exclude
+/// value and frame by design, so an unambiguous match means "the same
+/// control, one walk later" and the action proceeds without a model call;
+/// anything else feeds the fresh SNAP block back to the planner.
+async fn refresh_stale_perception_target<T>(
+    perception: &T,
+    obs: &[Element],
+    eid: &str,
+    stale_snapshot: &str,
+    perception_block: &mut Option<String>,
+    perception_snapshot: &mut Option<String>,
+) -> Result<Element, String>
+where
+    T: PerceptionTools + ?Sized,
+{
+    // Pin the re-read to the stale ref's WINDOW, not whatever is frontmost
+    // now (the user may have switched apps since the read): the window's
+    // latest snapshot either already supersedes the stale one (served
+    // without a walk) or is itself dirty, in which case the read layer
+    // re-sees pinned to that window. Only an evicted record falls back to
+    // the frontmost-window default.
+    let pinned_snapshot = {
+        let registry = crate::perception::ids::registry();
+        registry
+            .snapshot_by_id(stale_snapshot)
+            .and_then(|record| registry.latest_snapshot_id(&record.window_key))
+    };
+    let feed = perception
+        .read(&PerceptionReadQuery {
+            snapshot_id: pinned_snapshot,
+            ..PerceptionReadQuery::default()
+        })
+        .await
+        .map_err(|err| format!("snapshot {stale_snapshot} is stale and re-read failed: {err}"))?;
+    let fresh_snapshot = feed.snapshot_id.clone();
+    *perception_snapshot = Some(feed.snapshot_id);
+    *perception_block = Some(feed.block);
+    reresolve_eid_by_fingerprint(eid, stale_snapshot, &fresh_snapshot)
+        .and_then(|fresh_eid| resolve_perception_target(obs, &fresh_eid, &fresh_snapshot, false).ok())
+        .ok_or_else(|| {
+            format!(
+                "snapshot {stale_snapshot} was stale; a fresh element index is in your goal context — re-issue with its ids"
+            )
+        })
+}
+
+/// The fingerprint bridge across a re-see: the same element's eid in the
+/// fresh snapshot, but only when exactly one row matches — a duplicated
+/// fingerprint means repeated UI (list rows, toolbar twins) where guessing
+/// would click the wrong one.
+fn reresolve_eid_by_fingerprint(
+    eid: &str,
+    stale_snapshot: &str,
+    fresh_snapshot: &str,
+) -> Option<String> {
+    let registry = crate::perception::ids::registry();
+    let fp = registry.snapshot_by_id(stale_snapshot)?.row(eid)?.fp;
+    let fresh = registry.snapshot_by_id(fresh_snapshot)?;
+    let mut matches = fresh.rows.iter().filter(|row| row.fp == fp);
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.eid.clone())
 }
 
 /// A text-targeted click resolved to a concrete element (WI-2).
@@ -5944,6 +6340,8 @@ impl PreparedAction {
             | PreparedKind::CapturePermission => false,
             PreparedKind::Wait { .. }
             | PreparedKind::ReadPage
+            | PreparedKind::PerceptionRead { .. }
+            | PreparedKind::PerceptionLook { .. }
             | PreparedKind::FindUi { .. }
             | PreparedKind::WebLookup { .. }
             | PreparedKind::Ask { .. }
@@ -6995,6 +7393,8 @@ fn synthetic_mechanism(kind: &PreparedKind) -> Option<ActionMechanism> {
         | PreparedKind::OpenUrl { .. }
         | PreparedKind::Menu { .. }
         | PreparedKind::ReadPage
+        | PreparedKind::PerceptionRead { .. }
+        | PreparedKind::PerceptionLook { .. }
         | PreparedKind::FindUi { .. }
         | PreparedKind::WebLookup { .. }
         | PreparedKind::Ask { .. }
@@ -7782,17 +8182,21 @@ fn display_progress_action(action: &Action, prepared: &PreparedAction) -> String
         None => verb.to_string(),
     };
     match action {
-        Action::Click { .. } | Action::ClickTarget { .. } => with_target("click"),
+        Action::Click { .. } | Action::ClickTarget { .. } | Action::ClickEid { .. } => {
+            with_target("click")
+        }
         Action::ClickByText { text, .. } => {
             format!("clickText \"{}\"", compact_history_text(text))
         }
-        Action::DoubleClick { .. } | Action::DoubleClickTarget { .. } => {
-            with_target("double-click")
-        }
+        Action::DoubleClick { .. }
+        | Action::DoubleClickTarget { .. }
+        | Action::DoubleClickEid { .. } => with_target("double-click"),
         Action::RightClick { .. } => with_target("right-click"),
         Action::Move { .. } => with_target("move to"),
         Action::Drag { .. } => with_target("drag"),
-        Action::Type { text, .. } | Action::TypeTarget { text, .. } => match target_name {
+        Action::Type { text, .. }
+        | Action::TypeTarget { text, .. }
+        | Action::TypeEid { text, .. } => match target_name {
             Some(name) => format!("type \"{}\" into '{}'", compact_history_text(text), name),
             None => format!("type \"{}\"", compact_history_text(text)),
         },
@@ -7817,6 +8221,8 @@ fn display_progress_action(action: &Action, prepared: &PreparedAction) -> String
         Action::RunShortcut { name, .. } => format!("run shortcut '{}'", name.trim()),
         Action::MoveToTrash { path } => format!("move '{}' to trash", path.trim()),
         Action::ReadPage => "readPage".into(),
+        Action::Read { .. } => "read the element index".into(),
+        Action::Look { .. } => "look (annotated screenshot)".into(),
         Action::CaptureFrame { scope } => format!("capture the {}", scope.label()),
         Action::RecordClip { seconds, scope } => {
             format!("record the {} for {seconds}s", scope.label())
@@ -7836,6 +8242,22 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
         Action::OpenUrl { url } => format!("openUrl:{}", url.trim()),
         Action::WebSearch { query } => format!("webSearch:{}", normalize_text_for_match(query)),
         Action::ReadPage => "readPage".into(),
+        // Filter-sensitive: re-reading with NARROWER filters is progress;
+        // repeating the identical read on an unchanged screen is a loop.
+        Action::Read {
+            text,
+            roles,
+            actionable_only,
+            limit,
+            ..
+        } => format!(
+            "read:{}:{}:{}:{}",
+            normalize_text_for_match(text.as_deref().unwrap_or("")),
+            normalize_text_for_match(roles.as_deref().unwrap_or("")),
+            actionable_only,
+            limit.unwrap_or(0)
+        ),
+        Action::Look { .. } => "look".into(),
         Action::FindUi { query } => format!("findUi:{}", normalize_text_for_match(query)),
         Action::WebLookup { query } => format!("webLookup:{}", normalize_text_for_match(query)),
         Action::Ask { question, .. } => format!("ask:{}", normalize_text_for_match(question)),
@@ -7860,6 +8282,11 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
         Action::ClickByText { text, .. } => {
             format!("clickText:{}", normalize_text_for_match(text))
         }
+        // Unresolved eid forms (resolution rewrites them to the id forms
+        // before any key is taken; these arms only keep the match total).
+        Action::ClickEid { eid, .. } => format!("click:{eid}"),
+        Action::DoubleClickEid { eid, .. } => format!("doubleClick:{eid}"),
+        Action::TypeEid { eid, .. } => format!("type:{eid}"),
         Action::DoubleClick { .. } | Action::DoubleClickTarget { .. } => format!(
             "doubleClick:{}",
             prepared
@@ -8060,6 +8487,17 @@ enum PreparedKind {
         url: String,
     },
     ReadPage,
+    /// Structured perception read over the element index; loop-level arm
+    /// (like ReadPage) through the injected PerceptionTools. Emits no input
+    /// events.
+    PerceptionRead {
+        query: PerceptionReadQuery,
+    },
+    /// Set-of-marks frame attachment; loop-level arm through the injected
+    /// PerceptionTools. Low-risk side effect: writes local PNGs only.
+    PerceptionLook {
+        snap: Option<String>,
+    },
     /// Read-only local search over hints, the menu tree, and the current
     /// observation; emits no input events.
     FindUi {
@@ -8820,6 +9258,9 @@ fn history_entry_for_step(
                 | Action::DoubleClick { .. }
                 | Action::Type { .. }
                 | Action::RightClick { .. }
+                | Action::ClickEid { .. }
+                | Action::DoubleClickEid { .. }
+                | Action::TypeEid { .. }
         )
         .then(|| target.name.clone())
     });
@@ -8986,6 +9427,446 @@ mod tests {
             other => panic!("expected StaleSnapshot, got {other:?}"),
         }
         assert!(resolve_perception_target(&[], "ax:B1", "ax:exectest1", true).is_ok());
+    }
+
+    fn perception_row(eid: &str, fp: u64, title: &str, frame: crate::perception::RectPt) -> crate::perception::ids::ElementRow {
+        crate::perception::ids::ElementRow {
+            eid: eid.into(),
+            fp,
+            role: "AXButton".into(),
+            subrole: None,
+            title: Some(title.into()),
+            descr: None,
+            value: None,
+            actions: vec!["AXPress".into()],
+            actionable: true,
+            enabled: true,
+            focused: false,
+            frame,
+            depth: 1,
+            parent_eid: None,
+            is_web_boundary: false,
+            class_prefix: 'B',
+        }
+    }
+
+    /// Records read queries and serves one canned feed, for the read/eid
+    /// loop tests.
+    struct FakePerceptionTools {
+        feed_snapshot: String,
+        feed_block: String,
+        read_queries: Rc<RefCell<Vec<PerceptionReadQuery>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PerceptionTools for FakePerceptionTools {
+        async fn read(
+            &self,
+            query: &PerceptionReadQuery,
+        ) -> Result<crate::agent::perception_tools::PerceptionReadFeed, String> {
+            self.read_queries.borrow_mut().push(query.clone());
+            Ok(crate::agent::perception_tools::PerceptionReadFeed {
+                snapshot_id: self.feed_snapshot.clone(),
+                block: self.feed_block.clone(),
+                total: 1,
+                returned: 1,
+                refreshed: false,
+            })
+        }
+
+        async fn look(
+            &self,
+            _snapshot_id: Option<&str>,
+        ) -> Result<crate::agent::perception_tools::PerceptionLookFeed, String> {
+            Err("look is not scripted in this test".into())
+        }
+    }
+
+    #[test]
+    fn read_action_feeds_element_index_to_next_goal() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        let read_queries = Rc::new(RefCell::new(Vec::new()));
+        let perception = FakePerceptionTools {
+            feed_snapshot: "ax:feed1".into(),
+            feed_block: "SNAP ax:feed1 app=com.x win=\"W\" 800x600pt scale=2 n=1 t=5ms\nax:B1 button \"Details\" (10,20 80x24) [press]".into(),
+            read_queries: read_queries.clone(),
+        };
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![
+                Action::Read {
+                    text: Some("details".into()),
+                    roles: None,
+                    actionable_only: true,
+                    limit: None,
+                    snap: None,
+                },
+                Action::Done,
+            ],
+            goals: goals.clone(),
+        };
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &NoopGrounder,
+            &crate::agent::capture_tools::NoopCaptureEngine,
+            &perception,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(report.steps[0].executed);
+        assert_eq!(report.steps[0].mechanism, Some(ActionMechanism::UiSearch));
+        // The action's filters reached the index query unchanged.
+        assert_eq!(
+            read_queries.borrow().as_slice(),
+            &[PerceptionReadQuery {
+                text: Some("details".into()),
+                roles: None,
+                actionable_only: true,
+                limit: None,
+                snapshot_id: None,
+            }]
+        );
+        // The SNAP block rides the goal context of the NEXT planner call.
+        assert!(goals
+            .borrow()
+            .iter()
+            .any(|goal| goal.contains("Element index") && goal.contains("ax:B1 button")));
+    }
+
+    #[test]
+    fn eid_click_resolves_through_perception_index_and_executes() {
+        use crate::perception::ids::{registry, registry_test_guard, SnapshotRecord, WindowKey};
+        use crate::perception::RectPt;
+
+        let _guard = registry_test_guard();
+        registry().publish(
+            SnapshotRecord::new(
+                "ax:loop1".into(),
+                WindowKey::WindowId(515_151),
+                vec![perception_row(
+                    "ax:B1",
+                    4_242,
+                    "Details",
+                    RectPt::new(100.0, 200.0, 40.0, 20.0),
+                )],
+            ),
+            None,
+            None,
+        );
+
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let perception = FakePerceptionTools {
+            feed_snapshot: "ax:loop1".into(),
+            feed_block: "unused".into(),
+            read_queries: Rc::new(RefCell::new(Vec::new())),
+        };
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![
+                Action::ClickEid {
+                    eid: "ax:B1".into(),
+                    snap: Some("ax:loop1".into()),
+                },
+                Action::Done,
+            ],
+            goals: Rc::new(RefCell::new(Vec::new())),
+        };
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &NoopGrounder,
+            &crate::agent::capture_tools::NoopCaptureEngine,
+            &perception,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        let step = &report.steps[0];
+        assert!(step.executed, "eid click should execute: {step:?}");
+        // The rewritten action is the ordinary id form, and the resolved
+        // target carries the indexed element's label for the intent gate.
+        assert!(matches!(step.action, Action::Click { .. }));
+        assert_eq!(
+            step.target.as_ref().map(|target| target.name.as_str()),
+            Some("Details")
+        );
+        // Clicked at the indexed frame's center, in global points.
+        assert!(
+            events
+                .borrow()
+                .contains(&RecordedInput::Move(ClickPoint { x: 120, y: 210 })),
+            "expected a move to the indexed frame center, got {:?}",
+            events.borrow()
+        );
+    }
+
+    #[test]
+    fn stale_eid_rereads_and_reacquires_by_fingerprint() {
+        use crate::perception::ids::{registry, registry_test_guard, SnapshotRecord, WindowKey};
+        use crate::perception::RectPt;
+
+        let _guard = registry_test_guard();
+        let window = WindowKey::WindowId(616_161);
+        registry().publish(
+            SnapshotRecord::new(
+                "ax:stale1".into(),
+                window.clone(),
+                vec![perception_row(
+                    "ax:B1",
+                    7_777,
+                    "Details",
+                    RectPt::new(100.0, 200.0, 40.0, 20.0),
+                )],
+            ),
+            None,
+            None,
+        );
+        // The same control after a re-walk: new eid, new position, same
+        // fingerprint (fp excludes value/frame by design).
+        registry().publish(
+            SnapshotRecord::new(
+                "ax:fresh1".into(),
+                window,
+                vec![perception_row(
+                    "ax:B7",
+                    7_777,
+                    "Details",
+                    RectPt::new(300.0, 400.0, 40.0, 20.0),
+                )],
+            ),
+            None,
+            None,
+        );
+
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 6]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let read_queries = Rc::new(RefCell::new(Vec::new()));
+        let perception = FakePerceptionTools {
+            feed_snapshot: "ax:fresh1".into(),
+            feed_block: "SNAP ax:fresh1 fresh block".into(),
+            read_queries: read_queries.clone(),
+        };
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![
+                Action::ClickEid {
+                    eid: "ax:B1".into(),
+                    snap: Some("ax:stale1".into()),
+                },
+                Action::Done,
+            ],
+            goals: Rc::new(RefCell::new(Vec::new())),
+        };
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(4),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &NoopGrounder,
+            &crate::agent::capture_tools::NoopCaptureEngine,
+            &perception,
+            &AgentAbortState::default(),
+        ));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        // One transparent re-read, pinned to the stale ref's window (its
+        // latest snapshot), never to whatever app is frontmost now.
+        assert_eq!(read_queries.borrow().len(), 1);
+        assert_eq!(
+            read_queries.borrow()[0].snapshot_id.as_deref(),
+            Some("ax:fresh1")
+        );
+        let step = &report.steps[0];
+        assert!(step.executed, "stale eid should re-acquire: {step:?}");
+        assert!(
+            events
+                .borrow()
+                .contains(&RecordedInput::Move(ClickPoint { x: 320, y: 410 })),
+            "expected a move to the FRESH frame center, got {:?}",
+            events.borrow()
+        );
+    }
+
+    /// Emits one scripted decision with a target_name intent — the lens for
+    /// asserting the intent gate covers eid-resolved targets.
+    struct EidIntentPlanner {
+        action: Action,
+        target_name: String,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for EidIntentPlanner {
+        async fn next_action(
+            &self,
+            _goal: &str,
+            _obs: &[Element],
+            _history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            PlannerDecision::new("intent stub", self.action.clone())
+                .with_target_intent(Some(self.target_name.clone()), None)
+        }
+    }
+
+    /// An eid click passes through the same target-intent gate as an id
+    /// click: naming one element and resolving another never executes.
+    #[test]
+    fn eid_click_with_mismatched_target_name_is_rejected_by_the_intent_gate() {
+        use crate::perception::ids::{registry, registry_test_guard, SnapshotRecord, WindowKey};
+        use crate::perception::RectPt;
+
+        let _guard = registry_test_guard();
+        registry().publish(
+            SnapshotRecord::new(
+                "ax:intent1".into(),
+                WindowKey::WindowId(818_181),
+                vec![perception_row(
+                    "ax:B1",
+                    5_151,
+                    "Details",
+                    RectPt::new(100.0, 200.0, 40.0, 20.0),
+                )],
+            ),
+            None,
+            None,
+        );
+
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 8]);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let perception = FakePerceptionTools {
+            feed_snapshot: "ax:intent1".into(),
+            feed_block: "unused".into(),
+            read_queries: Rc::new(RefCell::new(Vec::new())),
+        };
+        let planner = EidIntentPlanner {
+            action: Action::ClickEid {
+                eid: "ax:B1".into(),
+                snap: Some("ax:intent1".into()),
+            },
+            target_name: "Send Money".into(),
+        };
+        let report = block_on(run_stub_agent_loop_with_grounder(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(2),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: events.clone(),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &NoopGrounder,
+            &crate::agent::capture_tools::NoopCaptureEngine,
+            &perception,
+            &AgentAbortState::default(),
+        ));
+
+        assert!(
+            events.borrow().is_empty(),
+            "intent mismatch must never reach input synthesis, got {:?}",
+            events.borrow()
+        );
+        assert!(
+            report.steps.iter().all(|step| !step.executed),
+            "no step may execute on a name/id disagreement: {:?}",
+            report.steps
+        );
+    }
+
+    /// The fingerprint bridge refuses ambiguity: two fresh rows sharing the
+    /// stale element's fp (repeated UI) must not be guessed between.
+    #[test]
+    fn reresolve_eid_by_fingerprint_requires_unique_match() {
+        use crate::perception::ids::{registry, registry_test_guard, SnapshotRecord, WindowKey};
+        use crate::perception::RectPt;
+
+        let _guard = registry_test_guard();
+        let frame = RectPt::new(0.0, 0.0, 10.0, 10.0);
+        registry().publish(
+            SnapshotRecord::new(
+                "ax:fpold".into(),
+                WindowKey::WindowId(717_171),
+                vec![perception_row("ax:B1", 99, "Row", frame)],
+            ),
+            None,
+            None,
+        );
+        registry().publish(
+            SnapshotRecord::new(
+                "ax:fpunique".into(),
+                WindowKey::WindowId(717_172),
+                vec![
+                    perception_row("ax:B9", 99, "Row", frame),
+                    perception_row("ax:B10", 100, "Other", frame),
+                ],
+            ),
+            None,
+            None,
+        );
+        registry().publish(
+            SnapshotRecord::new(
+                "ax:fpdupes".into(),
+                WindowKey::WindowId(717_173),
+                vec![
+                    perception_row("ax:B9", 99, "Row", frame),
+                    perception_row("ax:B10", 99, "Row", frame),
+                ],
+            ),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            reresolve_eid_by_fingerprint("ax:B1", "ax:fpold", "ax:fpunique"),
+            Some("ax:B9".to_string())
+        );
+        assert_eq!(
+            reresolve_eid_by_fingerprint("ax:B1", "ax:fpold", "ax:fpdupes"),
+            None
+        );
+        assert_eq!(
+            reresolve_eid_by_fingerprint("ax:missing", "ax:fpold", "ax:fpunique"),
+            None
+        );
     }
 
     #[test]
@@ -12556,6 +13437,7 @@ mod tests {
                 current_milestone: 1,
                 notes: &notes,
                 page_excerpt: Some("Mac mini M2 $429 at B&H"),
+                perception_block: Some("SNAP ax:t1 app=com.apple.Safari win=\"B&H\" 1512x982pt scale=2 n=2 t=9ms\nax:B1 button \"Add to Cart\" (10,20 80x24) [press]"),
                 recovery_notice: Some("STUCK: stop clicking that"),
                 known_hints: Some(
                     "Known paths in this app (learned earlier; verify on screen): web inspector = menu Develop > Show Web Inspector (verified today)",
@@ -12605,6 +13487,12 @@ mod tests {
         assert!(goal.contains("Notes you saved earlier:\n- B&H refurb $429"));
         assert!(goal.contains("Page text"));
         assert!(goal.contains("Mac mini M2 $429 at B&H"));
+        assert!(goal.contains("Element index (from your last read"));
+        assert!(goal.contains("ax:B1 button \"Add to Cart\""));
+        // The element index renders after page text, before recovery.
+        let index_at = goal.find("Element index (from your last read").unwrap();
+        assert!(goal.find("Page text").unwrap() < index_at);
+        assert!(index_at < goal.find("Recovery:").unwrap());
         assert!(goal.contains("Recovery:\nSTUCK: stop clicking that"));
         assert!(goal.contains("Banned actions — do NOT propose these"));
         assert!(goal.contains("- click 'Send': repeated 3 times with no UI change"));
@@ -12617,6 +13505,7 @@ mod tests {
                 current_milestone: 0,
                 notes: &[],
                 page_excerpt: None,
+                perception_block: None,
                 recovery_notice: None,
                 known_hints: None,
                 memory_context: None,
@@ -12628,6 +13517,7 @@ mod tests {
         assert!(!bare.contains("Plan:"));
         assert!(!bare.contains("Notes you saved earlier:"));
         assert!(!bare.contains("Page text"));
+        assert!(!bare.contains("Element index"));
         assert!(!bare.contains("Recovery:"));
         assert!(!bare.contains("Known paths"));
         assert!(!bare.contains("Saved memories from previous runs"));
@@ -14611,6 +15501,7 @@ mod tests {
             &NoConfirmationRequester,
             &grounder,
             &crate::agent::capture_tools::NoopCaptureEngine,
+            &crate::agent::perception_tools::NoopPerceptionTools,
             &AgentAbortState::default(),
         ));
 
@@ -14669,6 +15560,7 @@ mod tests {
             &confirmations,
             &grounder,
             &crate::agent::capture_tools::NoopCaptureEngine,
+            &crate::agent::perception_tools::NoopPerceptionTools,
             &AgentAbortState::default(),
         ));
 
@@ -14721,6 +15613,7 @@ mod tests {
             &NoConfirmationRequester,
             &grounder,
             &crate::agent::capture_tools::NoopCaptureEngine,
+            &crate::agent::perception_tools::NoopPerceptionTools,
             &AgentAbortState::default(),
         ));
 
@@ -17155,6 +18048,7 @@ mod tests {
             &NoConfirmationRequester,
             &NoopGrounder,
             &engine,
+            &crate::agent::perception_tools::NoopPerceptionTools,
             &AgentAbortState::default(),
         ));
 
@@ -17205,6 +18099,7 @@ mod tests {
             &NoConfirmationRequester,
             &NoopGrounder,
             &engine,
+            &crate::agent::perception_tools::NoopPerceptionTools,
             &AgentAbortState::default(),
         ));
 
@@ -17248,6 +18143,7 @@ mod tests {
             &NoConfirmationRequester,
             &NoopGrounder,
             &engine,
+            &crate::agent::perception_tools::NoopPerceptionTools,
             &AgentAbortState::default(),
         ));
 
@@ -17286,6 +18182,7 @@ mod tests {
             &NoConfirmationRequester,
             &NoopGrounder,
             &engine,
+            &crate::agent::perception_tools::NoopPerceptionTools,
             &AgentAbortState::default(),
         ));
 
@@ -17337,6 +18234,7 @@ mod tests {
             &confirmations,
             &NoopGrounder,
             &engine,
+            &crate::agent::perception_tools::NoopPerceptionTools,
             &AgentAbortState::default(),
         ));
 

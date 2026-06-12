@@ -88,7 +88,8 @@ pub(crate) static ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         name: "click",
         aliases: &["left_click", "leftclick", "click_element", "tap"],
-        fields: &[req("id")],
+        // id or eid+snap — the parse arm enforces exactly one targeting form.
+        fields: &[opt("id"), opt("eid"), opt("snap")],
         batchable: true,
         gate: Gate::Always,
         requires_target_name: true,
@@ -112,7 +113,7 @@ pub(crate) static ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         name: "doubleClick",
         aliases: &["double_click"],
-        fields: &[req("id")],
+        fields: &[opt("id"), opt("eid"), opt("snap")],
         batchable: false,
         gate: Gate::Always,
         requires_target_name: true,
@@ -128,7 +129,7 @@ pub(crate) static ACTIONS: &[ActionSpec] = &[
             "set_text",
             "settext",
         ],
-        fields: &[req("id"), req("text")],
+        fields: &[opt("id"), req("text"), opt("eid"), opt("snap")],
         batchable: true,
         gate: Gate::Always,
         requires_target_name: true,
@@ -199,8 +200,10 @@ pub(crate) static ACTIONS: &[ActionSpec] = &[
         prompt_example: r#"{"reason":"brief reason","action":"webSearch","query":"refurbished mac mini"}"#,
     },
     ActionSpec {
+        // "read" used to be an alias here; it now names the perception-index
+        // read action below.
         name: "readPage",
-        aliases: &["read_page", "readpage", "read"],
+        aliases: &["read_page", "readpage"],
         fields: &[],
         batchable: false,
         gate: Gate::Always,
@@ -341,6 +344,30 @@ pub(crate) static ACTIONS: &[ActionSpec] = &[
         gate: Gate::Always,
         requires_target_name: false,
         prompt_example: r#"{"reason":"brief reason","action":"fail","reason_detail":"..."}"#,
+    },
+    ActionSpec {
+        name: "read",
+        aliases: &["read_elements", "readelements", "perception_read"],
+        fields: &[
+            opt("text"),
+            opt("roles"),
+            opt("actionable_only"),
+            opt("limit"),
+            opt("snap"),
+        ],
+        batchable: false,
+        gate: Gate::Always,
+        requires_target_name: false,
+        prompt_example: r#"{"reason":"find the export controls","action":"read","text":"export","actionable_only":true}"#,
+    },
+    ActionSpec {
+        name: "look",
+        aliases: &["look_at_screen", "perception_look"],
+        fields: &[opt("snap")],
+        batchable: false,
+        gate: Gate::Always,
+        requires_target_name: false,
+        prompt_example: r#"{"reason":"read found no matching elements","action":"look"}"#,
     },
 ];
 
@@ -491,7 +518,9 @@ mod tests {
                 "stopRecording",
                 "capturePermission",
                 "done",
-                "fail"
+                "fail",
+                "read",
+                "look"
             ]
         );
         assert_eq!(

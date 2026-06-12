@@ -528,6 +528,23 @@ pub enum Action {
     },
     DoubleClick { id: u32 },
     DoubleClickTarget { target: String },
+    /// click/doubleClick/type targeted by a perception-index element id
+    /// (`ax:B3`) plus its snapshot id. Resolved through the perception
+    /// registry in the planning loop, like ClickByText; `snap: None` falls
+    /// back to the snapshot of the planner's last read/look.
+    ClickEid {
+        eid: String,
+        snap: Option<String>,
+    },
+    DoubleClickEid {
+        eid: String,
+        snap: Option<String>,
+    },
+    TypeEid {
+        eid: String,
+        snap: Option<String>,
+        text: String,
+    },
     Type { id: u32, text: String },
     TypeTarget { target: String, text: String },
     TypeFocused { text: String },
@@ -548,6 +565,21 @@ pub enum Action {
     /// Extract the visible text of the focused page/window into the
     /// planner's next prompt. Emits no input events.
     ReadPage,
+    /// Query the perception index of the frontmost window (stale snapshots
+    /// re-capture automatically); the serialized SNAP block arrives in the
+    /// planner's next goal context. Read-only; emits no input events.
+    Read {
+        text: Option<String>,
+        /// Class letters ("B,T") or AX roles ("button, link"), comma-separated.
+        roles: Option<String>,
+        actionable_only: bool,
+        limit: Option<u32>,
+        snap: Option<String>,
+    },
+    /// Attach a set-of-marks frame of the indexed window to the planner's
+    /// next prompt; every box label is an element id valid with that SNAP.
+    /// Vision fallback for targets the index cannot show.
+    Look { snap: Option<String> },
     /// Search the frontmost app's saved hints, full menu-bar tree, and the
     /// current observation for a feature by name. Read-only; matches arrive
     /// in the step result. Emits no input events.
@@ -622,6 +654,24 @@ impl Serialize for Action {
                 2 + usize::from(role_hint.is_some()) + usize::from(nth.is_some())
             }
             Self::ScrollAt { .. } => 4,
+            Self::ClickEid { snap, .. } | Self::DoubleClickEid { snap, .. } => {
+                2 + usize::from(snap.is_some())
+            }
+            Self::TypeEid { snap, .. } => 3 + usize::from(snap.is_some()),
+            Self::Read {
+                text,
+                roles,
+                actionable_only,
+                limit,
+                snap,
+            } => {
+                1 + usize::from(text.is_some())
+                    + usize::from(roles.is_some())
+                    + usize::from(*actionable_only)
+                    + usize::from(limit.is_some())
+                    + usize::from(snap.is_some())
+            }
+            Self::Look { snap } => 1 + usize::from(snap.is_some()),
         };
         let mut state = serializer.serialize_struct("Action", field_count)?;
         match self {
@@ -658,6 +708,28 @@ impl Serialize for Action {
             Self::DoubleClickTarget { target } => {
                 state.serialize_field("action", "doubleClick")?;
                 state.serialize_field("target", target)?;
+            }
+            Self::ClickEid { eid, snap } => {
+                state.serialize_field("action", "click")?;
+                state.serialize_field("eid", eid)?;
+                if let Some(snap) = snap {
+                    state.serialize_field("snap", snap)?;
+                }
+            }
+            Self::DoubleClickEid { eid, snap } => {
+                state.serialize_field("action", "doubleClick")?;
+                state.serialize_field("eid", eid)?;
+                if let Some(snap) = snap {
+                    state.serialize_field("snap", snap)?;
+                }
+            }
+            Self::TypeEid { eid, snap, text } => {
+                state.serialize_field("action", "type")?;
+                state.serialize_field("eid", eid)?;
+                if let Some(snap) = snap {
+                    state.serialize_field("snap", snap)?;
+                }
+                state.serialize_field("text", text)?;
             }
             Self::Type { id, text } => {
                 state.serialize_field("action", "type")?;
@@ -719,6 +791,36 @@ impl Serialize for Action {
             }
             Self::ReadPage => {
                 state.serialize_field("action", "readPage")?;
+            }
+            Self::Read {
+                text,
+                roles,
+                actionable_only,
+                limit,
+                snap,
+            } => {
+                state.serialize_field("action", "read")?;
+                if let Some(text) = text {
+                    state.serialize_field("text", text)?;
+                }
+                if let Some(roles) = roles {
+                    state.serialize_field("roles", roles)?;
+                }
+                if *actionable_only {
+                    state.serialize_field("actionable_only", actionable_only)?;
+                }
+                if let Some(limit) = limit {
+                    state.serialize_field("limit", limit)?;
+                }
+                if let Some(snap) = snap {
+                    state.serialize_field("snap", snap)?;
+                }
+            }
+            Self::Look { snap } => {
+                state.serialize_field("action", "look")?;
+                if let Some(snap) = snap {
+                    state.serialize_field("snap", snap)?;
+                }
             }
             Self::FindUi { query } => {
                 state.serialize_field("action", "findUi")?;
@@ -814,6 +916,11 @@ impl<'de> Deserialize<'de> for Action {
             nth: Option<u32>,
             scope: Option<String>,
             seconds: Option<u64>,
+            eid: Option<String>,
+            snap: Option<String>,
+            roles: Option<String>,
+            actionable_only: Option<bool>,
+            limit: Option<u32>,
             x: Option<serde_json::Value>,
             y: Option<serde_json::Value>,
         }
@@ -874,6 +981,11 @@ impl<'de> Deserialize<'de> for Action {
             ("nth", raw.nth.is_some()),
             ("scope", raw.scope.is_some()),
             ("seconds", raw.seconds.is_some()),
+            ("eid", raw.eid.is_some()),
+            ("snap", raw.snap.is_some()),
+            ("roles", raw.roles.is_some()),
+            ("actionable_only", raw.actionable_only.is_some()),
+            ("limit", raw.limit.is_some()),
         ];
 
         fn parse_scope<E>(scope: Option<String>) -> Result<CaptureScope, E>
@@ -897,16 +1009,22 @@ impl<'de> Deserialize<'de> for Action {
                 Ok(Self::ActivateApp { app })
             }
             "click" => {
-                reject_extra::<D::Error>(&raw.action, &present, &["id", "target"])?;
-                match (raw.id, raw.target) {
-                    (Some(id), None) => Ok(Self::Click { id }),
-                    (None, Some(target)) => Ok(Self::ClickTarget {
+                reject_extra::<D::Error>(&raw.action, &present, &["id", "target", "eid", "snap"])?;
+                match (raw.id, raw.target, raw.eid) {
+                    (Some(id), None, None) => Ok(Self::Click { id }),
+                    (None, Some(target), None) => Ok(Self::ClickTarget {
                         target: required_string::<D::Error>("target", Some(target))?,
                     }),
-                    (Some(_), Some(_)) => Err(serde::de::Error::custom(
-                        "click requires either id or target, not both",
+                    (None, None, Some(eid)) => Ok(Self::ClickEid {
+                        eid: validated_eid(&eid).map_err(serde::de::Error::custom)?,
+                        snap: validated_snap(raw.snap).map_err(serde::de::Error::custom)?,
+                    }),
+                    (None, None, None) => {
+                        Err(serde::de::Error::custom("click requires id, target, or eid"))
+                    }
+                    _ => Err(serde::de::Error::custom(
+                        "click requires exactly one of id, target, or eid",
                     )),
-                    (None, None) => Err(serde::de::Error::custom("click requires id or target")),
                 }
             }
             "clickText" | "click_text" => {
@@ -918,35 +1036,50 @@ impl<'de> Deserialize<'de> for Action {
                 })
             }
             "doubleClick" | "double_click" => {
-                reject_extra::<D::Error>(&raw.action, &present, &["id", "target"])?;
-                match (raw.id, raw.target) {
-                    (Some(id), None) => Ok(Self::DoubleClick { id }),
-                    (None, Some(target)) => Ok(Self::DoubleClickTarget {
+                reject_extra::<D::Error>(&raw.action, &present, &["id", "target", "eid", "snap"])?;
+                match (raw.id, raw.target, raw.eid) {
+                    (Some(id), None, None) => Ok(Self::DoubleClick { id }),
+                    (None, Some(target), None) => Ok(Self::DoubleClickTarget {
                         target: required_string::<D::Error>("target", Some(target))?,
                     }),
-                    (Some(_), Some(_)) => Err(serde::de::Error::custom(
-                        "doubleClick requires either id or target, not both",
+                    (None, None, Some(eid)) => Ok(Self::DoubleClickEid {
+                        eid: validated_eid(&eid).map_err(serde::de::Error::custom)?,
+                        snap: validated_snap(raw.snap).map_err(serde::de::Error::custom)?,
+                    }),
+                    (None, None, None) => Err(serde::de::Error::custom(
+                        "doubleClick requires id, target, or eid",
                     )),
-                    (None, None) => Err(serde::de::Error::custom(
-                        "doubleClick requires id or target",
+                    _ => Err(serde::de::Error::custom(
+                        "doubleClick requires exactly one of id, target, or eid",
                     )),
                 }
             }
             "type" => {
-                reject_extra::<D::Error>(&raw.action, &present, &["id", "target", "text"])?;
+                reject_extra::<D::Error>(
+                    &raw.action,
+                    &present,
+                    &["id", "target", "text", "eid", "snap"],
+                )?;
                 let text = raw
                     .text
                     .ok_or_else(|| serde::de::Error::custom("type requires text"))?;
-                match (raw.id, raw.target) {
-                    (Some(id), None) => Ok(Self::Type { id, text }),
-                    (None, Some(target)) => Ok(Self::TypeTarget {
+                match (raw.id, raw.target, raw.eid) {
+                    (Some(id), None, None) => Ok(Self::Type { id, text }),
+                    (None, Some(target), None) => Ok(Self::TypeTarget {
                         target: required_string::<D::Error>("target", Some(target))?,
                         text,
                     }),
-                    (Some(_), Some(_)) => Err(serde::de::Error::custom(
-                        "type requires either id or target, not both",
+                    (None, None, Some(eid)) => Ok(Self::TypeEid {
+                        eid: validated_eid(&eid).map_err(serde::de::Error::custom)?,
+                        snap: validated_snap(raw.snap).map_err(serde::de::Error::custom)?,
+                        text,
+                    }),
+                    (None, None, None) => {
+                        Err(serde::de::Error::custom("type requires id, target, or eid"))
+                    }
+                    _ => Err(serde::de::Error::custom(
+                        "type requires exactly one of id, target, or eid",
                     )),
-                    (None, None) => Err(serde::de::Error::custom("type requires id or target")),
                 }
             }
             "typeFocused" | "type_focused" => {
@@ -1037,6 +1170,26 @@ impl<'de> Deserialize<'de> for Action {
             "readPage" | "read_page" => {
                 reject_extra::<D::Error>(&raw.action, &present, &[])?;
                 Ok(Self::ReadPage)
+            }
+            "read" => {
+                reject_extra::<D::Error>(
+                    &raw.action,
+                    &present,
+                    &["text", "roles", "actionable_only", "limit", "snap"],
+                )?;
+                Ok(Self::Read {
+                    text: trimmed_optional(raw.text),
+                    roles: trimmed_optional(raw.roles),
+                    actionable_only: raw.actionable_only.unwrap_or(false),
+                    limit: raw.limit.filter(|limit| *limit >= 1),
+                    snap: validated_snap(raw.snap).map_err(serde::de::Error::custom)?,
+                })
+            }
+            "look" => {
+                reject_extra::<D::Error>(&raw.action, &present, &["snap"])?;
+                Ok(Self::Look {
+                    snap: validated_snap(raw.snap).map_err(serde::de::Error::custom)?,
+                })
             }
             "findUi" | "find_ui" => {
                 reject_extra::<D::Error>(&raw.action, &present, &["query"])?;
@@ -1136,6 +1289,44 @@ where
         .ok_or_else(|| E::custom(format!("{field} is required")))
 }
 
+fn trimmed_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// A snapshot ref must carry its namespace prefix too (`ax:k7f3a`); free
+/// text here means the model hallucinated the scope instead of copying the
+/// SNAP header.
+pub(crate) fn validated_snap(value: Option<String>) -> Result<Option<String>, String> {
+    match value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(None),
+        Some(snap) if snap.contains(':') => Ok(Some(snap)),
+        Some(snap) => Err(format!(
+            "snap must be the SNAP id from a read header (like ax:k7f3a), got '{snap}'"
+        )),
+    }
+}
+
+/// A perception element id must carry its namespace prefix (`ax:B3`); the
+/// resolver dispatches on it (C4).
+pub(crate) fn validated_eid(eid: &str) -> Result<String, String> {
+    let eid = eid.trim();
+    let namespaced = eid
+        .split_once(':')
+        .is_some_and(|(ns, rest)| !ns.is_empty() && !rest.is_empty());
+    if namespaced {
+        Ok(eid.to_string())
+    } else {
+        Err(format!(
+            "eid must be a namespaced element id like ax:B3, got '{eid}'"
+        ))
+    }
+}
+
 impl Action {
     pub fn from_json_strict(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
@@ -1158,6 +1349,9 @@ impl Action {
             | Self::ClickByText { .. }
             | Self::ClickTarget { .. }
             | Self::DoubleClickTarget { .. }
+            | Self::ClickEid { .. }
+            | Self::DoubleClickEid { .. }
+            | Self::TypeEid { .. }
             | Self::TypeTarget { .. }
             | Self::TypeFocused { .. }
             | Self::Key { .. }
@@ -1167,6 +1361,8 @@ impl Action {
             | Self::OpenUrl { .. }
             | Self::WebSearch { .. }
             | Self::ReadPage
+            | Self::Read { .. }
+            | Self::Look { .. }
             | Self::FindUi { .. }
             | Self::WebLookup { .. }
             | Self::Ask { .. }
@@ -1195,6 +1391,9 @@ impl Action {
             Self::ClickTarget { target }
             | Self::DoubleClickTarget { target }
             | Self::TypeTarget { target, .. } => Some(ActionTargetRef::Target(target.clone())),
+            Self::ClickEid { eid, .. }
+            | Self::DoubleClickEid { eid, .. }
+            | Self::TypeEid { eid, .. } => Some(ActionTargetRef::Target(eid.clone())),
             _ => None,
         }
     }
