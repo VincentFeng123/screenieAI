@@ -27,6 +27,9 @@ export default function PlaybooksManager() {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState<string | null>(
+    null,
+  );
 
   const refresh = useCallback(() => {
     invoke<PlaybookMeta[]>("list_playbooks")
@@ -66,7 +69,14 @@ export default function PlaybooksManager() {
       .finally(() => setBusy(false));
   };
 
+  // Deleting a user file is irreversible (a shadowed built-in reappears,
+  // a user playbook is gone): the first click arms, the second executes.
   const remove = (name: string) => {
+    if (confirmingDelete !== name) {
+      setConfirmingDelete(name);
+      return;
+    }
+    setConfirmingDelete(null);
     setBusy(true);
     setError(null);
     invoke("delete_playbook", { name })
@@ -130,8 +140,13 @@ export default function PlaybooksManager() {
                 className="settings-button settings-button-danger"
                 disabled={busy}
                 onClick={() => remove(playbook.name)}
+                onBlur={() => setConfirmingDelete(null)}
               >
-                {playbook.overridden ? "Revert" : "Delete"}
+                {confirmingDelete === playbook.name
+                  ? "Click to confirm"
+                  : playbook.overridden
+                    ? "Revert"
+                    : "Delete"}
               </button>
             )}
             <button

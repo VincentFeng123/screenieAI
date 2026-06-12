@@ -12,8 +12,9 @@
 //!   only when the goal matches, never globally.
 //! - Every write surfaces to the user as an audit card with a delete path.
 
-use super::hints::now_ms;
 use super::search::score_match;
+#[cfg(test)]
+use super::hints::now_ms;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs;

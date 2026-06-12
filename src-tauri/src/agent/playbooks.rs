@@ -343,19 +343,26 @@ impl PlaybookStore {
 
     /// Path of the user file whose frontmatter name matches, regardless of
     /// its filename (hand-created files may not follow the sanitized name).
+    /// Sorted scan with last-match-wins, mirroring `load_all`'s shadowing
+    /// order so management ops act on the same file the agent loads.
     fn user_file_for(&self, name: &str) -> Option<PathBuf> {
         let dir = self.dir.as_ref()?;
-        fs::read_dir(dir)
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
             .ok()?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-            .find(|path| {
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .filter(|path| {
                 fs::read_to_string(path)
                     .ok()
                     .and_then(|raw| parse_playbook(&raw))
                     .is_some_and(|playbook| playbook.name == name)
             })
+            .next_back()
     }
 }
 

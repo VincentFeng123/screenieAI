@@ -20,6 +20,8 @@ function age(createdAtMs: number): string {
 export default function AgentMemoryList() {
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirmingClear, setConfirmingClear] = useState(false);
 
   const refresh = useCallback(() => {
     invoke<MemoryEntry[]>("list_agent_memory")
@@ -32,15 +34,27 @@ export default function AgentMemoryList() {
   }, [refresh]);
 
   const remove = (id: string) => {
+    if (busy) return;
+    setBusy(true);
     invoke("delete_agent_memory", { id })
       .then(refresh)
-      .catch((err) => setError(String(err)));
+      .catch((err) => setError(String(err)))
+      .finally(() => setBusy(false));
   };
 
+  // Irreversible bulk wipe: the first click arms, the second executes.
   const clear = () => {
+    if (!confirmingClear) {
+      setConfirmingClear(true);
+      return;
+    }
+    setConfirmingClear(false);
+    if (busy) return;
+    setBusy(true);
     invoke("clear_agent_memory")
       .then(refresh)
-      .catch((err) => setError(String(err)));
+      .catch((err) => setError(String(err)))
+      .finally(() => setBusy(false));
   };
 
   if (entries.length === 0) {
@@ -68,6 +82,7 @@ export default function AgentMemoryList() {
           <div className="settings-control playbooks-actions">
             <button
               className="settings-button settings-button-danger"
+              disabled={busy}
               onClick={() => remove(entry.id)}
             >
               Forget
@@ -76,8 +91,13 @@ export default function AgentMemoryList() {
         </div>
       ))}
       <div className="playbooks-footer">
-        <button className="settings-button settings-button-danger" onClick={clear}>
-          Forget all
+        <button
+          className="settings-button settings-button-danger"
+          disabled={busy}
+          onClick={clear}
+          onBlur={() => setConfirmingClear(false)}
+        >
+          {confirmingClear ? "Click again to forget all" : "Forget all"}
         </button>
       </div>
       {error && <p className="playbooks-error">{error}</p>}

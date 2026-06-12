@@ -2037,10 +2037,17 @@ where
             observation_metadata = observer.observation_metadata();
         }
 
+        let from_queue = queued.pop_front();
+        let planned_fresh = from_queue.is_none();
+
         let history_overflow = history
             .len()
             .saturating_sub(super::planner::MAX_HISTORY_ENTRIES_IN_PROMPT);
-        if history_overflow >= summarized_through + SUMMARIZE_HISTORY_EVERY_OVERFLOWED {
+        // Fresh steps only: a batched follow-up's contract is zero model
+        // calls, so a fold crossing the boundary there waits one step.
+        if planned_fresh
+            && history_overflow >= summarized_through + SUMMARIZE_HISTORY_EVERY_OVERFLOWED
+        {
             if let Some(summary) = planner
                 .summarize_history(
                     progress_summary.as_deref(),
@@ -2089,8 +2096,6 @@ where
         } else {
             GroundingMode::OnePass
         };
-        let from_queue = queued.pop_front();
-        let planned_fresh = from_queue.is_none();
         let mut decision_followups: Vec<Action> = Vec::new();
         let (
             action,
@@ -16035,11 +16040,10 @@ mod tests {
         }
     }
 
-    /// Emits one scripted decision (typically done-with-remember) while
-    /// recording goals, for the cross-run memory tests.
+    /// Emits scripted (action, remember) decisions indexed by history length
+    /// while recording goals, for the cross-run memory tests.
     struct RememberingPlanner {
-        decision_remember: Option<String>,
-        terminal: Action,
+        decisions: Vec<(Action, Option<String>)>,
         goals: Rc<RefCell<Vec<String>>>,
     }
 
@@ -16049,11 +16053,16 @@ mod tests {
             &self,
             goal: &str,
             _obs: &[Element],
-            _history: &[PlannerHistoryEntry],
+            history: &[PlannerHistoryEntry],
         ) -> PlannerDecision {
             self.goals.borrow_mut().push(goal.to_string());
-            PlannerDecision::new("remembering stub", self.terminal.clone())
-                .with_remember(self.decision_remember.clone())
+            let (action, remember) = self
+                .decisions
+                .get(history.len())
+                .or_else(|| self.decisions.last())
+                .cloned()
+                .expect("planner needs at least one decision");
+            PlannerDecision::new("remembering stub", action).with_remember(remember)
         }
     }
 
@@ -16081,11 +16090,10 @@ mod tests {
         }
     }
 
-    fn memory_run(
+    fn memory_run_with_decisions(
         memory_dir: &std::path::Path,
         goal: &str,
-        terminal: Action,
-        remember: Option<String>,
+        decisions: Vec<(Action, Option<String>)>,
     ) -> (
         Rc<RefCell<Vec<String>>>,
         Rc<RefCell<Vec<MemoryEntry>>>,
@@ -16094,15 +16102,14 @@ mod tests {
         let goals = Rc::new(RefCell::new(Vec::<String>::new()));
         let saved = Rc::new(RefCell::new(Vec::<MemoryEntry>::new()));
         let report = block_on(run_stub_agent_loop(
-            &FakeObserver::new(vec![Ok(vec![element(1, "Anything")]); 3]),
+            &FakeObserver::new(vec![Ok(vec![element(1, "Anything")]); 8]),
             &RememberingPlanner {
-                decision_remember: remember,
-                terminal,
+                decisions,
                 goals: goals.clone(),
             },
             StubAgentOptions {
                 execution_policy: Some(ExecutionPolicy::Auto),
-                max_steps: Some(2),
+                max_steps: Some(3),
                 settle_ms: Some(0),
                 stable_settle_timeout_ms: Some(0),
                 stable_settle_poll_ms: Some(1),
@@ -16121,6 +16128,19 @@ mod tests {
             &AgentAbortState::default(),
         ));
         (goals, saved, report)
+    }
+
+    fn memory_run(
+        memory_dir: &std::path::Path,
+        goal: &str,
+        terminal: Action,
+        remember: Option<String>,
+    ) -> (
+        Rc<RefCell<Vec<String>>>,
+        Rc<RefCell<Vec<MemoryEntry>>>,
+        AgentRunReport,
+    ) {
+        memory_run_with_decisions(memory_dir, goal, vec![(terminal, remember)])
     }
 
     #[test]
@@ -16169,6 +16189,31 @@ mod tests {
         let (goals, _, _) = memory_run(&dir, "compare mac mini prices again", Action::Done, None);
         assert!(goals.borrow()[0].contains("Saved memories from previous runs"));
         assert!(goals.borrow()[0].contains("B&H beats Amazon on refurb mac minis"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_on_an_earlier_step_never_leaks_into_done() {
+        let dir = std::env::temp_dir().join(format!(
+            "screenie-exec-memory-stale-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Decision 1 (a click) smuggles a remember; the Done decision carries
+        // none. pending_remember is per-decision, so nothing may persist.
+        let (_, saved, report) = memory_run_with_decisions(
+            &dir,
+            "click around",
+            vec![
+                (Action::Click { id: 1 }, Some("stale takeaway".into())),
+                (Action::Done, None),
+            ],
+        );
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(saved.borrow().is_empty());
+        assert!(MemoryStore::new(Some(dir.clone())).list().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
