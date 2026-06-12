@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Screen AI lens — hotkey-triggered region capture + AI analysis"
 authors = ["Vincent Feng"]
 edition = "2021"
+# The see_probe dev binary makes `cargo run` ambiguous; tauri dev needs the app.
+default-run = "screenieai"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
