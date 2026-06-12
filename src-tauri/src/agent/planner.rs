@@ -351,6 +351,14 @@ where
     async fn plan_milestones(&self, goal: &str) -> Vec<String> {
         request_milestones(&self.client, goal).await
     }
+
+    async fn summarize_history(
+        &self,
+        previous: Option<&str>,
+        overflow: &[PlannerHistoryEntry],
+    ) -> Option<String> {
+        request_history_summary(&self.client, previous, overflow).await
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -470,6 +478,14 @@ where
 
     async fn plan_milestones(&self, goal: &str) -> Vec<String> {
         request_milestones(&self.text_client, goal).await
+    }
+
+    async fn summarize_history(
+        &self,
+        previous: Option<&str>,
+        overflow: &[PlannerHistoryEntry],
+    ) -> Option<String> {
+        request_history_summary(&self.text_client, previous, overflow).await
     }
 
     fn web_lookup_available(&self) -> bool {
@@ -980,6 +996,69 @@ pub(crate) fn parse_milestones(raw_output: &str) -> Vec<String> {
         .collect()
 }
 
+const HISTORY_SUMMARY_SYSTEM_PROMPT: &str = "Fold the agent's earlier steps into ONE running progress summary under 600 characters: what was accomplished, key facts learned (names, prices, URLs), and what failed and must not be retried. Merge the previous summary with the new steps, keeping only what still matters for finishing the goal. Return only JSON: {\"summary\":\"...\"}.";
+
+pub(crate) const MAX_HISTORY_SUMMARY_CHARS: usize = 600;
+
+pub(crate) fn history_summary_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary"],
+        "properties": {
+            "summary": { "type": "string", "maxLength": MAX_HISTORY_SUMMARY_CHARS }
+        }
+    })
+}
+
+/// One-shot fold of history entries that fell out of the prompt window into
+/// a rolling summary. Failure-tolerant like milestones: any request or parse
+/// error yields `None` and the run keeps its previous summary.
+pub(crate) async fn request_history_summary<C>(
+    client: &C,
+    previous: Option<&str>,
+    overflow: &[PlannerHistoryEntry],
+) -> Option<String>
+where
+    C: PlannerLlmClient,
+{
+    if overflow.is_empty() {
+        return None;
+    }
+    let mut user_prompt = String::new();
+    if let Some(previous) = previous {
+        user_prompt.push_str("Previous summary:\n");
+        user_prompt.push_str(previous);
+        user_prompt.push_str("\n\n");
+    }
+    user_prompt.push_str("Steps to fold in:\n");
+    for (index, entry) in overflow.iter().enumerate() {
+        user_prompt.push_str(&history_entry_line(index, entry));
+        user_prompt.push('\n');
+    }
+    let prompt = ai::decision::DecisionPrompt {
+        system_prompt: HISTORY_SUMMARY_SYSTEM_PROMPT.to_string(),
+        user_prompt,
+        schema: history_summary_response_schema(),
+    };
+    match client.complete(prompt).await {
+        Ok(raw) => parse_history_summary(&raw),
+        Err(err) => {
+            eprintln!("[screenie] agent history summarization failed: {err}");
+            None
+        }
+    }
+}
+
+pub(crate) fn parse_history_summary(raw_output: &str) -> Option<String> {
+    let json_text = strip_markdown_fences(raw_output);
+    let value = parse_json_value_tolerant(&json_text).ok()?;
+    normalize_optional_field(
+        value.get("summary").and_then(Value::as_str),
+        MAX_HISTORY_SUMMARY_CHARS,
+    )
+}
+
 /// The registry's taught example for an action; prompt assembly may only
 /// reference actions the registry knows.
 fn action_example(name: &str) -> &'static str {
@@ -1325,7 +1404,7 @@ fn build_grounding_vision_user_prompt(
     prompt
 }
 
-const MAX_HISTORY_ENTRIES_IN_PROMPT: usize = 12;
+pub(crate) const MAX_HISTORY_ENTRIES_IN_PROMPT: usize = 12;
 
 fn format_history(history: &[PlannerHistoryEntry]) -> String {
     if history.is_empty() {
@@ -1338,31 +1417,37 @@ fn format_history(history: &[PlannerHistoryEntry]) -> String {
         lines.push(format!("({omitted} earlier step(s) omitted)"));
     }
     for (index, entry) in history.iter().enumerate().skip(omitted) {
-        let mut action = entry
-            .action
-            .to_json()
-            .unwrap_or_else(|_| format!("{:?}", entry.action));
-        // Executed id-actions render with the target_name echo the contract
-        // requires, so history never models the forbidden bare-id shape.
-        if let Some(name) = entry.target_name.as_deref() {
-            if action.ends_with('}') && !action.contains("\"target_name\"") {
-                if let Ok(escaped) = serde_json::to_string(name) {
-                    action.pop();
-                    action.push_str(",\"target_name\":");
-                    action.push_str(&escaped);
-                    action.push('}');
-                }
-            }
-        }
-        lines.push(format!(
-            "{}. {} reason=\"{}\" result=\"{}\"",
-            index + 1,
-            action,
-            escape_compact_field(&entry.reason),
-            escape_result_field(&entry.result)
-        ));
+        lines.push(history_entry_line(index, entry));
     }
     lines.join("\n")
+}
+
+/// One compact history line, shared by the decision prompt and the
+/// history-summary fold so both render entries identically.
+fn history_entry_line(index: usize, entry: &PlannerHistoryEntry) -> String {
+    let mut action = entry
+        .action
+        .to_json()
+        .unwrap_or_else(|_| format!("{:?}", entry.action));
+    // Executed id-actions render with the target_name echo the contract
+    // requires, so history never models the forbidden bare-id shape.
+    if let Some(name) = entry.target_name.as_deref() {
+        if action.ends_with('}') && !action.contains("\"target_name\"") {
+            if let Ok(escaped) = serde_json::to_string(name) {
+                action.pop();
+                action.push_str(",\"target_name\":");
+                action.push_str(&escaped);
+                action.push('}');
+            }
+        }
+    }
+    format!(
+        "{}. {} reason=\"{}\" result=\"{}\"",
+        index + 1,
+        action,
+        escape_compact_field(&entry.reason),
+        escape_result_field(&entry.result)
+    )
 }
 
 fn format_observation(obs: &[Element]) -> String {
@@ -3640,6 +3725,26 @@ mod tests {
         assert_eq!(plain.note, None);
         assert_eq!(plain.expect, None);
         assert!(!plain.milestone_done);
+    }
+
+    #[test]
+    fn parse_history_summary_tolerates_fences_and_rejects_garbage() {
+        assert_eq!(
+            parse_history_summary(r#"{"summary":"Opened the site and saved two prices."}"#),
+            Some("Opened the site and saved two prices.".to_string())
+        );
+        assert_eq!(
+            parse_history_summary("```json\n{\"summary\":\"Folded.\"}\n```"),
+            Some("Folded.".to_string())
+        );
+        // Over-length summaries are truncated, not rejected.
+        let long = "x".repeat(MAX_HISTORY_SUMMARY_CHARS + 50);
+        let parsed = parse_history_summary(&format!(r#"{{"summary":"{long}"}}"#)).unwrap();
+        assert!(parsed.chars().count() <= MAX_HISTORY_SUMMARY_CHARS);
+        // Garbage and empties degrade to None.
+        assert_eq!(parse_history_summary("not json"), None);
+        assert_eq!(parse_history_summary(r#"{"summary":"   "}"#), None);
+        assert_eq!(parse_history_summary(r#"{"other":"field"}"#), None);
     }
 
     #[test]

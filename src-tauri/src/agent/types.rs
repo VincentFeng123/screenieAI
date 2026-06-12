@@ -1305,6 +1305,17 @@ pub trait Planner {
         Vec::new()
     }
 
+    /// Fold history entries that fell out of the prompt window into a
+    /// rolling progress summary carried in the goal block. The default
+    /// (stub and test planners) returns `None`, which disables compaction.
+    async fn summarize_history(
+        &self,
+        _previous: Option<&str>,
+        _overflow: &[PlannerHistoryEntry],
+    ) -> Option<String> {
+        None
+    }
+
     /// Whether the webLookup action can actually run this turn: the user's
     /// toggle is on AND the text provider supports server-side web search.
     /// The executor uses this for graceful rung descent.

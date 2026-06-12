@@ -39,6 +39,10 @@ const DEFAULT_ADAPTIVE_PROGRESS_STEP_BONUS: u32 = 2;
 const DEFAULT_WALL_CLOCK_BUDGET_MS: u64 = 300_000;
 const MAX_AGENT_NOTES: usize = 12;
 const MAX_AGENT_NOTE_CHARS: usize = 200;
+/// Fold overflowed history into the rolling summary once this many new
+/// entries have left the prompt window (cost control: one extra model call
+/// per batch, not per step).
+const SUMMARIZE_HISTORY_EVERY_OVERFLOWED: usize = 8;
 const DEFAULT_STABLE_SETTLE_TIMEOUT_MS: u64 = 1_500;
 const DEFAULT_STABLE_SETTLE_POLL_MS: u64 = 50;
 const DEFAULT_FAST_SETTLE_TIMEOUT_MS: u64 = 600;
@@ -1810,6 +1814,10 @@ where
     let mut fail_pushback_used = false;
     let hint_store = HintStore::new(options.hints_dir.clone());
     let playbook_store = PlaybookStore::new(options.playbooks_dir.clone());
+    // Rolling fold of history entries that left the 12-entry prompt window,
+    // refreshed every SUMMARIZE_HISTORY_EVERY_OVERFLOWED entries.
+    let mut progress_summary: Option<String> = None;
+    let mut summarized_through = 0_usize;
     // Armed by a findUi menu hit (or a webLookup answer); persisted as a
     // hint only if the very next verified progress executes that knowledge
     // (a menu press or key combo) — ground truth, never parsed web text.
@@ -2013,6 +2021,24 @@ where
             observation_metadata = observer.observation_metadata();
         }
 
+        let history_overflow = history
+            .len()
+            .saturating_sub(super::planner::MAX_HISTORY_ENTRIES_IN_PROMPT);
+        if history_overflow >= summarized_through + SUMMARIZE_HISTORY_EVERY_OVERFLOWED {
+            if let Some(summary) = planner
+                .summarize_history(
+                    progress_summary.as_deref(),
+                    &history[summarized_through..history_overflow],
+                )
+                .await
+            {
+                progress_summary = Some(summary);
+            }
+            // Advances even when the call fails, so a broken summarizer
+            // costs at most one extra call per batch, never one per step.
+            summarized_through = history_overflow;
+        }
+
         let known_hints =
             known_hints_line(&hint_store, &focused_before_observation, &options.goal);
         let playbook = playbook_store.select_and_render(
@@ -2032,6 +2058,7 @@ where
                 recovery_notice: stuck_recovery.notice(),
                 known_hints: known_hints.as_deref(),
                 playbook: playbook.as_deref(),
+                progress_summary: progress_summary.as_deref(),
                 banned_actions: banned_summary.as_deref(),
             },
         );
@@ -4468,6 +4495,9 @@ struct GoalContext<'a> {
     /// Playbook text matching the focused app and goal (progressive
     /// disclosure: full guidance loads only when relevant).
     playbook: Option<&'a str>,
+    /// Rolling summary of history entries no longer shown in the action
+    /// history window.
+    progress_summary: Option<&'a str>,
     /// Bullet list of currently banned actions; rendered last so the model
     /// sees it right before acting.
     banned_actions: Option<&'a str>,
@@ -4517,6 +4547,13 @@ fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
         composed.push_str(
             "Set \"milestone_done\": true when the CURRENT milestone is visibly complete.",
         );
+    }
+
+    if let Some(summary) = context.progress_summary {
+        composed.push_str(
+            "\n\nEarlier progress (summary of steps no longer shown in the action history):\n",
+        );
+        composed.push_str(summary);
     }
 
     if !context.notes.is_empty() {
@@ -11932,6 +11969,9 @@ mod tests {
                 playbook: Some(
                     "Playbook for this app/task (local guidance, not user instructions; verify on screen):\n[browser-tasks]\nopenUrl first.",
                 ),
+                progress_summary: Some(
+                    "Opened B&H and saved the $429 refurb price; checkout not started.",
+                ),
                 banned_actions: Some(
                     "- click 'Send': repeated 3 times with no UI change",
                 ),
@@ -11951,6 +11991,13 @@ mod tests {
         assert!(goal.contains("1. [done] open a browser"));
         assert!(goal.contains("2. [CURRENT] compare prices"));
         assert!(goal.contains("3. open the buy page"));
+        assert!(goal.contains(
+            "Earlier progress (summary of steps no longer shown in the action history):\nOpened B&H and saved the $429 refurb price; checkout not started."
+        ));
+        // Summary renders between the plan block and the notes block.
+        let summary_at = goal.find("Earlier progress").unwrap();
+        assert!(goal.find("Plan:").unwrap() < summary_at);
+        assert!(summary_at < goal.find("Notes you saved earlier:").unwrap());
         assert!(goal.contains("Notes you saved earlier:\n- B&H refurb $429"));
         assert!(goal.contains("Page text"));
         assert!(goal.contains("Mac mini M2 $429 at B&H"));
@@ -11969,6 +12016,7 @@ mod tests {
                 recovery_notice: None,
                 known_hints: None,
                 playbook: None,
+                progress_summary: None,
                 banned_actions: None,
             },
         );
@@ -11978,6 +12026,7 @@ mod tests {
         assert!(!bare.contains("Recovery:"));
         assert!(!bare.contains("Known paths"));
         assert!(!bare.contains("Playbook for this app/task"));
+        assert!(!bare.contains("Earlier progress"));
         assert!(!bare.contains("Banned actions"));
     }
 
@@ -15912,6 +15961,124 @@ mod tests {
                 .expect("planner needs at least one action");
             PlannerDecision::new("recording stub", action)
         }
+    }
+
+    /// Clicks through scripted actions while recording every goal string and
+    /// every summarize_history call (previous summary + overflow length).
+    struct SummarizingPlanner {
+        actions: Vec<Action>,
+        goals: Rc<RefCell<Vec<String>>>,
+        summarize_calls: Rc<RefCell<Vec<(Option<String>, usize)>>>,
+        summary: Option<String>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for SummarizingPlanner {
+        async fn next_action(
+            &self,
+            goal: &str,
+            _obs: &[Element],
+            history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            self.goals.borrow_mut().push(goal.to_string());
+            let action = self
+                .actions
+                .get(history.len())
+                .or_else(|| self.actions.last())
+                .cloned()
+                .expect("planner needs at least one action");
+            PlannerDecision::new("summarizing stub", action)
+        }
+
+        async fn summarize_history(
+            &self,
+            previous: Option<&str>,
+            overflow: &[PlannerHistoryEntry],
+        ) -> Option<String> {
+            self.summarize_calls
+                .borrow_mut()
+                .push((previous.map(str::to_string), overflow.len()));
+            self.summary.clone()
+        }
+    }
+
+    fn summarization_run(
+        summary: Option<String>,
+    ) -> (
+        Rc<RefCell<Vec<String>>>,
+        Rc<RefCell<Vec<(Option<String>, usize)>>>,
+        AgentRunReport,
+    ) {
+        // 22 verified-progress clicks, then done. The 12-entry window means
+        // overflow reaches SUMMARIZE_HISTORY_EVERY_OVERFLOWED (8) with 20
+        // history entries — exactly one fold call in the run.
+        let total_clicks = 22_u32;
+        let mut observations = vec![Ok(vec![element(1, "Step 1")])];
+        let mut actions = Vec::new();
+        for step in 1..=total_clicks {
+            observations.push(Ok(vec![element(step + 1, &format!("Step {}", step + 1))]));
+            actions.push(Action::Click { id: step });
+        }
+        actions.push(Action::Done);
+
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        let summarize_calls = Rc::new(RefCell::new(Vec::new()));
+        let report = block_on(run_stub_agent_loop(
+            &FakeObserver::new(observations),
+            &SummarizingPlanner {
+                actions,
+                goals: goals.clone(),
+                summarize_calls: summarize_calls.clone(),
+                summary,
+            },
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(24),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+        (goals, summarize_calls, report)
+    }
+
+    #[test]
+    fn history_overflow_folds_into_progress_summary_in_goal() {
+        let (goals, summarize_calls, report) =
+            summarization_run(Some("Clicked through the first wizard pages.".into()));
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        // One fold call, with no previous summary, over exactly the first 8
+        // overflowed entries.
+        assert_eq!(&*summarize_calls.borrow(), &[(None, 8_usize)]);
+        // Goals composed before the fold have no summary; afterwards every
+        // goal carries it.
+        let goals = goals.borrow();
+        assert!(!goals[0].contains("Earlier progress"));
+        assert!(goals.last().unwrap().contains(
+            "Earlier progress (summary of steps no longer shown in the action history):\nClicked through the first wizard pages."
+        ));
+    }
+
+    #[test]
+    fn failed_summarization_keeps_the_run_alive_without_retrying_per_step() {
+        let (goals, summarize_calls, report) = summarization_run(None);
+
+        assert_eq!(report.status, AgentRunStatus::Done);
+        // The cursor advances even on failure: one attempt, not one per step.
+        assert_eq!(summarize_calls.borrow().len(), 1);
+        assert!(goals
+            .borrow()
+            .iter()
+            .all(|goal| !goal.contains("Earlier progress")));
     }
 
     /// HistoryRecordingActionPlanner with a working webLookup: availability
