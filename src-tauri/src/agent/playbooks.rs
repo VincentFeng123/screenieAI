@@ -35,7 +35,11 @@ const APP_ONLY_SCORE: u32 = 50;
 
 /// Built-in playbooks shipped with the binary. Adding one is a markdown
 /// file plus an entry here.
-const BUILTINS: &[&str] = &[include_str!("playbooks/builtin/browser-tasks.md")];
+const BUILTINS: &[&str] = &[
+    include_str!("playbooks/builtin/browser-tasks.md"),
+    include_str!("playbooks/builtin/system-settings.md"),
+    include_str!("playbooks/builtin/finder-file-ops.md"),
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Playbook {
@@ -406,11 +410,39 @@ mod tests {
     fn builtins_parse_and_load_without_a_dir() {
         let store = PlaybookStore::new(None);
         let loaded = store.load();
-        assert!(
-            loaded.iter().any(|p| p.name == "browser-tasks" && p.builtin),
-            "browser-tasks builtin missing: {:?}",
-            loaded.iter().map(|p| &p.name).collect::<Vec<_>>()
-        );
+        for name in ["browser-tasks", "system-settings", "finder-file-ops"] {
+            assert!(
+                loaded.iter().any(|p| p.name == name && p.builtin),
+                "{name} builtin missing: {:?}",
+                loaded.iter().map(|p| &p.name).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_routing_playbooks_route_settings_and_gate_finder_scripts() {
+        let store = PlaybookStore::new(None);
+
+        let settings_app = FocusedApp {
+            bundle_id: Some("com.apple.systempreferences".into()),
+            name: "System Settings".into(),
+            pid: Some(9),
+        };
+        let rendered = store
+            .select_and_render(&settings_app, "turn on do not disturb", false)
+            .unwrap();
+        assert!(rendered.contains("[system-settings]"));
+        assert!(rendered.contains("x-apple.systempreferences:"));
+
+        // The Finder script playbook never appears with scripting off.
+        assert!(store
+            .select_and_render(&finder(), "move the report file to a new folder", false)
+            .is_none());
+        let with_scripting = store
+            .select_and_render(&finder(), "move the report file to a new folder", true)
+            .unwrap();
+        assert!(with_scripting.contains("[finder-file-ops]"));
+        assert!(with_scripting.contains("moveToTrash"));
     }
 
     #[test]
