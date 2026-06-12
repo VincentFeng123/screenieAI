@@ -10,8 +10,15 @@
 
 pub mod ax;
 pub mod geometry;
+pub mod ids;
 
 pub use geometry::RectPt;
+pub use ids::{ElementRow, ResolvedElement};
+
+/// Namespaces the resolver understands enough to redirect: `ax:` is handled
+/// here, `dom:` (browser extension) and `vis:` (vision marks) get a typed
+/// WrongNamespace pointing the caller at the right channel.
+pub const RESOLVE_NAMESPACES: &[&str] = &["ax", "dom", "vis"];
 
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};

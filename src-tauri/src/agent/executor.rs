@@ -5611,6 +5611,49 @@ fn target_element_by_id(obs: &[Element], id: u32) -> Result<Element, ExecutionEr
         .ok_or(ExecutionError::TargetMissing(id))
 }
 
+/// The executor's single integration point with the perception index (C4):
+/// a namespaced element ref (`ax:B3` + snapshot id) resolves through
+/// `perception::ids::resolve`, which enforces snapshot scoping. Stale refs
+/// surface as the typed [`ExecutionError::StaleSnapshot`] so the loop can
+/// re-perceive instead of failing the action; the resolved element becomes
+/// a synthetic observation entry in the same global-top-left point space
+/// every click path already uses.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // call sites arrive with the operating-prompt planner wiring
+fn resolve_perception_target(
+    obs: &[Element],
+    eid: &str,
+    snapshot_id: &str,
+    allow_stale: bool,
+) -> Result<Element, ExecutionError> {
+    use crate::perception::{ids, PerceptionError};
+    let resolved = ids::resolve(eid, snapshot_id, allow_stale).map_err(|err| match err {
+        PerceptionError::StaleSnapshot { snapshot_id } => {
+            ExecutionError::StaleSnapshot(snapshot_id)
+        }
+        other => ExecutionError::Input(other.to_string()),
+    })?;
+    Ok(Element::new(
+        next_synthetic_id(obs),
+        resolved.role.clone(),
+        resolved
+            .title
+            .clone()
+            .unwrap_or_else(|| resolved.eid.clone()),
+        resolved.value.clone(),
+        Rect {
+            x: resolved.frame.x,
+            y: resolved.frame.y,
+            width: resolved.frame.w,
+            height: resolved.frame.h,
+        },
+        resolved.enabled,
+        resolved.focused,
+        CoordinateSpace::AxPoints,
+        ElementSource::Ax,
+    ))
+}
+
 /// A text-targeted click resolved to a concrete element (WI-2).
 #[derive(Clone, Debug)]
 struct TextResolution {
@@ -8116,6 +8159,11 @@ enum ExecutionError {
     InvalidKeyCombo(String),
     #[error("input execution failed: {0}")]
     Input(String),
+    /// A perception-index element ref points at a snapshot that is no longer
+    /// its window's latest — re-see (or re-read) and retry with fresh ids
+    /// instead of treating this as an input failure.
+    #[error("perception snapshot {0} is stale; re-read and retry with fresh element ids")]
+    StaleSnapshot(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8872,6 +8920,71 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
+
+    /// The executor↔perception wiring: namespaced refs resolve through the
+    /// index, stale snapshots surface as the typed error, and the resolved
+    /// element click-targets at the indexed frame's center.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn perception_refs_resolve_and_reject_stale_snapshots() {
+        use crate::perception::ids::{
+            registry, registry_test_guard, ElementRow, SnapshotRecord, WindowKey,
+        };
+        use crate::perception::RectPt;
+
+        let _guard = registry_test_guard();
+        let row = ElementRow {
+            eid: "ax:B1".into(),
+            fp: 42,
+            role: "AXButton".into(),
+            subrole: None,
+            title: Some("Save".into()),
+            descr: None,
+            value: None,
+            actions: vec!["AXPress".into()],
+            actionable: true,
+            enabled: true,
+            focused: false,
+            frame: RectPt::new(100.0, 200.0, 40.0, 20.0),
+            depth: 1,
+            parent_eid: None,
+            is_web_boundary: false,
+            class_prefix: 'B',
+        };
+        let window = WindowKey::WindowId(424_242);
+        registry().publish(
+            SnapshotRecord::new("ax:exectest1".into(), window.clone(), vec![row.clone()]),
+            None,
+        );
+
+        let resolved = resolve_perception_target(&[], "ax:B1", "ax:exectest1", false)
+            .expect("fresh ref resolves");
+        assert_eq!(resolved.role, "AXButton");
+        assert_eq!(resolved.name, "Save");
+        // Same click-point math as every other element path.
+        assert_eq!(
+            element_to_click_point(resolved.bounds, resolved.coordinate_space),
+            (120, 210)
+        );
+
+        // Wrong namespace is a hard input error naming the channel.
+        match resolve_perception_target(&[], "dom:L2", "ax:exectest1", false) {
+            Err(ExecutionError::Input(message)) => assert!(message.contains("dom")),
+            other => panic!("expected Input error, got {other:?}"),
+        }
+
+        // A newer snapshot supersedes the old one: typed StaleSnapshot,
+        // and allow_stale opts back in.
+        registry().publish(
+            SnapshotRecord::new("ax:exectest2".into(), window, vec![row]),
+            None,
+        );
+        match resolve_perception_target(&[], "ax:B1", "ax:exectest1", false) {
+            Err(ExecutionError::StaleSnapshot(id)) => assert_eq!(id, "ax:exectest1"),
+            other => panic!("expected StaleSnapshot, got {other:?}"),
+        }
+        assert!(resolve_perception_target(&[], "ax:B1", "ax:exectest1", true).is_ok());
+    }
 
     #[test]
     fn element_to_click_point_rounds_center_without_scaling() {
