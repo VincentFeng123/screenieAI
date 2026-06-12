@@ -45,7 +45,6 @@ pub enum CoordinateSpace {
     },
 }
 
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ElementSource {
@@ -377,6 +376,15 @@ pub struct ScrollContext {
     pub container: Option<Rect>,
     /// Role of the selected container, when one was found.
     pub container_kind: Option<ScrollContainerKind>,
+    /// Scrollable ancestor of the focused UI element. When an open dropdown
+    /// / combo list / popover owns keyboard focus, this is the container the
+    /// user means by "scroll" — it outranks the window's main container.
+    pub focus_container: Option<Rect>,
+    /// Topmost open transient container: an open menu hanging off the app
+    /// element, or a non-standard (borderless/floating) window of the app
+    /// overlaying the focused window — dropdown portals, completion lists.
+    /// Wheel events must land inside it while it is open.
+    pub transient: Option<Rect>,
     /// Focused window frame.
     pub window: Option<Rect>,
     /// Bounds of the display hosting the window.
@@ -439,7 +447,11 @@ pub trait ScreenObserver {
     /// Read-only fuzzy search over the frontmost app's full menu-bar tree
     /// for the findUi action. Never presses anything; platform observers
     /// override this. The default keeps stub and test observers working.
-    fn search_menu_tree(&self, _query: &str, _max_results: usize) -> Result<MenuScanResult, String> {
+    fn search_menu_tree(
+        &self,
+        _query: &str,
+        _max_results: usize,
+    ) -> Result<MenuScanResult, String> {
         Ok(MenuScanResult::default())
     }
 
@@ -515,9 +527,15 @@ pub const MAX_RECORD_CLIP_SECONDS: u64 = 30;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    ActivateApp { app: String },
-    Click { id: u32 },
-    ClickTarget { target: String },
+    ActivateApp {
+        app: String,
+    },
+    Click {
+        id: u32,
+    },
+    ClickTarget {
+        target: String,
+    },
     /// Click the visible element whose label best matches `text`, resolved
     /// at execution time against the current observation (WI-2). `nth` is
     /// 1-based in reading order, for when several elements share the label.
@@ -526,64 +544,123 @@ pub enum Action {
         role_hint: Option<String>,
         nth: Option<u32>,
     },
-    DoubleClick { id: u32 },
-    DoubleClickTarget { target: String },
-    Type { id: u32, text: String },
-    TypeTarget { target: String, text: String },
-    TypeFocused { text: String },
-    RightClick { id: u32 },
-    Move { id: u32 },
-    Drag { from_id: u32, to_id: u32 },
-    Key { combo: String },
+    DoubleClick {
+        id: u32,
+    },
+    DoubleClickTarget {
+        target: String,
+    },
+    Type {
+        id: u32,
+        text: String,
+    },
+    TypeTarget {
+        target: String,
+        text: String,
+    },
+    TypeFocused {
+        text: String,
+    },
+    RightClick {
+        id: u32,
+    },
+    Move {
+        id: u32,
+    },
+    Drag {
+        from_id: u32,
+        to_id: u32,
+    },
+    Key {
+        combo: String,
+    },
     /// Press one item in the frontmost app's menu bar by title path, e.g.
     /// `["File", "Export as PDF…"]`.
-    Menu { path: Vec<String> },
-    Scroll { dx: i32, dy: i32 },
-    ScrollAt { id: u32, dx: i32, dy: i32 },
-    Wait { ms: u64 },
+    Menu {
+        path: Vec<String>,
+    },
+    Scroll {
+        dx: i32,
+        dy: i32,
+    },
+    ScrollAt {
+        id: u32,
+        dx: i32,
+        dy: i32,
+    },
+    Wait {
+        ms: u64,
+    },
     /// Open a URL in the default browser in one deterministic step.
-    OpenUrl { url: String },
+    OpenUrl {
+        url: String,
+    },
     /// Run a web search in the default browser in one deterministic step.
-    WebSearch { query: String },
+    WebSearch {
+        query: String,
+    },
     /// Extract the visible text of the focused page/window into the
     /// planner's next prompt. Emits no input events.
     ReadPage,
     /// Search the frontmost app's saved hints, full menu-bar tree, and the
     /// current observation for a feature by name. Read-only; matches arrive
     /// in the step result. Emits no input events.
-    FindUi { query: String },
+    FindUi {
+        query: String,
+    },
     /// Ask a research model with web access where a feature lives in the
     /// frontmost app's UI. Gated by a user setting and provider support;
     /// results are untrusted navigation data. Emits no input events.
-    WebLookup { query: String },
+    WebLookup {
+        query: String,
+    },
     /// Pause and ask the user one short question; the answer arrives in the
     /// planner's history. Emits no input events.
-    Ask { question: String, options: Vec<String> },
+    Ask {
+        question: String,
+        options: Vec<String>,
+    },
     /// Run an AppleScript snippet. Gated by a user setting (default off) and
     /// always requires explicit approval; `do shell script` is rejected.
-    AppleScript { script: String },
+    AppleScript {
+        script: String,
+    },
     /// Run a Shortcuts.app shortcut by name. Same gating as AppleScript.
-    RunShortcut { name: String, input: Option<String> },
+    RunShortcut {
+        name: String,
+        input: Option<String>,
+    },
     /// Move a file to the Trash via Finder. Permanent deletion does not
     /// exist as a primitive.
-    MoveToTrash { path: String },
+    MoveToTrash {
+        path: String,
+    },
     /// Capture one still of the screen/focused window; the image is attached
     /// to the planner's NEXT prompt. Needs the Screen Recording grant.
     /// Emits no input events; writes one PNG into the captures directory.
-    CaptureFrame { scope: CaptureScope },
+    CaptureFrame {
+        scope: CaptureScope,
+    },
     /// Record the screen/focused window for `seconds` (1-30) and save a
     /// local clip. The macOS screen-sharing indicator is visible throughout.
-    RecordClip { seconds: u32, scope: CaptureScope },
+    RecordClip {
+        seconds: u32,
+        scope: CaptureScope,
+    },
     /// Begin an open-ended recording session (one at a time; auto-stops at
     /// the engine's safety caps).
-    StartRecording { scope: CaptureScope },
+    StartRecording {
+        scope: CaptureScope,
+    },
     /// End the open recording session and save the clip.
     StopRecording,
     /// Report the Screen Recording + Accessibility permission map without
     /// touching the screen. Read-only.
     CapturePermission,
     Done,
-    Fail { reason: String },
+    Fail {
+        reason: String,
+    },
 }
 
 impl Serialize for Action {
@@ -1511,7 +1588,10 @@ mod tests {
                 r#"{"action":"startRecording","scope":"screen"}"#,
             ),
             (Action::StopRecording, r#"{"action":"stopRecording"}"#),
-            (Action::CapturePermission, r#"{"action":"capturePermission"}"#),
+            (
+                Action::CapturePermission,
+                r#"{"action":"capturePermission"}"#,
+            ),
         ];
         for (action, json) in cases {
             assert_eq!(action.to_json().unwrap(), json);
@@ -1555,9 +1635,7 @@ mod tests {
         assert!(
             Action::from_json_strict(r#"{"action":"stopRecording","scope":"screen"}"#).is_err()
         );
-        assert!(
-            Action::from_json_strict(r#"{"action":"capturePermission","seconds":5}"#).is_err()
-        );
+        assert!(Action::from_json_strict(r#"{"action":"capturePermission","seconds":5}"#).is_err());
     }
 
     #[test]

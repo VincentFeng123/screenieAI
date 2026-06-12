@@ -6,10 +6,10 @@ use super::observer::{
 use super::safari_dom;
 use super::search::score_match;
 use super::types::{
-    intersect_rects, is_secure_text_role, normalize_signature_name, ChangeCounter,
-    CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider, MenuMatch,
-    MenuPressOutcome, MenuScanResult, ObservationError, PlatformElementHandle, Rect,
-    ScreenObserver, ScrollContainerKind, ScrollContext, UiChangeSignal,
+    intersect_rects, is_secure_text_role, normalize_signature_name, ChangeCounter, CoordinateSpace,
+    Element, ElementSource, FocusedApp, FocusedAppProvider, MenuMatch, MenuPressOutcome,
+    MenuScanResult, ObservationError, PlatformElementHandle, Rect, ScreenObserver,
+    ScrollContainerKind, ScrollContext, UiChangeSignal,
 };
 use super::vision::{ObservationMetadata, ObservationMetadataProvider};
 use core_foundation::base::TCFType;
@@ -20,7 +20,7 @@ use core_foundation_sys::array::{
     CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFArrayRef,
 };
 use core_foundation_sys::base::{
-    Boolean, CFCopyDescription, CFGetTypeID, CFRelease, CFRetain, CFTypeID, CFTypeRef,
+    Boolean, CFCopyDescription, CFEqual, CFGetTypeID, CFRelease, CFRetain, CFTypeID, CFTypeRef,
 };
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::number::{
@@ -687,14 +687,138 @@ impl MacObserver {
             None => (None, None, None),
         };
 
+        // Both probes are best-effort: any AX hiccup degrades to None and
+        // the anchor ladder simply starts at the main container.
+        let focus_container = focused_scroll_ancestor(app);
+        let transient = transient_overlay_rect(app, window.as_type_ref(), window_rect);
+
         Ok(Some(ScrollContext {
             container,
             container_kind,
+            focus_container,
+            transient,
             window: window_rect,
             screen,
             vertical_position,
         }))
     }
+}
+
+/// Roles that scroll as a unit when the wheel lands inside them — the set
+/// the focused element's ancestry is probed for.
+const SCROLLABLE_FOCUS_ROLES: &[&str] = &[
+    "AXScrollArea",
+    "AXWebArea",
+    "AXMenu",
+    "AXPopover",
+    "AXSheet",
+    "AXList",
+    "AXOutline",
+    "AXTable",
+    "AXGrid",
+];
+const MAX_FOCUS_ANCESTOR_HOPS: usize = 15;
+const MAX_TRANSIENT_SCAN: usize = 24;
+
+/// Scrollable ancestor of the app's focused UI element. When an open
+/// dropdown / combo list owns keyboard focus this is the container the
+/// user means by "scroll down".
+fn focused_scroll_ancestor(app: AXUIElementRef) -> Option<Rect> {
+    let mut current = copy_attribute(app, "AXFocusedUIElement").ok().flatten()?;
+    for _ in 0..MAX_FOCUS_ANCESTOR_HOPS {
+        let role = copy_string_attribute(current.as_type_ref(), "AXRole")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if SCROLLABLE_FOCUS_ROLES.iter().any(|known| *known == role) {
+            let bounds = copy_bounds(current.as_type_ref()).ok()?;
+            return rect_has_visible_bounds(bounds).then_some(bounds);
+        }
+        current = copy_attribute(current.as_type_ref(), "AXParent")
+            .ok()
+            .flatten()?;
+    }
+    None
+}
+
+/// Topmost open transient container of the frontmost app: an open `AXMenu`
+/// hanging off the app element (NSMenu dropdowns/context menus), else the
+/// smallest non-standard window overlapping the focused window (combo-box
+/// portals and completion lists are borderless sibling windows). `None`
+/// when nothing transient is open — the common case, kept cheap: two
+/// attribute reads plus a shallow scan.
+fn transient_overlay_rect(
+    app: AXUIElementRef,
+    focused_window: AXUIElementRef,
+    window_rect: Option<Rect>,
+) -> Option<Rect> {
+    // Open NSMenus parent under the app element, not under any window.
+    if let Ok(Some(children)) = copy_array_attribute(app, "AXChildren") {
+        if let (Ok(count), Ok(array_ref)) = (cf_array_len(&children), children.as_array_ref()) {
+            for index in 0..count.min(MAX_TRANSIENT_SCAN) {
+                let child =
+                    unsafe { CFArrayGetValueAtIndex(array_ref, index as isize) } as AXUIElementRef;
+                if child.is_null() {
+                    continue;
+                }
+                let role = copy_string_attribute(child, "AXRole")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                if role == "AXMenu" {
+                    if let Ok(bounds) = copy_bounds(child) {
+                        if rect_has_visible_bounds(bounds) {
+                            return Some(bounds);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Non-standard windows of the app overlaying the focused window.
+    let windows = copy_array_attribute(app, "AXWindows").ok().flatten()?;
+    let array_ref = windows.as_array_ref().ok()?;
+    let count = cf_array_len(&windows).ok()?;
+    let mut best: Option<Rect> = None;
+    for index in 0..count.min(MAX_TRANSIENT_SCAN) {
+        let window = unsafe { CFArrayGetValueAtIndex(array_ref, index as isize) } as AXUIElementRef;
+        if window.is_null() || unsafe { CFEqual(window, focused_window) } != 0 {
+            continue;
+        }
+        let subrole = copy_string_attribute(window, "AXSubrole")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if subrole == "AXStandardWindow" {
+            continue;
+        }
+        let Ok(bounds) = copy_bounds(window) else {
+            continue;
+        };
+        if !rect_has_visible_bounds(bounds) {
+            continue;
+        }
+        if let Some(window_rect) = window_rect {
+            // Only overlays of the focused window count; detached palettes
+            // and inspector panels elsewhere on screen are not scroll intent.
+            if intersect_rects(bounds, window_rect).is_none() {
+                continue;
+            }
+            // A "transient" matching the whole window is just another
+            // full-size window, not an overlay worth retargeting at.
+            if (bounds.width * bounds.height) >= 0.9 * (window_rect.width * window_rect.height) {
+                continue;
+            }
+        }
+        let smaller = best.map_or(true, |current| {
+            bounds.width * bounds.height < current.width * current.height
+        });
+        if smaller {
+            best = Some(bounds);
+        }
+    }
+    best
 }
 
 impl ScreenObserver for MacObserver {
@@ -817,7 +941,10 @@ impl ScreenObserver for MacObserver {
         let mut resolved_path = Vec::with_capacity(path.len());
         for (depth, wanted) in path.iter().enumerate() {
             let items = menu_level_items(current.as_type_ref())?;
-            let titles = items.iter().map(|(_, title)| title.clone()).collect::<Vec<_>>();
+            let titles = items
+                .iter()
+                .map(|(_, title)| title.clone())
+                .collect::<Vec<_>>();
             let Some(index) = match_menu_title(&titles, wanted) else {
                 return Ok(MenuPressOutcome::NotFound {
                     depth,
@@ -836,8 +963,7 @@ impl ScreenObserver for MacObserver {
             current = element;
         }
 
-        if copy_bool_attribute(current.as_type_ref(), "AXEnabled")
-            .map_err(|err| err.to_string())?
+        if copy_bool_attribute(current.as_type_ref(), "AXEnabled").map_err(|err| err.to_string())?
             == Some(false)
         {
             return Err(format!(
@@ -849,8 +975,9 @@ impl ScreenObserver for MacObserver {
         // Pressing a deep AXMenuItem triggers it without opening the parent
         // menus on screen — the tree is fully readable while menus are closed.
         let action = CFString::new("AXPress");
-        let err =
-            unsafe { AXUIElementPerformAction(current.as_type_ref(), action.as_concrete_TypeRef()) };
+        let err = unsafe {
+            AXUIElementPerformAction(current.as_type_ref(), action.as_concrete_TypeRef())
+        };
         if err != AX_ERROR_SUCCESS {
             return Err(format!(
                 "pressing menu item '{}' failed (AX error {err})",
@@ -1265,7 +1392,10 @@ fn scan_menu_tree(menu_bar: AXUIElementRef, query: &str, max_results: usize) -> 
         let title = path.last().map(String::as_str).unwrap_or_default();
         // Score the item title and the joined path so multi-level queries
         // ("safari settings advanced") can match too.
-        let score = match (score_match(title, query), score_match(&path.join(" "), query)) {
+        let score = match (
+            score_match(title, query),
+            score_match(&path.join(" "), query),
+        ) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
@@ -1501,8 +1631,7 @@ fn copy_attribute(
         )),
         other => Err(ObservationError::AxReadFailed(format!(
             "AXUIElementCopyAttributeValue({}) returned {}",
-            attribute,
-            other
+            attribute, other
         ))),
     }
 }

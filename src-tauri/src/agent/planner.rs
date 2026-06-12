@@ -239,9 +239,7 @@ impl Planner for StubPlanner {
                 .decisions
                 .get(history.len())
                 .cloned()
-                .unwrap_or_else(|| {
-                    PlannerDecision::new("stub sequence", self.fallback.clone())
-                });
+                .unwrap_or_else(|| PlannerDecision::new("stub sequence", self.fallback.clone()));
         }
         let action = self
             .actions
@@ -1108,7 +1106,7 @@ pub(crate) fn build_system_prompt(scripting_enabled: bool, web_lookup_available:
         "Action history includes completed and rejected actions. If an action was rejected as already executed, do not repeat it; choose a different visible target or key action for the unfinished goal.",
         "If the requested app is already focused and no in-app target is requested, emit done.",
         "If the target is not among the visible elements: scroll to reveal more; if it is still missing, emit findUi with a short feature query (e.g. \"export pdf\"); if findUi finds nothing, ask or fail with reason_detail. Do not guess ids.",
-        "For scroll, dx/dy are PIXELS: positive dy scrolls down, negative up; positive dx right, negative left. One screen-page is roughly 600-900, so prefer dy around 600. If the step result reports a scroll boundary, that edge is reached - reverse direction or stop scrolling.",
+        "For scroll, dx/dy are PIXELS: positive dy scrolls down, negative up; positive dx right, negative left. One screen-page is roughly 600-900, so prefer dy around 600. Scroll anchoring is automatic: an open dropdown/menu/popover scrolls first, then the focused list, then the main content - so to scroll inside an open dropdown just emit scroll. If the step result reports a scroll boundary, that edge is reached - reverse direction or stop scrolling.",
         "Emit done the moment the goal is satisfied. Emit fail only when on-screen evidence or your step results show the goal cannot be completed, and cite that evidence in reason_detail. Never fail because you believe something in the goal does not exist - your knowledge may be outdated; verify on screen or ask instead.",
         "captureFrame attaches a screenshot to your NEXT prompt (scope \"screen\" = full visible desktop across displays, default; \"window\" = focused window). Use it ONLY when the goal needs visual content the observation and readPage cannot give (images, video frames, charts, canvas, layout or colors). It needs the macOS Screen Recording permission; if a capture action reports a permission problem, do NOT retry - relay the fix to the user via ask or fail.",
         "recordClip records the screen for N seconds (1-30) and saves a local video; the step result gives the file path, which the user also receives. The macOS screen-sharing indicator is visible while recording. Only record when the user asked for a recording.",
@@ -1666,10 +1664,8 @@ pub(crate) fn parse_planner_decision(
 
     let reason = normalize_reason(&raw.reason)?;
     let action = parse_raw_planner_action(&raw, obs)?;
-    let target_name =
-        normalize_optional_field(raw.target_name.as_deref(), MAX_TARGET_NAME_CHARS);
-    let target_role =
-        normalize_optional_field(raw.target_role.as_deref(), MAX_TARGET_ROLE_CHARS);
+    let target_name = normalize_optional_field(raw.target_name.as_deref(), MAX_TARGET_NAME_CHARS);
+    let target_role = normalize_optional_field(raw.target_role.as_deref(), MAX_TARGET_ROLE_CHARS);
     // The target-intent contract: an id-targeted action must echo the name
     // the planner read for that id, so the executor can refuse to act when
     // the id and the stated intent disagree. Batch followups stay tolerant.
@@ -1691,7 +1687,10 @@ pub(crate) fn parse_planner_decision(
 
     Ok(PlannerDecision::new(reason, action)
         .with_followups(followups)
-        .with_note(normalize_optional_field(raw.note.as_deref(), MAX_NOTE_CHARS))
+        .with_note(normalize_optional_field(
+            raw.note.as_deref(),
+            MAX_NOTE_CHARS,
+        ))
         .with_remember(normalize_optional_field(
             raw.remember.as_deref(),
             super::memory::MAX_REMEMBER_CHARS,
@@ -1779,34 +1778,22 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             let (dx, dy) = parse_scroll_axes(raw)?;
             Action::Scroll { dx, dy }
         }
-        "wait" => {
-            Action::Wait {
-                ms: raw.ms.ok_or_else(|| "wait requires ms".to_string())?,
-            }
-        }
-        "openUrl" | "open_url" => {
-            Action::OpenUrl {
-                url: require_string("url", raw.url.as_deref())?.to_string(),
-            }
-        }
-        "webSearch" | "web_search" => {
-            Action::WebSearch {
-                query: require_string("query", raw.query.as_deref())?.to_string(),
-            }
-        }
-        "readPage" | "read_page" => {
-            Action::ReadPage
-        }
-        "findUi" | "find_ui" => {
-            Action::FindUi {
-                query: require_string("query", raw.query.as_deref())?.to_string(),
-            }
-        }
-        "webLookup" | "web_lookup" => {
-            Action::WebLookup {
-                query: require_string("query", raw.query.as_deref())?.to_string(),
-            }
-        }
+        "wait" => Action::Wait {
+            ms: raw.ms.ok_or_else(|| "wait requires ms".to_string())?,
+        },
+        "openUrl" | "open_url" => Action::OpenUrl {
+            url: require_string("url", raw.url.as_deref())?.to_string(),
+        },
+        "webSearch" | "web_search" => Action::WebSearch {
+            query: require_string("query", raw.query.as_deref())?.to_string(),
+        },
+        "readPage" | "read_page" => Action::ReadPage,
+        "findUi" | "find_ui" => Action::FindUi {
+            query: require_string("query", raw.query.as_deref())?.to_string(),
+        },
+        "webLookup" | "web_lookup" => Action::WebLookup {
+            query: require_string("query", raw.query.as_deref())?.to_string(),
+        },
         "ask" => {
             let question = normalize_optional_field(raw.question.as_deref(), MAX_QUESTION_CHARS)
                 .ok_or_else(|| "ask requires question".to_string())?;
@@ -1831,25 +1818,16 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
             }
             Action::AppleScript { script }
         }
-        "shortcut" | "run_shortcut" | "runShortcut" => {
-            Action::RunShortcut {
-                name: require_string("name", raw.name.as_deref())?.to_string(),
-                input: raw
-                    .input
-                    .clone()
-                    .filter(|input| !input.trim().is_empty()),
-            }
-        }
-        "moveToTrash" | "move_to_trash" => {
-            Action::MoveToTrash {
-                path: require_string("file", raw.file.as_deref())?.to_string(),
-            }
-        }
-        "captureFrame" | "capture_frame" => {
-            Action::CaptureFrame {
-                scope: parse_capture_scope(raw.scope.as_deref())?,
-            }
-        }
+        "shortcut" | "run_shortcut" | "runShortcut" => Action::RunShortcut {
+            name: require_string("name", raw.name.as_deref())?.to_string(),
+            input: raw.input.clone().filter(|input| !input.trim().is_empty()),
+        },
+        "moveToTrash" | "move_to_trash" => Action::MoveToTrash {
+            path: require_string("file", raw.file.as_deref())?.to_string(),
+        },
+        "captureFrame" | "capture_frame" => Action::CaptureFrame {
+            scope: parse_capture_scope(raw.scope.as_deref())?,
+        },
         "recordClip" | "record_clip" => {
             let seconds = raw
                 .seconds
@@ -1865,25 +1843,15 @@ fn parse_raw_planner_action(raw: &RawPlannerResponse, obs: &[Element]) -> Result
                 scope: parse_capture_scope(raw.scope.as_deref())?,
             }
         }
-        "startRecording" | "start_recording" => {
-            Action::StartRecording {
-                scope: parse_capture_scope(raw.scope.as_deref())?,
-            }
-        }
-        "stopRecording" | "stop_recording" => {
-            Action::StopRecording
-        }
-        "capturePermission" | "capture_permission" => {
-            Action::CapturePermission
-        }
-        "done" => {
-            Action::Done
-        }
-        "fail" => {
-            Action::Fail {
-                reason: require_string("reason_detail", raw.reason_detail.as_deref())?.to_string(),
-            }
-        }
+        "startRecording" | "start_recording" => Action::StartRecording {
+            scope: parse_capture_scope(raw.scope.as_deref())?,
+        },
+        "stopRecording" | "stop_recording" => Action::StopRecording,
+        "capturePermission" | "capture_permission" => Action::CapturePermission,
+        "done" => Action::Done,
+        "fail" => Action::Fail {
+            reason: require_string("reason_detail", raw.reason_detail.as_deref())?.to_string(),
+        },
         other => return Err(format!("unknown action '{other}'")),
     };
 
@@ -3062,9 +3030,13 @@ mod tests {
         assert!(prompt.contains("outrank your memory about what exists or is current"));
         assert!(prompt.contains("fictional, hypothetical, or speculative"));
         // Fail must cite the screen or step results, never world knowledge.
-        assert!(!prompt.contains("Emit fail if the goal is not achievable with the visible elements"));
+        assert!(
+            !prompt.contains("Emit fail if the goal is not achievable with the visible elements")
+        );
         assert!(prompt.contains("or your step results show the goal cannot be completed"));
-        assert!(prompt.contains("Never fail because you believe something in the goal does not exist"));
+        assert!(
+            prompt.contains("Never fail because you believe something in the goal does not exist")
+        );
         // Mark-vision wraps the base prompt and inherits the grounding.
         assert!(build_mark_vision_system_prompt(false).contains("Today's date is"));
     }
@@ -3213,8 +3185,9 @@ mod tests {
         let base = build_system_prompt(false, false);
         let scripted = build_system_prompt(true, false);
         for prompt in [&base, &scripted] {
-            assert!(prompt
-                .contains("Prefer the action that completes a sub-task in ONE step over GUI clicking"));
+            assert!(prompt.contains(
+                "Prefer the action that completes a sub-task in ONE step over GUI clicking"
+            ));
         }
         // Finder script routing only rides inside the scripting splice.
         let finder_line = "For Finder file operations (rename, move, copy, reveal, new folder)";
@@ -3256,8 +3229,7 @@ mod tests {
     #[test]
     fn parse_validates_current_observation_ids() {
         let obs = vec![element(14, "Ask")];
-        let decision =
-            parse_planner_decision(
+        let decision = parse_planner_decision(
             r#"{"reason":"choose Ask","action":"click","id":14,"target_name":"Ask"}"#,
             &obs,
         )
@@ -3277,8 +3249,9 @@ mod tests {
     fn parse_requires_target_name_for_id_targeted_actions() {
         let obs = vec![element(14, "Ask")];
 
-        let err = parse_planner_decision(r#"{"reason":"choose Ask","action":"click","id":14}"#, &obs)
-            .unwrap_err();
+        let err =
+            parse_planner_decision(r#"{"reason":"choose Ask","action":"click","id":14}"#, &obs)
+                .unwrap_err();
         assert!(err.contains("target_name"), "got: {err}");
 
         let err = parse_planner_decision(
@@ -3603,11 +3576,9 @@ mod tests {
             &obs,
         )
         .is_err());
-        assert!(parse_planner_decision(
-            r#"{"reason":"open menu","action":"menu"}"#,
-            &obs,
-        )
-        .is_err());
+        assert!(
+            parse_planner_decision(r#"{"reason":"open menu","action":"menu"}"#, &obs,).is_err()
+        );
     }
 
     #[test]
@@ -4036,9 +4007,8 @@ mod tests {
     #[test]
     fn capture_attachment_routes_next_call_through_vision_and_consumes_once() {
         let state = VisionFallbackState::new();
-        let text_client = FakeDecisionClient::new(vec![Ok(
-            r#"{"reason":"done","action":"done"}"#.into()
-        )]);
+        let text_client =
+            FakeDecisionClient::new(vec![Ok(r#"{"reason":"done","action":"done"}"#.into())]);
         let vision_client = FakeDecisionClient::new(vec![Ok(
             r#"{"reason":"chart read","action":"readPage"}"#.into(),
         )]);
@@ -4074,9 +4044,10 @@ mod tests {
     fn visual_crosscheck_routes_through_vision_with_regular_actions() {
         let state = VisionFallbackState::new();
         state.set_context(crosscheck_context(), ObservationMetadata::default());
-        let text_client = FakeDecisionClient::new(vec![Ok(
-            r#"{"reason":"wrong path","action":"done"}"#.into()
-        )]);
+        let text_client =
+            FakeDecisionClient::new(vec![
+                Ok(r#"{"reason":"wrong path","action":"done"}"#.into()),
+            ]);
         let vision_client = FakeDecisionClient::new(vec![Ok(
             r#"{"reason":"AX and image both show Ask","action":"click","id":14,"target_name":"Ask"}"#.into(),
         )]);
@@ -4100,10 +4071,7 @@ mod tests {
         let state = VisionFallbackState::new();
         state.set_context(crosscheck_context(), ObservationMetadata::default());
         let text_client = FakeDecisionClient::new(vec![
-            Ok(
-                r#"{"reason":"AX shows Ask","action":"click","id":14,"target_name":"Ask"}"#
-                    .into(),
-            ),
+            Ok(r#"{"reason":"AX shows Ask","action":"click","id":14,"target_name":"Ask"}"#.into()),
             Ok(r#"{"reason":"goal met","action":"done"}"#.into()),
         ]);
         let vision_client =
@@ -4136,7 +4104,10 @@ mod tests {
     #[test]
     fn llm_planner_retries_once_on_invalid_output() {
         let client = FakeDecisionClient::new(vec![
-            Ok(r#"{"reason":"choose missing","action":"click","id":99,"target_name":"Ask"}"#.into()),
+            Ok(
+                r#"{"reason":"choose missing","action":"click","id":99,"target_name":"Ask"}"#
+                    .into(),
+            ),
             Ok(r#"{"reason":"choose Ask","action":"click","id":14,"target_name":"Ask"}"#.into()),
         ]);
         let prompts = client.prompts.clone();
@@ -4155,7 +4126,10 @@ mod tests {
     fn llm_planner_accepts_retry_with_oversized_reason() {
         let long_reason = "x".repeat(MAX_REASON_CHARS + 20);
         let client = FakeDecisionClient::new(vec![
-            Ok(r#"{"reason":"choose missing","action":"click","id":99,"target_name":"Ask"}"#.into()),
+            Ok(
+                r#"{"reason":"choose missing","action":"click","id":99,"target_name":"Ask"}"#
+                    .into(),
+            ),
             Ok(format!(
                 r#"{{"reason":"{long_reason}","action":"click","id":14,"target_name":"Ask"}}"#
             )),
@@ -4185,7 +4159,10 @@ mod tests {
         let state = VisionFallbackState::new();
         state.set_context(mark_context(), ObservationMetadata::default());
         let client = FakeDecisionClient::new(vec![
-            Ok(r#"{"reason":"choose missing","action":"click","id":99,"target_name":"Ask"}"#.into()),
+            Ok(
+                r#"{"reason":"choose missing","action":"click","id":99,"target_name":"Ask"}"#
+                    .into(),
+            ),
             Ok(r#"{"reason":"choose Ask","action":"click","id":14,"target_name":"Ask"}"#.into()),
         ]);
         let prompts = client.prompts.clone();

@@ -1,21 +1,21 @@
+use super::capture_tools::CaptureEngine;
 use super::grounding::{
     Grounder, GrounderConfig, GroundingMode, GroundingReport, GroundingRequest, GroundingResponse,
     DEFAULT_GROUNDER_CONFIDENCE_THRESHOLD, DEFAULT_GROUNDER_ENDPOINT, DEFAULT_GROUNDER_HEALTH_URL,
     DEFAULT_GROUNDER_MODEL,
 };
-use super::hints::{now_ms, HintStore, UiHint, UiHintKind};
-use super::memory::{MemoryEntry, MemoryStore};
-use super::playbooks::PlaybookStore;
-use super::matching;
-use super::search::score_match;
 #[cfg(test)]
 use super::grounding::{GroundingPixel, NoopGrounder};
-use super::capture_tools::CaptureEngine;
+use super::hints::{now_ms, HintStore, UiHint, UiHintKind};
+use super::matching;
+use super::memory::{MemoryEntry, MemoryStore};
+use super::playbooks::PlaybookStore;
+use super::search::score_match;
 use super::types::{
     intersect_rects, is_secure_text_role, normalize_signature_name, Action, CaptureScope,
     CoordinateSpace, Element, ElementSource, FocusedApp, FocusedAppProvider, MenuPressOutcome,
-    MenuScanResult, ObservationError, Planner, PlannerCaptureAttachment, PlannerHistoryEntry,
-    Rect, ScreenObserver, ScrollContext,
+    MenuScanResult, ObservationError, Planner, PlannerCaptureAttachment, PlannerHistoryEntry, Rect,
+    ScreenObserver, ScrollContext,
 };
 #[cfg(test)]
 use super::types::{ChangeWait, MenuMatch, ScrollContainerKind, UiChangeSignal};
@@ -2080,8 +2080,7 @@ where
             summarized_through = history_overflow;
         }
 
-        let known_hints =
-            known_hints_line(&hint_store, &focused_before_observation, &options.goal);
+        let known_hints = known_hints_line(&hint_store, &focused_before_observation, &options.goal);
         let playbook = playbook_store.select_and_render(
             &focused_before_observation,
             &options.goal,
@@ -2278,8 +2277,7 @@ where
                             );
                             let proposal_key =
                                 format!("clickText:{}", normalize_text_for_match(&text));
-                            let was_banned =
-                                stuck_recovery.rejection_for(&proposal_key).is_some();
+                            let was_banned = stuck_recovery.rejection_for(&proposal_key).is_some();
                             if !was_banned
                                 && duplicate_rejections < MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP
                             {
@@ -2341,9 +2339,7 @@ where
                                 calibration: None,
                                 observation_source: observation_metadata.source,
                                 vision_candidate_count: observation_metadata.candidate_count,
-                                vision_trigger_reason: observation_metadata
-                                    .trigger_reason
-                                    .clone(),
+                                vision_trigger_reason: observation_metadata.trigger_reason.clone(),
                                 vision_capture_size: observation_metadata.capture_size,
                                 vision_detector_kind: observation_metadata.detector_kind.clone(),
                                 grounding: None,
@@ -2521,8 +2517,7 @@ where
                     if was_banned
                         || duplicate_rejections >= MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP
                     {
-                        let proposal_display =
-                            display_progress_action(&display_action, &prepared);
+                        let proposal_display = display_progress_action(&display_action, &prepared);
                         let stage = stuck_recovery.escalate_rejection(
                             &proposal_key,
                             &proposal_display,
@@ -2736,11 +2731,8 @@ where
                     find_ui_since_progress = true;
                     // Source priority: verified hints, then menu paths, then
                     // observation elements — most reliable next action first.
-                    let mut matches: Vec<FindUiMatch> = find_ui_hint_matches(
-                        &hint_store,
-                        &focused_before_observation,
-                        query,
-                    );
+                    let mut matches: Vec<FindUiMatch> =
+                        find_ui_hint_matches(&hint_store, &focused_before_observation, query);
                     let mut scan_truncated = false;
                     // On scan failure (permission, no menu bar): degrade to
                     // observation matches instead of failing.
@@ -2875,9 +2867,7 @@ where
 
                 web_lookups_total = web_lookups_total.saturating_add(1);
                 web_lookups_since_progress = web_lookups_since_progress.saturating_add(1);
-                let result_text = match planner
-                    .web_lookup(&focused_before_observation, query)
-                    .await
+                let result_text = match planner.web_lookup(&focused_before_observation, query).await
                 {
                     Ok(raw) => {
                         let filtered = filter_web_lookup_answer(&raw);
@@ -3016,10 +3006,7 @@ where
                             AgentConfirmationRequest {
                                 action: action.clone(),
                                 target: None,
-                                reason: format!(
-                                    "capture a screenshot of the {}",
-                                    scope.label()
-                                ),
+                                reason: format!("capture a screenshot of the {}", scope.label()),
                             },
                             confirmation_timeout,
                             abort,
@@ -3109,10 +3096,7 @@ where
                             AgentConfirmationRequest {
                                 action: action.clone(),
                                 target: None,
-                                reason: format!(
-                                    "record the {} for {seconds}s",
-                                    scope.label()
-                                ),
+                                reason: format!("record the {} for {seconds}s", scope.label()),
                             },
                             confirmation_timeout,
                             abort,
@@ -3656,16 +3640,57 @@ where
                 if let Some(ctx) = context.as_ref() {
                     let ladder = scroll_anchor_ladder(ctx);
                     if !ladder.is_empty() {
-                        let index = (attempt as usize).saturating_sub(1).min(ladder.len() - 1);
+                        let mut index = (attempt as usize).saturating_sub(1).min(ladder.len() - 1);
+                        // Containment check: the wheel goes to whatever is
+                        // on TOP at the anchor. Transient/focus rungs verify
+                        // that the element under the anchor still lives
+                        // inside the surface they aim at — a dropdown that
+                        // closed between observe and execute demotes to the
+                        // next rung instead of wheeling a phantom overlay.
+                        // (The reverse miss — an undetected overlay above a
+                        // Container anchor — is mitigated by transient
+                        // detection itself, not by this check.)
+                        while index < ladder.len() {
+                            let candidate = ladder[index];
+                            if !candidate.verify_containment
+                                || !calibration_probe.hit_test_available()
+                            {
+                                break;
+                            }
+                            match calibration_probe.hit_test(candidate.anchor) {
+                                Ok(Some(hit))
+                                    if !rect_mostly_within(hit.bounds, candidate.frame) =>
+                                {
+                                    eprintln!(
+                                        "[screenie] agent step {} scroll_anchor demoted strategy={:?} hit_role={} hit_bounds={:?} frame={:?}",
+                                        step_number,
+                                        candidate.strategy,
+                                        hit.role,
+                                        hit.bounds,
+                                        candidate.frame,
+                                    );
+                                    index += 1;
+                                }
+                                // A passing hit, no hit, or a hit-test error
+                                // all accept the rung — absence of signal is
+                                // not evidence the surface is gone.
+                                _ => break,
+                            }
+                        }
+                        if index >= ladder.len() {
+                            index = ladder.len() - 1;
+                        }
                         rung = Some(ladder[index]);
                     }
                     eprintln!(
-                        "[screenie] agent step {} scroll_anchor attempt={} strategy={:?} anchor={} container_kind={:?} container={:?} window={:?} screen={:?} pos={:?}",
+                        "[screenie] agent step {} scroll_anchor attempt={} strategy={:?} anchor={} transient={:?} focus_container={:?} container_kind={:?} container={:?} window={:?} screen={:?} pos={:?}",
                         step_number,
                         attempt,
                         rung.map(|rung| rung.strategy),
                         rung.map(|rung| format!("({}, {})", rung.anchor.x, rung.anchor.y))
                             .unwrap_or_else(|| "none".into()),
+                        ctx.transient,
+                        ctx.focus_container,
                         ctx.container_kind,
                         ctx.container,
                         ctx.window,
@@ -4224,8 +4249,7 @@ where
                     // ms-insensitive) so same-screen waits walk the recovery
                     // ladder instead of silently burning the wall clock.
                     if matches!(prepared.kind, PreparedKind::Wait { .. })
-                        && step.verification.status
-                            == VerificationStatus::SkippedNoUiChangeExpected
+                        && step.verification.status == VerificationStatus::SkippedNoUiChangeExpected
                     {
                         let entry = ProgressLoopEntry {
                             pre_state_hash: pre_state_hash.clone(),
@@ -4904,7 +4928,11 @@ fn find_ui_observation_matches(obs: &[Element], query: &str) -> Vec<FindUiMatch>
             } else {
                 element.name.clone()
             };
-            let disabled = if element.enabled { "" } else { " (disabled now)" };
+            let disabled = if element.enabled {
+                ""
+            } else {
+                " (disabled now)"
+            };
             Some((
                 score,
                 FindUiMatch {
@@ -4948,9 +4976,8 @@ fn claimed_shortcut_from_answer(filtered: &str) -> Option<String> {
     filtered.split(" | ").find_map(|segment| {
         let segment = segment.trim();
         let prefix_len = "shortcut: ".len();
-        (segment.len() > prefix_len
-            && segment[..prefix_len].eq_ignore_ascii_case("shortcut: "))
-        .then(|| segment[prefix_len..].trim().to_string())
+        (segment.len() > prefix_len && segment[..prefix_len].eq_ignore_ascii_case("shortcut: "))
+            .then(|| segment[prefix_len..].trim().to_string())
     })
 }
 
@@ -5493,9 +5520,11 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
             // are the loop detector's job, not a longer sleep's.
             ms: (*ms).min(MAX_WAIT_ACTION_MS),
         })),
-        Action::CaptureFrame { scope } => Ok(PreparedAction::without_target(
-            PreparedKind::CaptureFrame { scope: *scope },
-        )),
+        Action::CaptureFrame { scope } => {
+            Ok(PreparedAction::without_target(PreparedKind::CaptureFrame {
+                scope: *scope,
+            }))
+        }
         Action::RecordClip { seconds, scope } => {
             if *seconds == 0 || u64::from(*seconds) > super::types::MAX_RECORD_CLIP_SECONDS {
                 return Err(ExecutionError::Input(format!(
@@ -5511,9 +5540,7 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
         Action::StartRecording { scope } => Ok(PreparedAction::without_target(
             PreparedKind::StartRecording { scope: *scope },
         )),
-        Action::StopRecording => {
-            Ok(PreparedAction::without_target(PreparedKind::StopRecording))
-        }
+        Action::StopRecording => Ok(PreparedAction::without_target(PreparedKind::StopRecording)),
         Action::CapturePermission => Ok(PreparedAction::without_target(
             PreparedKind::CapturePermission,
         )),
@@ -5723,7 +5750,8 @@ fn resolve_click_by_text(
     // Reading order — on-screen first, then top-to-bottom, left-to-right.
     // This is the order `nth` indexes and the order candidates are listed.
     matches.sort_by(|(_, a), (_, b)| {
-        let offscreen = |element: &Element| u8::from(element.bounds.y < 0.0 || element.bounds.x < 0.0);
+        let offscreen =
+            |element: &Element| u8::from(element.bounds.y < 0.0 || element.bounds.x < 0.0);
         offscreen(a)
             .cmp(&offscreen(b))
             .then(a.bounds.y.total_cmp(&b.bounds.y))
@@ -5770,7 +5798,9 @@ fn resolve_click_by_text(
             })
             .collect::<Vec<_>>()
             .join("; ");
-        let extra = matches.len().saturating_sub(CLICK_TEXT_MAX_LISTED_CANDIDATES);
+        let extra = matches
+            .len()
+            .saturating_sub(CLICK_TEXT_MAX_LISTED_CANDIDATES);
         let extra_note = if extra > 0 {
             format!(" (+{extra} more)")
         } else {
@@ -7065,7 +7095,9 @@ fn run_command_with_timeout(
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().map_err(|err| format!("spawn failed: {err}"))?;
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("spawn failed: {err}"))?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -7177,16 +7209,15 @@ where
     C: CalibrationProbe,
 {
     let fallback_point = prepared.click_point.unwrap_or(ClickPoint { x: 0, y: 0 });
-    let refreshed = refresh_prepared_target(observer, prepared, Some(move_tolerance)).map_err(
-        |reason| {
+    let refreshed =
+        refresh_prepared_target(observer, prepared, Some(move_tolerance)).map_err(|reason| {
             ClickPreflightReport::failed_with_kind(
                 fallback_point,
                 None,
                 reason,
                 ClickPreflightFailureKind::TargetRefresh,
             )
-        },
-    )?;
+        })?;
     let expected_point = refreshed.click_point.ok_or_else(|| {
         ClickPreflightReport::failed_with_kind(
             fallback_point,
@@ -7319,8 +7350,13 @@ where
     let mut last_report: Option<ClickPreflightReport> = None;
     let mut all_ax_hit_test = true;
     for attempt in 1..=CLICK_PREFLIGHT_MAX_ATTEMPTS {
-        match run_click_preflight(executor, observer, calibration_probe, prepared, move_tolerance)
-        {
+        match run_click_preflight(
+            executor,
+            observer,
+            calibration_probe,
+            prepared,
+            move_tolerance,
+        ) {
             Ok((preflighted, report)) => {
                 return PreflightOutcome::Passed(preflighted, report);
             }
@@ -7489,7 +7525,10 @@ const SCROLL_BOUNDARY_TOLERANCE: f64 = 0.005;
 /// anchor must never be fabricated from a disjoint intersection.
 fn derive_scroll_frame(ctx: &ScrollContext) -> Option<Rect> {
     let mut frame: Option<Rect> = None;
-    for rect in [ctx.container, ctx.window, ctx.screen].into_iter().flatten() {
+    for rect in [ctx.container, ctx.window, ctx.screen]
+        .into_iter()
+        .flatten()
+    {
         if !rect_is_finite(rect) || rect.is_empty() {
             return None;
         }
@@ -7522,6 +7561,12 @@ const MIN_SCROLL_ANCHOR_WINDOW_FRACTION: f64 = 0.25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollAnchorStrategy {
+    /// An open transient container (menu / dropdown portal / popover): while
+    /// one is up, it is what the user means by "scroll".
+    Transient,
+    /// The focused element's scrollable ancestor (combo lists, focused
+    /// outlines) when it differs from the window's main container.
+    FocusContainer,
     Container,
     WindowCenter,
     WindowLowerThird,
@@ -7531,9 +7576,29 @@ enum ScrollAnchorStrategy {
 struct ScrollAnchorRung {
     anchor: ClickPoint,
     strategy: ScrollAnchorStrategy,
-    /// False when the container was rejected as browser chrome — its
-    /// scrollbar position must not feed boundary verdicts.
+    /// The surface this rung aims at, for containment verification.
+    frame: Rect,
+    /// False when this rung's surface is not the main container — its
+    /// scrollbar position must not feed boundary verdicts. (Browser-chrome
+    /// rejection and transient/focus surfaces both land here.)
     container_trusted: bool,
+    /// Verify with an AX hit-test that the element under the anchor still
+    /// lives inside `frame` before scrolling — transient surfaces can close
+    /// between observation and execution.
+    verify_containment: bool,
+}
+
+/// True when `inner` (the hit-tested element under a scroll anchor) sits
+/// mostly inside `outer` (the surface the rung aims at). Degenerate inner
+/// bounds give no signal and pass — a flaky hit-test must not demote a
+/// good anchor.
+fn rect_mostly_within(inner: Rect, outer: Rect) -> bool {
+    if inner.is_empty() || !rect_is_finite(inner) {
+        return true;
+    }
+    let area = inner.width * inner.height;
+    intersect_rects(inner, outer)
+        .is_some_and(|overlap| overlap.width * overlap.height >= 0.5 * area)
 }
 
 /// True when the anchor frame looks like a browser-chrome strip (Safari's
@@ -7552,22 +7617,87 @@ fn scroll_anchor_frame_is_chrome_strip(frame: Rect, window: Option<Rect>) -> boo
 
 /// Ordered anchor candidates for an untargeted page scroll. Attempt N uses
 /// rung N (clamped to the last), so no-op retries post the wheel somewhere
-/// meaningfully different instead of replaying the identical failure:
-/// container center first (unless it looks like browser chrome), then the
-/// window center, then the window's lower third. When the container was
-/// guard-rejected, every remaining rung is marked untrusted.
+/// meaningfully different instead of replaying the identical failure.
+/// Intent-specific surfaces lead: an open transient container (dropdown /
+/// menu / popover) first, then the focused element's scrollable ancestor,
+/// then the main container (unless it looks like browser chrome), then the
+/// window center and lower third. Transient/focus rungs are hit-test
+/// verified at execution and never feed scrollbar-position verdicts.
 fn scroll_anchor_ladder(ctx: &ScrollContext) -> Vec<ScrollAnchorRung> {
     let mut rungs: Vec<ScrollAnchorRung> = Vec::new();
     let mut container_trusted = true;
 
+    fn clamp_to_screen(frame: Rect, screen: Option<Rect>) -> Option<Rect> {
+        match screen {
+            Some(screen) => intersect_rects(frame, screen),
+            None => Some(frame),
+        }
+    }
+    fn roughly_same(a: Rect, b: Rect) -> bool {
+        (a.x - b.x).abs() < 4.0
+            && (a.y - b.y).abs() < 4.0
+            && (a.width - b.width).abs() < 8.0
+            && (a.height - b.height).abs() < 8.0
+    }
+    fn push_unique(rungs: &mut Vec<ScrollAnchorRung>, rung: ScrollAnchorRung) {
+        if !rungs.iter().any(|existing| existing.anchor == rung.anchor) {
+            rungs.push(rung);
+        }
+    }
+
+    if let Some(frame) = ctx
+        .transient
+        .and_then(|frame| clamp_to_screen(frame, ctx.screen))
+    {
+        push_unique(
+            &mut rungs,
+            ScrollAnchorRung {
+                anchor: rect_center_point(frame),
+                strategy: ScrollAnchorStrategy::Transient,
+                frame,
+                container_trusted: false,
+                verify_containment: true,
+            },
+        );
+    }
+
+    if let Some(frame) = ctx
+        .focus_container
+        .and_then(|frame| clamp_to_screen(frame, ctx.screen))
+    {
+        // When the focused element just sits in the main container, the
+        // Container rung below covers it WITH the trusted scrollbar
+        // postcondition — don't shadow it with an untrusted twin.
+        let same_as_main = ctx
+            .container
+            .map_or(false, |main| roughly_same(frame, main));
+        if !same_as_main && !scroll_anchor_frame_is_chrome_strip(frame, ctx.window) {
+            push_unique(
+                &mut rungs,
+                ScrollAnchorRung {
+                    anchor: rect_center_point(frame),
+                    strategy: ScrollAnchorStrategy::FocusContainer,
+                    frame,
+                    container_trusted: false,
+                    verify_containment: true,
+                },
+            );
+        }
+    }
+
     if ctx.container.is_some() {
         match derive_scroll_frame(ctx) {
             Some(frame) if !scroll_anchor_frame_is_chrome_strip(frame, ctx.window) => {
-                rungs.push(ScrollAnchorRung {
-                    anchor: rect_center_point(frame),
-                    strategy: ScrollAnchorStrategy::Container,
-                    container_trusted: true,
-                });
+                push_unique(
+                    &mut rungs,
+                    ScrollAnchorRung {
+                        anchor: rect_center_point(frame),
+                        strategy: ScrollAnchorStrategy::Container,
+                        frame,
+                        container_trusted: true,
+                        verify_containment: false,
+                    },
+                );
             }
             // Chrome strip or disjoint from the window/screen: the
             // container's geometry describes the wrong surface.
@@ -7582,24 +7712,30 @@ fn scroll_anchor_ladder(ctx: &ScrollContext) -> Vec<ScrollAnchorRung> {
     };
     if let Some(frame) = derive_scroll_frame(&window_ctx) {
         let center = rect_center_point(frame);
-        if rungs.last().map_or(true, |rung| rung.anchor != center) {
-            rungs.push(ScrollAnchorRung {
+        push_unique(
+            &mut rungs,
+            ScrollAnchorRung {
                 anchor: center,
                 strategy: ScrollAnchorStrategy::WindowCenter,
+                frame,
                 container_trusted,
-            });
-        }
+                verify_containment: false,
+            },
+        );
         let lower_third = ClickPoint {
             x: center.x,
             y: (frame.y + frame.height * 2.0 / 3.0).round() as i32,
         };
-        if rungs.last().map_or(true, |rung| rung.anchor != lower_third) {
-            rungs.push(ScrollAnchorRung {
+        push_unique(
+            &mut rungs,
+            ScrollAnchorRung {
                 anchor: lower_third,
                 strategy: ScrollAnchorStrategy::WindowLowerThird,
+                frame,
                 container_trusted,
-            });
-        }
+                verify_containment: false,
+            },
+        );
     }
 
     rungs
@@ -7697,8 +7833,7 @@ fn scroll_verification(
         if dy > 0 && post >= 1.0 - SCROLL_BOUNDARY_TOLERANCE {
             return Some((
                 VerificationStatus::ScrollBoundary,
-                "scroll boundary: bottom edge reached; reverse direction or stop scrolling"
-                    .into(),
+                "scroll boundary: bottom edge reached; reverse direction or stop scrolling".into(),
             ));
         }
         if dy < 0 && post <= SCROLL_BOUNDARY_TOLERANCE {
@@ -8399,9 +8534,11 @@ fn observe_until_stable<O: ScreenObserver + ObservationMetadataProvider>(
     poll: Duration,
 ) -> Result<StableObservation, ObservationError> {
     match observer.change_signal() {
-        Some(mut signal) => observe_until_stable_with_sleep(observer, timeout, poll, move |interval| {
-            let _ = signal.wait_for_change(interval);
-        }),
+        Some(mut signal) => {
+            observe_until_stable_with_sleep(observer, timeout, poll, move |interval| {
+                let _ = signal.wait_for_change(interval);
+            })
+        }
         None => observe_until_stable_with_sleep(observer, timeout, poll, thread::sleep),
     }
 }
@@ -8576,9 +8713,13 @@ fn verify_expected_effect<O: ScreenObserver + ObservationMetadataProvider>(
                 let _ = signal.wait_for_change(interval);
             },
         ),
-        None => {
-            verify_expected_effect_with_sleep(observer, pre_state_hash, timeout, poll, thread::sleep)
-        }
+        None => verify_expected_effect_with_sleep(
+            observer,
+            pre_state_hash,
+            timeout,
+            poll,
+            thread::sleep,
+        ),
     }
 }
 
@@ -9303,12 +9444,11 @@ mod tests {
         let first = vec![element(1, "Loading")];
         let stable = vec![element(2, "Ask")];
         let recorded = Rc::new(RefCell::new(Vec::new()));
-        let observer =
-            FakeObserver::new(vec![Ok(first), Ok(stable.clone()), Ok(stable.clone())])
-                .with_change_signals(vec![Box::new(ScriptedChangeSignal {
-                    script: vec![ChangeWait::Notified, ChangeWait::TimedOut].into(),
-                    recorded: Rc::clone(&recorded),
-                })]);
+        let observer = FakeObserver::new(vec![Ok(first), Ok(stable.clone()), Ok(stable.clone())])
+            .with_change_signals(vec![Box::new(ScriptedChangeSignal {
+                script: vec![ChangeWait::Notified, ChangeWait::TimedOut].into(),
+                recorded: Rc::clone(&recorded),
+            })]);
 
         // Poll is longer than the timeout: the polling fallback would sleep
         // through the whole budget and time out, so only an event-driven
@@ -9331,11 +9471,13 @@ mod tests {
         let before_hash = semantic_state_hash(&before);
         let after = vec![element(2, "Settings")];
         let recorded = Rc::new(RefCell::new(Vec::new()));
-        let observer = FakeObserver::new(vec![Ok(after.clone()), Ok(after)])
-            .with_change_signals(vec![Box::new(ScriptedChangeSignal {
-                script: vec![ChangeWait::TimedOut].into(),
-                recorded: Rc::clone(&recorded),
-            })]);
+        let observer =
+            FakeObserver::new(vec![Ok(after.clone()), Ok(after)]).with_change_signals(vec![
+                Box::new(ScriptedChangeSignal {
+                    script: vec![ChangeWait::TimedOut].into(),
+                    recorded: Rc::clone(&recorded),
+                }),
+            ]);
 
         let (report, post) = verify_expected_effect(
             &observer,
@@ -9808,6 +9950,8 @@ mod tests {
                 height: 2000.0, // extends past the screen bottom
             }),
             container_kind: Some(ScrollContainerKind::WebArea),
+            focus_container: None,
+            transient: None,
             window: Some(Rect {
                 x: 0.0,
                 y: 25.0,
@@ -9868,6 +10012,8 @@ mod tests {
                 height: 94.0,
             }),
             container_kind: Some(ScrollContainerKind::ScrollArea),
+            focus_container: None,
+            transient: None,
             window: Some(Rect {
                 x: 0.0,
                 y: 0.0,
@@ -9924,6 +10070,8 @@ mod tests {
                 height: 94.0,
             }),
             container_kind: Some(ScrollContainerKind::ScrollArea),
+            focus_container: None,
+            transient: None,
             window: None,
             screen: Some(Rect {
                 x: 0.0,
@@ -10072,6 +10220,8 @@ mod tests {
                 height: 500.0,
             }),
             container_kind: Some(ScrollContainerKind::ScrollArea),
+            focus_container: None,
+            transient: None,
             window: Some(Rect {
                 x: 0.0,
                 y: 0.0,
@@ -10086,6 +10236,90 @@ mod tests {
             }),
             vertical_position: Some(position),
         }
+    }
+
+    #[test]
+    fn scroll_anchor_ladder_prefers_transient_then_focus_container() {
+        let mut ctx = scroll_test_context(0.2);
+        // An open dropdown portal (small overlay) and a focused list that
+        // differs from the main container.
+        ctx.transient = Some(Rect {
+            x: 200.0,
+            y: 150.0,
+            width: 240.0,
+            height: 320.0,
+        });
+        ctx.focus_container = Some(Rect {
+            x: 190.0,
+            y: 140.0,
+            width: 260.0,
+            height: 380.0,
+        });
+        let ladder = scroll_anchor_ladder(&ctx);
+        assert_eq!(ladder[0].strategy, ScrollAnchorStrategy::Transient);
+        assert_eq!(ladder[0].anchor, ClickPoint { x: 320, y: 310 });
+        assert!(!ladder[0].container_trusted);
+        assert!(ladder[0].verify_containment);
+        assert_eq!(ladder[1].strategy, ScrollAnchorStrategy::FocusContainer);
+        assert!(ladder[1].verify_containment);
+        // The main container and window rungs still follow, trusted.
+        assert_eq!(ladder[2].strategy, ScrollAnchorStrategy::Container);
+        assert!(ladder[2].container_trusted);
+        assert!(!ladder[2].verify_containment);
+    }
+
+    #[test]
+    fn scroll_anchor_ladder_skips_focus_container_matching_main() {
+        let mut ctx = scroll_test_context(0.2);
+        // Focus sits in the main container (the common page case): no
+        // untrusted twin may shadow the trusted Container rung.
+        ctx.focus_container = ctx.container;
+        let ladder = scroll_anchor_ladder(&ctx);
+        assert_eq!(ladder[0].strategy, ScrollAnchorStrategy::Container);
+        assert!(ladder[0].container_trusted);
+        assert!(!ladder
+            .iter()
+            .any(|rung| rung.strategy == ScrollAnchorStrategy::FocusContainer));
+    }
+
+    #[test]
+    fn rect_mostly_within_judges_overlap_not_geometry_containment() {
+        let frame = Rect {
+            x: 100.0,
+            y: 100.0,
+            width: 200.0,
+            height: 200.0,
+        };
+        // An option row inside the dropdown frame passes.
+        assert!(rect_mostly_within(
+            Rect {
+                x: 110.0,
+                y: 120.0,
+                width: 180.0,
+                height: 24.0,
+            },
+            frame
+        ));
+        // A page-sized element behind a stale transient anchor fails.
+        assert!(!rect_mostly_within(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1400.0,
+                height: 900.0,
+            },
+            frame
+        ));
+        // Degenerate hit bounds give no signal and must not demote.
+        assert!(rect_mostly_within(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
+            frame
+        ));
     }
 
     #[test]
@@ -10242,7 +10476,10 @@ mod tests {
                 RecordedInput::ScrollPixels(0, 300),
             ]
         );
-        assert_eq!(report.steps[0].verification.status, VerificationStatus::NoOp);
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::NoOp
+        );
     }
 
     #[test]
@@ -10259,6 +10496,8 @@ mod tests {
                 height: 94.0,
             }),
             container_kind: Some(ScrollContainerKind::ScrollArea),
+            focus_container: None,
+            transient: None,
             window: Some(Rect {
                 x: 0.0,
                 y: 0.0,
@@ -10297,7 +10536,10 @@ mod tests {
             &AgentAbortState::default(),
         ));
 
-        assert_eq!(report.steps[0].verification.status, VerificationStatus::NoOp);
+        assert_eq!(
+            report.steps[0].verification.status,
+            VerificationStatus::NoOp
+        );
         // And the wheel was anchored at the window center, not the strip.
         assert_eq!(
             events.borrow()[0],
@@ -10414,7 +10656,10 @@ mod tests {
 
         assert!(err.contains("ambiguous"), "got: {err}");
         assert!(err.contains("iPhone 17 Pro 6.3-inch display"), "got: {err}");
-        assert!(err.contains("iPhone 17 Pro Max 6.9-inch display"), "got: {err}");
+        assert!(
+            err.contains("iPhone 17 Pro Max 6.9-inch display"),
+            "got: {err}"
+        );
         assert!(err.contains("nth"), "got: {err}");
     }
 
@@ -10711,10 +10956,7 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         let report = block_on(run_stub_agent_loop(
             &observer,
-            &StubPlanner::sequence(vec![
-                Action::Scroll { dx: 0, dy: 300 };
-                6
-            ]),
+            &StubPlanner::sequence(vec![Action::Scroll { dx: 0, dy: 300 }; 6]),
             StubAgentOptions {
                 execution_policy: Some(ExecutionPolicy::Auto),
                 max_steps: Some(6),
@@ -10873,10 +11115,7 @@ mod tests {
             SettlingPreflightFactory {
                 events: events.clone(),
                 clicks: clicks.clone(),
-                stale_reads: Rc::new(RefCell::new(VecDeque::from([ClickPoint {
-                    x: 20,
-                    y: 0,
-                }]))),
+                stale_reads: Rc::new(RefCell::new(VecDeque::from([ClickPoint { x: 20, y: 0 }]))),
             },
             &NoCalibrationProbe,
             &NoConfirmationRequester,
@@ -11058,6 +11297,8 @@ mod tests {
         let outside_window = ScrollContext {
             container: None,
             container_kind: None,
+            focus_container: None,
+            transient: None,
             window: Some(Rect {
                 x: 200.0,
                 y: 100.0,
@@ -11134,6 +11375,8 @@ mod tests {
         let containing_window = ScrollContext {
             container: None,
             container_kind: None,
+            focus_container: None,
+            transient: None,
             window: Some(Rect {
                 x: 0.0,
                 y: 0.0,
@@ -12359,10 +12602,7 @@ mod tests {
         };
         let mut click_recovery = StuckRecovery::default();
         click_recovery.escalate(&click_entry, 3, "click 'Send'");
-        assert!(!click_recovery
-            .notice()
-            .unwrap()
-            .contains("Typing produced"));
+        assert!(!click_recovery.notice().unwrap().contains("Typing produced"));
     }
 
     #[test]
@@ -12392,7 +12632,11 @@ mod tests {
             recovery.escalate_rejection("type:abc", display, hint),
             StuckRecoveryStage::AskUser
         );
-        assert!(recovery.pending_question.as_deref().unwrap().contains(display));
+        assert!(recovery
+            .pending_question
+            .as_deref()
+            .unwrap()
+            .contains(display));
         assert_eq!(
             recovery.escalate_rejection("type:abc", display, hint),
             StuckRecoveryStage::Exhausted
@@ -12841,7 +13085,10 @@ mod tests {
         let move_pos = events
             .iter()
             .position(|event| matches!(event, RecordedInput::Move(_)));
-        assert!(activate_pos.is_some(), "expected a focus-restore activation");
+        assert!(
+            activate_pos.is_some(),
+            "expected a focus-restore activation"
+        );
         assert!(
             activate_pos.unwrap() < move_pos.unwrap(),
             "focus restore must happen before the approved click"
@@ -13130,7 +13377,7 @@ mod tests {
             Ok(vec![element(1, "Ask"), element(2, "Results")]),
         ])
         .with_page_texts(vec![Ok(
-            "iPhone 17 Pro - Apple unveils A19 Pro chip".to_string(),
+            "iPhone 17 Pro - Apple unveils A19 Pro chip".to_string()
         )]);
         let goals = Rc::new(RefCell::new(Vec::<String>::new()));
         let planner = GoalRecordingActionPlanner {
@@ -13266,7 +13513,10 @@ mod tests {
     #[test]
     fn find_ui_is_intercepted_and_reports_observation_matches() {
         let observer = FakeObserver::new(vec![
-            Ok(vec![element(1, "Ask"), element(2, "Export as PDF…")]);
+            Ok(vec![
+                element(1, "Ask"),
+                element(2, "Export as PDF…")
+            ]);
             6
         ]);
         let results = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -13343,7 +13593,10 @@ mod tests {
     #[test]
     fn find_ui_ranks_menu_paths_before_observation_elements() {
         let observer = FakeObserver::new(vec![
-            Ok(vec![element(1, "Ask"), element(2, "Export as PDF…")]);
+            Ok(vec![
+                element(1, "Ask"),
+                element(2, "Export as PDF…")
+            ]);
             6
         ])
         .with_menu_tree(vec![
@@ -13416,14 +13669,10 @@ mod tests {
         let other = Action::FindUi {
             query: "word count".into(),
         };
-        assert!(planner_action_rejection_reason(
-            &other,
-            &prepared,
-            &[],
-            &prior,
-            "export the note"
-        )
-        .is_none());
+        assert!(
+            planner_action_rejection_reason(&other, &prepared, &[], &prior, "export the note")
+                .is_none()
+        );
 
         // Verified progress since the search resets the dedupe window.
         let progressed = vec![
@@ -13624,8 +13873,7 @@ mod tests {
 
     #[test]
     fn unverified_menu_press_writes_no_hint() {
-        let dir =
-            std::env::temp_dir().join(format!("screenie-hint-noop-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("screenie-hint-noop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let menu_path = vec!["File".to_string(), "Export as PDF…".to_string()];
 
@@ -13703,7 +13951,9 @@ mod tests {
             None,
             &options,
         );
-        assert!(store.lookup(&app, "close everything", 3, now_ms()).is_empty());
+        assert!(store
+            .lookup(&app, "close everything", 3, now_ms())
+            .is_empty());
 
         // An incidental key press (Return) after a lookup that claimed a
         // different shortcut must not be cached as the feature's shortcut.
@@ -15152,7 +15402,11 @@ mod tests {
             text: "secret".into(),
         };
         let prepared = prepare_action(&typed, std::slice::from_ref(&field)).unwrap();
-        assert!(secure_typing_target(&typed, &prepared, std::slice::from_ref(&field)));
+        assert!(secure_typing_target(
+            &typed,
+            &prepared,
+            std::slice::from_ref(&field)
+        ));
 
         let focused = Action::TypeFocused {
             text: "secret".into(),
@@ -15540,7 +15794,11 @@ mod tests {
         let observer = FakeObserver::new(vec![
             Ok(vec![to.clone(), subject.clone(), body.clone()]),
             Ok(vec![to_filled.clone(), subject.clone(), body.clone()]),
-            Ok(vec![to_filled.clone(), subject_filled.clone(), body.clone()]),
+            Ok(vec![
+                to_filled.clone(),
+                subject_filled.clone(),
+                body.clone(),
+            ]),
             Ok(vec![
                 to_filled.clone(),
                 subject_filled.clone(),
@@ -15656,9 +15914,7 @@ mod tests {
         assert!(
             applescript_rejection("with administrator privileges\ntell app \"Finder\"").is_some()
         );
-        assert!(
-            applescript_rejection("tell application \"Notes\" to make new note").is_none()
-        );
+        assert!(applescript_rejection("tell application \"Notes\" to make new note").is_none());
     }
 
     #[test]
@@ -15745,10 +16001,8 @@ mod tests {
             _obs: &[Element],
             history: &[PlannerHistoryEntry],
         ) -> PlannerDecision {
-            *self.seen_results.borrow_mut() = history
-                .iter()
-                .map(|entry| entry.result.clone())
-                .collect();
+            *self.seen_results.borrow_mut() =
+                history.iter().map(|entry| entry.result.clone()).collect();
             if history.is_empty() {
                 PlannerDecision::new(
                     "make a note",
@@ -15884,7 +16138,9 @@ mod tests {
         );
         let recorded = results.borrow();
         assert!(
-            recorded.iter().any(|result| result.contains("fail deferred")),
+            recorded
+                .iter()
+                .any(|result| result.contains("fail deferred")),
             "planner must see the pushback feedback: {recorded:?}"
         );
     }
@@ -16148,8 +16404,9 @@ mod tests {
                 PlannerDecision::new(
                     "planner output invalid",
                     Action::Fail {
-                        reason: "planner output invalid after retry: type does not allow field(s): url"
-                            .into(),
+                        reason:
+                            "planner output invalid after retry: type does not allow field(s): url"
+                                .into(),
                     },
                 )
             } else {
@@ -16261,10 +16518,7 @@ mod tests {
             }
         }
 
-        fn with_prepare_visual_results(
-            self,
-            results: Vec<Result<(), ObservationError>>,
-        ) -> Self {
+        fn with_prepare_visual_results(self, results: Vec<Result<(), ObservationError>>) -> Self {
             *self.prepare_visual_results.borrow_mut() = results.into();
             self
         }
@@ -16430,10 +16684,7 @@ mod tests {
             self.vision_context.borrow().clone()
         }
 
-        fn prepare_planning_visual_context(
-            &self,
-            _ax: &[Element],
-        ) -> Result<(), ObservationError> {
+        fn prepare_planning_visual_context(&self, _ax: &[Element]) -> Result<(), ObservationError> {
             self.prepare_visual_calls
                 .set(self.prepare_visual_calls.get() + 1);
             self.prepare_visual_results
@@ -16694,10 +16945,7 @@ mod tests {
 
     #[test]
     fn done_with_remember_persists_memory_and_feeds_matching_reruns() {
-        let dir = std::env::temp_dir().join(format!(
-            "screenie-exec-memory-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("screenie-exec-memory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         // A failed run never writes, even with a remember on the decision.
@@ -16713,8 +16961,7 @@ mod tests {
         assert!(saved.borrow().is_empty());
 
         // Done without remember writes nothing either.
-        let (_, saved, report) =
-            memory_run(&dir, "compare mac mini prices", Action::Done, None);
+        let (_, saved, report) = memory_run(&dir, "compare mac mini prices", Action::Done, None);
         assert_eq!(report.status, AgentRunStatus::Done);
         assert!(saved.borrow().is_empty());
 
@@ -16744,10 +16991,8 @@ mod tests {
 
     #[test]
     fn remember_on_an_earlier_step_never_leaks_into_done() {
-        let dir = std::env::temp_dir().join(format!(
-            "screenie-exec-memory-stale-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("screenie-exec-memory-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         // Decision 1 (a click) smuggles a remember; the Done decision carries
