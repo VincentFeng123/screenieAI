@@ -635,13 +635,14 @@ mod tests {
         );
     }
 
-    /// Provider drift guard. Ignored until the OpenAI strict schema is
-    /// generated mechanically from the planner schema (registry commit A4);
-    /// today it documents the live drift: 14 of 25 actions, no target_name.
+    /// Provider drift guard: the OpenAI strict schema is derived mechanically
+    /// from the planner schema, so it must cover every registry action and
+    /// the target-intent fields. This was a live bug — the previous
+    /// hand-maintained copy had 14 of 25 actions and no target_name, making
+    /// the OpenAI provider unable to emit a valid click at all.
     #[test]
-    #[ignore = "fixed when openai_strictify replaces the hand-built strict schema"]
     fn openai_strict_schema_covers_registry() {
-        let schema = crate::ai::decision::openai_strict_decision_schema();
+        let schema = crate::ai::decision::openai_strictify(&planner_response_schema());
         let openai_enum: Vec<String> = schema["properties"]["action"]["enum"]
             .as_array()
             .expect("action enum")
@@ -652,6 +653,12 @@ mod tests {
         let properties = schema["properties"].as_object().expect("properties");
         assert!(properties.contains_key("target_name"));
         assert!(properties.contains_key("target_role"));
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
         for spec in ACTIONS {
             for field in spec.fields {
                 assert!(
@@ -660,6 +667,9 @@ mod tests {
                     spec.name,
                     field.name
                 );
+                // Strict mode requires every property; optional ones must be
+                // nullable so the model can omit them by emitting null.
+                assert!(required.contains(&field.name));
             }
         }
     }

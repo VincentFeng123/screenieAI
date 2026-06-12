@@ -482,7 +482,7 @@ pub(crate) fn openai_decision_body(prompt: &DecisionPrompt, model: &str) -> Valu
             "json_schema": {
                 "name": "computer_action",
                 "strict": true,
-                "schema": openai_schema_for_prompt(prompt)
+                "schema": openai_strictify(&prompt.schema)
             }
         }),
     );
@@ -551,7 +551,7 @@ pub(crate) fn openai_vision_decision_body(
             "json_schema": {
                 "name": "computer_action",
                 "strict": true,
-                "schema": openai_schema_for_prompt(prompt)
+                "schema": openai_strictify(&prompt.schema)
             }
         }),
     );
@@ -566,225 +566,83 @@ pub(crate) fn openai_vision_decision_body(
     Value::Object(body)
 }
 
-fn openai_schema_for_prompt(prompt: &DecisionPrompt) -> Value {
-    if prompt_uses_vision_control_schema(prompt) {
-        openai_strict_vision_control_schema()
-    } else if prompt
-        .schema
-        .get("properties")
-        .and_then(|properties| properties.get("milestones"))
-        .is_some()
-    {
-        openai_strict_milestones_schema()
-    } else if prompt
-        .schema
-        .get("properties")
-        .and_then(|properties| properties.get("x"))
-        .is_some()
-    {
-        openai_strict_coordinate_schema()
-    } else {
-        openai_strict_decision_schema()
+/// Transform a planner-authored JSON schema into OpenAI strict mode's
+/// dialect: every object node requires every property (originally-optional
+/// properties become nullable), `additionalProperties` is pinned false, and
+/// keywords outside the supported set are dropped (length caps are enforced
+/// client-side by the parser's truncation). Applied mechanically to whatever
+/// schema the prompt carries, so the OpenAI request can never drift from the
+/// planner contract again.
+pub(crate) fn openai_strictify(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let originally_required: Vec<&str> = map
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|entries| entries.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let mut out = Map::new();
+            for (key, entry) in map {
+                match key.as_str() {
+                    "properties" => {
+                        let Some(properties) = entry.as_object() else {
+                            continue;
+                        };
+                        let strict_properties: Map<String, Value> = properties
+                            .iter()
+                            .map(|(name, property)| {
+                                let mut strict = openai_strictify(property);
+                                if !originally_required.contains(&name.as_str()) {
+                                    null_union_type(&mut strict);
+                                }
+                                (name.clone(), strict)
+                            })
+                            .collect();
+                        out.insert("properties".into(), Value::Object(strict_properties));
+                    }
+                    "items" => {
+                        out.insert("items".into(), openai_strictify(entry));
+                    }
+                    "type" | "enum" | "minimum" | "maximum" | "minItems" | "maxItems" => {
+                        out.insert(key.clone(), entry.clone());
+                    }
+                    // required/additionalProperties are regenerated below;
+                    // everything else (maxLength, ...) is unsupported in
+                    // strict mode and dropped.
+                    _ => {}
+                }
+            }
+            if let Some(properties) = out.get("properties").and_then(Value::as_object) {
+                let names: Vec<String> = properties.keys().cloned().collect();
+                out.insert("required".into(), json!(names));
+                out.insert("additionalProperties".into(), json!(false));
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
     }
 }
 
-fn prompt_uses_vision_control_schema(prompt: &DecisionPrompt) -> bool {
-    let Some(properties) = prompt.schema.get("properties") else {
-        return false;
+/// Strict mode's documented optional-field emulation: union the property's
+/// type with "null" (enum value lists stay untouched).
+fn null_union_type(property: &mut Value) {
+    let Some(map) = property.as_object_mut() else {
+        return;
     };
-    properties.get("observation").is_some()
-        && properties
-            .get("action")
-            .and_then(|action| action.get("type"))
-            .and_then(Value::as_str)
-            == Some("object")
-}
-
-pub(crate) fn openai_strict_decision_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "reason",
-            "action",
-            "app",
-            "id",
-            "text",
-            "combo",
-            "path",
-            "question",
-            "options",
-            "dx",
-            "dy",
-            "ms",
-            "url",
-            "query",
-            "reason_detail",
-            "note",
-            "expect",
-            "milestone_done",
-            "next"
-        ],
-        "properties": {
-            "reason": { "type": "string" },
-            "action": {
-                "type": "string",
-                "enum": ["activateApp", "click", "doubleClick", "type", "key", "menu", "scroll", "wait", "openUrl", "webSearch", "readPage", "ask", "done", "fail"]
-            },
-            "app": { "type": ["string", "null"] },
-            "id": { "type": ["integer", "null"], "minimum": 0 },
-            "text": { "type": ["string", "null"] },
-            "combo": { "type": ["string", "null"] },
-            "path": {
-                "type": ["array", "null"],
-                "items": { "type": "string" }
-            },
-            "question": { "type": ["string", "null"] },
-            "options": {
-                "type": ["array", "null"],
-                "items": { "type": "string" }
-            },
-            "dx": { "type": ["integer", "null"] },
-            "dy": { "type": ["integer", "null"] },
-            "ms": { "type": ["integer", "null"], "minimum": 0 },
-            "url": { "type": ["string", "null"] },
-            "query": { "type": ["string", "null"] },
-            "reason_detail": { "type": ["string", "null"] },
-            "note": { "type": ["string", "null"] },
-            "expect": { "type": ["string", "null"] },
-            "milestone_done": { "type": ["boolean", "null"] },
-            "next": {
-                "type": ["array", "null"],
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["action", "id", "text", "combo", "dx", "dy", "ms"],
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["click", "type", "key", "scroll", "wait"]
-                        },
-                        "id": { "type": ["integer", "null"], "minimum": 0 },
-                        "text": { "type": ["string", "null"] },
-                        "combo": { "type": ["string", "null"] },
-                        "dx": { "type": ["integer", "null"] },
-                        "dy": { "type": ["integer", "null"] },
-                        "ms": { "type": ["integer", "null"], "minimum": 0 }
-                    }
+    match map.get("type") {
+        Some(Value::String(single)) => {
+            let single = single.clone();
+            map.insert("type".into(), json!([single, "null"]));
+        }
+        Some(Value::Array(_)) => {
+            if let Some(Value::Array(types)) = map.get_mut("type") {
+                if !types.iter().any(|entry| entry == "null") {
+                    types.push(json!("null"));
                 }
             }
         }
-    })
-}
-
-pub(crate) fn openai_strict_milestones_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["milestones"],
-        "properties": {
-            "milestones": {
-                "type": "array",
-                "items": { "type": "string" }
-            }
-        }
-    })
-}
-
-pub(crate) fn openai_strict_coordinate_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "reason",
-            "action",
-            "x",
-            "y",
-            "ms",
-            "reason_detail"
-        ],
-        "properties": {
-            "reason": { "type": "string" },
-            "action": {
-                "type": "string",
-                "enum": ["click", "doubleClick", "wait", "done", "fail"]
-            },
-            "x": { "type": ["integer", "null"], "minimum": 0 },
-            "y": { "type": ["integer", "null"], "minimum": 0 },
-            "ms": { "type": ["integer", "null"], "minimum": 0 },
-            "reason_detail": { "type": ["string", "null"] }
-        }
-    })
-}
-
-pub(crate) fn openai_strict_vision_control_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["observation", "target", "reasoning", "action"],
-        "properties": {
-            "observation": { "type": "string" },
-            "target": { "type": "string" },
-            "reasoning": { "type": "string" },
-            "action": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                    "type",
-                    "x",
-                    "y",
-                    "from",
-                    "to",
-                    "text",
-                    "keys",
-                    "dx",
-                    "dy",
-                    "ms",
-                    "result",
-                    "reason"
-                ],
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": [
-                            "click",
-                            "double_click",
-                            "right_click",
-                            "move",
-                            "drag",
-                            "type",
-                            "key",
-                            "scroll",
-                            "wait",
-                            "done",
-                            "fail"
-                        ]
-                    },
-                    "x": { "type": ["integer", "null"], "minimum": 0 },
-                    "y": { "type": ["integer", "null"], "minimum": 0 },
-                    "from": {
-                        "type": ["array", "null"],
-                        "minItems": 2,
-                        "maxItems": 2,
-                        "items": { "type": "integer", "minimum": 0 }
-                    },
-                    "to": {
-                        "type": ["array", "null"],
-                        "minItems": 2,
-                        "maxItems": 2,
-                        "items": { "type": "integer", "minimum": 0 }
-                    },
-                    "text": { "type": ["string", "null"] },
-                    "keys": { "type": ["string", "null"] },
-                    "dx": { "type": ["integer", "null"] },
-                    "dy": { "type": ["integer", "null"] },
-                    "ms": { "type": ["integer", "null"], "minimum": 0 },
-                    "result": { "type": ["string", "null"] },
-                    "reason": { "type": ["string", "null"] }
-                }
-            }
-        }
-    })
+        _ => {}
+    }
 }
 
 pub(crate) fn gemini_decision_body(prompt: &DecisionPrompt, model: &str) -> Value {
@@ -1064,16 +922,83 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        // The strict schema is derived from the prompt's schema, never a
+        // hand-maintained copy — that copy drifted in production once.
         assert_eq!(
             body["response_format"]["json_schema"]["schema"],
-            openai_strict_decision_schema()
+            openai_strictify(&prompt.schema)
         );
-        assert!(body["response_format"]["json_schema"]["schema"]["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("reason_detail")));
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["max_tokens"], MAX_DECISION_TOKENS);
+    }
+
+    #[test]
+    fn openai_strictify_requires_all_fields_and_nullifies_optionals() {
+        let strict = openai_strictify(&json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reason", "action"],
+            "properties": {
+                "reason": { "type": "string", "maxLength": 200 },
+                "action": { "type": "string", "enum": ["click", "done"] },
+                "scope": { "type": "string", "enum": ["screen", "window"] },
+                "id": { "type": "integer", "minimum": 0 },
+                "next": {
+                    "type": "array",
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "required": ["action"],
+                        "properties": {
+                            "action": { "type": "string" },
+                            "ms": { "type": "integer", "minimum": 0 }
+                        }
+                    }
+                }
+            }
+        }));
+
+        // Every property required, additionalProperties pinned, at every level.
+        assert_eq!(
+            strict["required"],
+            json!(["action", "id", "next", "reason", "scope"])
+        );
+        assert_eq!(strict["additionalProperties"], json!(false));
+        assert_eq!(
+            strict["properties"]["next"]["items"]["required"],
+            json!(["action", "ms"])
+        );
+        assert_eq!(
+            strict["properties"]["next"]["items"]["additionalProperties"],
+            json!(false)
+        );
+
+        // Originally-required properties keep their plain type; optional ones
+        // become nullable, with enum value lists untouched (the documented
+        // strict-mode optional-field emulation).
+        assert_eq!(strict["properties"]["reason"]["type"], json!("string"));
+        assert_eq!(strict["properties"]["action"]["type"], json!("string"));
+        assert_eq!(
+            strict["properties"]["scope"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            strict["properties"]["scope"]["enum"],
+            json!(["screen", "window"])
+        );
+        assert_eq!(
+            strict["properties"]["id"]["type"],
+            json!(["integer", "null"])
+        );
+        assert_eq!(
+            strict["properties"]["next"]["items"]["properties"]["ms"]["type"],
+            json!(["integer", "null"])
+        );
+
+        // Unsupported keywords are dropped; supported bounds survive.
+        assert!(strict["properties"]["reason"].get("maxLength").is_none());
+        assert_eq!(strict["properties"]["id"]["minimum"], json!(0));
+        assert_eq!(strict["properties"]["next"]["maxItems"], json!(3));
     }
 
     #[test]
@@ -1204,7 +1129,7 @@ mod tests {
         assert_eq!(openai["response_format"]["json_schema"]["strict"], true);
         assert_eq!(
             openai["response_format"]["json_schema"]["schema"],
-            openai_strict_decision_schema()
+            openai_strictify(&prompt.schema)
         );
 
         let gemini = gemini_vision_decision_body(&prompt, "gemini-2.5-flash", "png123");
@@ -1220,30 +1145,9 @@ mod tests {
     }
 
     #[test]
-    fn openai_vision_coordinate_prompt_uses_coordinate_schema() {
-        let prompt = DecisionPrompt {
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "reason": { "type": "string" },
-                    "action": { "type": "string" },
-                    "x": { "type": "integer" },
-                    "y": { "type": "integer" }
-                },
-                "required": ["reason", "action"]
-            }),
-            ..prompt()
-        };
-        let body = openai_vision_decision_body(&prompt, "gpt-4o", "png123");
-
-        assert_eq!(
-            body["response_format"]["json_schema"]["schema"],
-            openai_strict_coordinate_schema()
-        );
-    }
-
-    #[test]
-    fn openai_vision_control_prompt_uses_nested_action_schema() {
+    fn openai_vision_control_prompt_strictifies_nested_action_schema() {
+        // The grounding contract's nested action object goes through the same
+        // mechanical transform — no sniffing, no parallel hand-built schema.
         let prompt = DecisionPrompt {
             schema: json!({
                 "type": "object",
@@ -1253,8 +1157,10 @@ mod tests {
                     "reasoning": { "type": "string" },
                     "action": {
                         "type": "object",
+                        "required": ["type"],
                         "properties": {
-                            "type": { "type": "string" }
+                            "type": { "type": "string", "enum": ["click", "done"] },
+                            "x": { "type": "integer", "minimum": 0 }
                         }
                     }
                 },
@@ -1263,10 +1169,24 @@ mod tests {
             ..prompt()
         };
         let body = openai_vision_decision_body(&prompt, "gpt-4o", "png123");
+        let schema = &body["response_format"]["json_schema"]["schema"];
 
         assert_eq!(
-            body["response_format"]["json_schema"]["schema"],
-            openai_strict_vision_control_schema()
+            schema["required"],
+            json!(["action", "observation", "reasoning", "target"])
+        );
+        assert_eq!(schema["properties"]["action"]["required"], json!(["type", "x"]));
+        assert_eq!(
+            schema["properties"]["action"]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            schema["properties"]["action"]["properties"]["type"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            schema["properties"]["action"]["properties"]["x"]["type"],
+            json!(["integer", "null"])
         );
     }
 
