@@ -3,7 +3,11 @@
 
 export type VoiceBackendStatus = "idle" | "listening" | "transcribing";
 
-export type VoiceModelName = "tiny.en" | "base.en" | "small.en";
+export type VoiceModelName =
+  | "tiny.en"
+  | "base.en"
+  | "small.en"
+  | "large-v3-turbo";
 
 export type VoiceConfig = {
   silenceMs: number;
@@ -16,7 +20,10 @@ export type VoiceStatusPayload = {
   modelPresent: boolean;
   micPermission: "authorized" | "denied" | "undetermined" | "unknown";
   config: VoiceConfig;
+  queuePaused: boolean;
 };
+
+export type VoiceQueuePayload = { paused: boolean };
 
 export type VoiceLevelPayload = { rms: number };
 
@@ -29,7 +36,8 @@ export type VoiceChipState =
   | "done"
   | "failed"
   | "blocked_on_confirmation"
-  | "killed";
+  | "killed"
+  | "removed";
 
 export type VoiceTaskPayload = { id: string; state: VoiceChipState };
 

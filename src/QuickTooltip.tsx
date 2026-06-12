@@ -231,7 +231,8 @@ const QUICK_TOOLTIP_FROST_REGION_SELECTOR = [
   ".quick-tooltip-shell",
   ".quick-tooltip-status-card",
   ".quick-tooltip-chat-panel",
-  ".quick-tooltip-agent-row",
+  ".quick-tooltip-agent-composer",
+  ".quick-tooltip-voice-feed",
   ".screenie-select-menu-portal",
 ].join(", ");
 const QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR =
@@ -239,8 +240,8 @@ const QUICK_TOOLTIP_STATUS_CONTENT_SELECTOR =
 const QUICK_TOOLTIP_STATUS_MIN_HEIGHT = 82;
 const QUICK_TOOLTIP_STATUS_MAX_HEIGHT = 420;
 // Must match QUICK_TOOLTIP_AGENT_CARD_H / _MAX_H in src-tauri/src/lib.rs.
-const QUICK_TOOLTIP_AGENT_CARD_MIN_HEIGHT = 88;
-const QUICK_TOOLTIP_AGENT_CARD_MAX_HEIGHT = 300;
+const QUICK_TOOLTIP_AGENT_CARD_MIN_HEIGHT = 106;
+const QUICK_TOOLTIP_AGENT_CARD_MAX_HEIGHT = 340;
 
 const QUICK_TOOLTIP_DRAG_BLOCKERS =
   'button, input, textarea, select, a, [role="button"], [role="listbox"], .screenie-select, .screenie-select-menu-portal, .quick-tooltip-agent-card';
@@ -528,7 +529,7 @@ export default function QuickTooltip() {
   const runSeqRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
-  const agentInputRef = useRef<HTMLInputElement>(null);
+  const agentInputRef = useRef<HTMLTextAreaElement>(null);
   const statusCardRef = useRef<HTMLElement>(null);
   const agentInputOpenRef = useRef(false);
   const agentFormRef = useRef<HTMLDivElement>(null);
@@ -836,6 +837,21 @@ export default function QuickTooltip() {
     setQuickTooltipKeyboardMode(false).catch(() => {});
   }, [setQuickTooltipKeyboardMode]);
 
+  // Inline chip editing mirrors the main input's keyboard claim/restore:
+  // claim on focus; on exit, hand keys back to the target app only during a
+  // hands-free session (same condition as the input's onBlur).
+  const handleChipEditFocus = useCallback(() => {
+    setQuickTooltipKeyboardMode(true).catch(() => {});
+  }, [setQuickTooltipKeyboardMode]);
+
+  const handleChipEditBlur = useCallback(() => {
+    if (voiceActiveRef.current) {
+      restoreQuickTooltipKeyboardMode();
+    }
+    // Outside a hands-free session the open card keeps the keyboard —
+    // deliberately no-op.
+  }, [restoreQuickTooltipKeyboardMode]);
+
   const closeAgentInput = useCallback(() => {
     if (!agentInputOpenRef.current) return;
     agentInputOpenRef.current = false;
@@ -902,6 +918,42 @@ export default function QuickTooltip() {
     return () => window.clearTimeout(id);
   }, [confirmation]);
 
+  // Auto-grow the goal textarea with its content. Collapse to 0 before
+  // reading scrollHeight so the measurement is pure content + padding. CSS
+  // min/max-height clamp the result (42px single line .. ~5 lines), and the
+  // form's ResizeObserver grows the card + native window to follow.
+  const syncAgentInputHeight = useCallback(() => {
+    const el = agentInputRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = `${el.scrollHeight}px`;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!agentInputOpen) return;
+    syncAgentInputHeight();
+  }, [agentInputOpen, agentGoal, syncAgentInputHeight]);
+
+  // The card mounts while the native window is still pill-width, so the
+  // first measurement can see a WRAPPED placeholder (two lines -> 62px) and
+  // never correct itself once the window widens. Re-sync whenever the
+  // textarea's width changes; ignore the observer's echoes of our own
+  // height writes.
+  useLayoutEffect(() => {
+    if (!agentInputOpen) return;
+    const el = agentInputRef.current;
+    if (!el) return;
+    let lastWidth = el.clientWidth;
+    const ro = new ResizeObserver(() => {
+      const width = el.clientWidth;
+      if (width === lastWidth) return;
+      lastWidth = width;
+      syncAgentInputHeight();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [agentInputOpen, syncAgentInputHeight]);
+
   // The agent card grows with the voice feed (statusHeight pattern): the
   // form is content-sized, the measurement drives both the CSS var and the
   // native window height.
@@ -967,18 +1019,71 @@ export default function QuickTooltip() {
     }
   }, [voice, restoreQuickTooltipKeyboardMode, setQuickTooltipKeyboardMode]);
 
+  // Which way the card's dropdown menus open, decided by the toolbar's
+  // position on its monitor (only Rust knows that): "below" grows the
+  // native window downward as before; "above" keeps the window as-is and
+  // the menu overlays the card upward. Re-queried when the card opens,
+  // the card height changes, on menu open/close, and (debounced) when the
+  // window moves — so a dragged toolbar has a fresh answer BEFORE the next
+  // menu open. Rust enforces the no-clamp rule independently, so a stale
+  // value here can mis-place the menu for a frame but never move the
+  // window.
+  const [agentMenuPlacement, setAgentMenuPlacement] = useState<"below" | "above">(
+    "below",
+  );
+  useEffect(() => {
+    if (!agentInputOpen) return;
+    let cancelled = false;
+    let moveTimer: number | null = null;
+    const query = () => {
+      invoke<string>("quick_tooltip_menu_direction", { agentCardHeight })
+        .then((direction) => {
+          if (cancelled) return;
+          setAgentMenuPlacement(direction === "above" ? "above" : "below");
+        })
+        .catch((e) => {
+          console.error("quick_tooltip_menu_direction failed:", e);
+        });
+    };
+    query();
+    let offMoved: (() => void) | null = null;
+    getCurrentWindow()
+      .onMoved(() => {
+        if (moveTimer !== null) window.clearTimeout(moveTimer);
+        moveTimer = window.setTimeout(query, 120);
+      })
+      .then((off) => {
+        if (cancelled) {
+          off();
+        } else {
+          offMoved = off;
+        }
+      })
+      .catch((e) => {
+        console.error("tooltip move listener failed:", e);
+      });
+    return () => {
+      cancelled = true;
+      if (moveTimer !== null) window.clearTimeout(moveTimer);
+      offMoved?.();
+    };
+  }, [agentInputOpen, agentCardHeight, agentModelMenuOpen]);
+
   useEffect(() => {
     invoke("resize_quick_tooltip", {
       expanded: chatVisible,
       agentInputOpen,
-      agentModelMenuOpen,
+      // An upward-opening menu needs no extra window: growing would jump
+      // the whole toolbar up (the monitor clamp) — the exact thing the
+      // "above" placement avoids.
+      agentModelMenuOpen: agentModelMenuOpen && agentMenuPlacement === "below",
       statusOpen: hasStatus,
       statusHeight: hasStatus ? statusHeight : undefined,
       agentCardHeight: agentInputOpen ? agentCardHeight : undefined,
     }).catch((e) => {
         console.error("resize_quick_tooltip failed:", e);
     });
-  }, [agentCardHeight, agentInputOpen, agentModelMenuOpen, chatVisible, hasStatus, statusHeight]);
+  }, [agentCardHeight, agentInputOpen, agentMenuPlacement, agentModelMenuOpen, chatVisible, hasStatus, statusHeight]);
 
   useEffect(() => {
     if (!chatVisible) return;
@@ -1353,121 +1458,143 @@ export default function QuickTooltip() {
             className="quick-tooltip-agent-form"
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <div className="quick-tooltip-agent-row">
-              <input
-                ref={agentInputRef}
-                value={agentGoal}
-                onChange={(e) => setAgentGoal(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    closeAgentInput();
-                  } else if (e.key === "Enter") {
-                    e.preventDefault();
+            <div className="quick-tooltip-agent-composer">
+              <div className="quick-tooltip-agent-row">
+                <textarea
+                  ref={agentInputRef}
+                  value={agentGoal}
+                  rows={1}
+                  onChange={(e) => setAgentGoal(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      closeAgentInput();
+                    } else if (e.key === "Enter" && !e.shiftKey) {
+                      // Shift+Enter inserts a newline; plain Enter submits.
+                      e.preventDefault();
+                      void submitAgentGoal();
+                    }
+                  }}
+                  onFocus={() => {
+                    // Clicking into the field always reclaims keystrokes —
+                    // covers both hands-free sessions (keys defaulted to the
+                    // target app) and the just-stopped-voice state.
+                    setQuickTooltipKeyboardMode(true).catch(() => {});
+                  }}
+                  onBlur={() => {
+                    if (voiceActiveRef.current) {
+                      restoreQuickTooltipKeyboardMode();
+                    }
+                  }}
+                  placeholder="Tell Screenie what to do"
+                  aria-label="Tell Screenie what to do"
+                />
+                <VoiceMicButton
+                  state={voiceMicState}
+                  onToggle={() => {
+                    void toggleVoice();
+                  }}
+                />
+                <button
+                  type="button"
+                  className="quick-tooltip-agent-submit screenie-send"
+                  onClick={() => {
                     void submitAgentGoal();
-                  }
-                }}
-                onFocus={() => {
-                  // Clicking into the field always reclaims keystrokes —
-                  // covers both hands-free sessions (keys defaulted to the
-                  // target app) and the just-stopped-voice state.
-                  setQuickTooltipKeyboardMode(true).catch(() => {});
-                }}
-                onBlur={() => {
-                  if (voiceActiveRef.current) {
-                    restoreQuickTooltipKeyboardMode();
-                  }
-                }}
-                placeholder="Tell Screenie what to do"
-                aria-label="Tell Screenie what to do"
-              />
-              <VoiceMicButton
-                state={voiceMicState}
-                onToggle={() => {
-                  void toggleVoice();
-                }}
-              />
-              <button
-                type="button"
-                className="quick-tooltip-agent-submit screenie-send"
-                onClick={() => {
-                  void submitAgentGoal();
-                }}
-                aria-label="Start agent task"
-                title="Start agent task"
-                disabled={!agentGoal.trim() || agentRunning || voice.busy}
-              >
-                <ArrowUp size={15} strokeWidth={2} aria-hidden />
-              </button>
-              <SvgInsetBorder radius={999} strokeAlpha={0.2} />
+                  }}
+                  aria-label="Start agent task"
+                  title="Start agent task"
+                  disabled={!agentGoal.trim() || agentRunning || voice.busy}
+                >
+                  <ArrowUp size={15} strokeWidth={2} aria-hidden />
+                </button>
+              </div>
+              {voice.active && (
+                <VoiceLevelMeter fillRef={voice.meterFillRef} />
+              )}
+              <div className="quick-tooltip-agent-model-row">
+                <div className="screenie-chat-model-select quick-tooltip-agent-model-select">
+                  <CustomDropdown
+                    value={providerInfo.model}
+                    options={modelOptions}
+                    onChange={updateModel}
+                    ariaLabel={`${providerInfo.label} agent model`}
+                    variant="ghost"
+                    disabled={agentRunning}
+                    placement={agentMenuPlacement}
+                    onOpenChange={setAgentModelMenuOpen}
+                    triggerLabel={
+                      <span className="quick-tooltip-agent-model-label">
+                        <span
+                          className={`screenie-model-dot ${
+                            providerInfo.cloud ? "cloud" : "local"
+                          }`}
+                        />
+                        <span className="quick-tooltip-agent-model-provider">
+                          {providerInfo.label}
+                        </span>
+                        <span className="quick-tooltip-agent-model-name">
+                          {activeModelLabel}
+                        </span>
+                      </span>
+                    }
+                  />
+                </div>
+                <div className="screenie-chat-model-select quick-tooltip-agent-autonomy-select">
+                  <CustomDropdown
+                    value={autonomy}
+                    options={AGENT_AUTONOMY_OPTIONS}
+                    onChange={updateAutonomy}
+                    ariaLabel="Agent autonomy"
+                    variant="ghost"
+                    disabled={agentRunning}
+                    placement={agentMenuPlacement}
+                    onOpenChange={setAgentModelMenuOpen}
+                    triggerLabel={
+                      <span className="quick-tooltip-agent-model-label">
+                        <ShieldCheck size={11} strokeWidth={1.9} aria-hidden />
+                        <span className="quick-tooltip-agent-model-name">
+                          {
+                            AGENT_AUTONOMY_OPTIONS.find(
+                              (option) => option.value === autonomy,
+                            )?.label
+                          }
+                        </span>
+                      </span>
+                    }
+                  />
+                </div>
+              </div>
+              <SvgInsetBorder radius={18} strokeAlpha={0.2} />
             </div>
-            {voice.active && <VoiceLevelMeter fillRef={voice.meterFillRef} />}
             {voice.notice && (
               <div className="quick-tooltip-voice-notice">{voice.notice}</div>
             )}
             {voice.modelMissing ? (
               <VoiceModelDownloadCard
                 pct={voice.downloadPct}
+                model={voice.modelName}
                 onDownload={() => {
                   void voice.downloadModel();
                 }}
               />
             ) : (
-              <VoiceTranscriptFeed chips={voice.chips} />
+              <VoiceTranscriptFeed
+                chips={voice.chips}
+                paused={voice.queuePaused}
+                onSetPaused={(paused) => {
+                  void voice.setQueuePaused(paused);
+                }}
+                onClear={() => {
+                  void voice.clearQueue();
+                }}
+                onRemove={(id) => {
+                  void voice.removeTask(id);
+                }}
+                onEdit={voice.editTask}
+                onEditFocus={handleChipEditFocus}
+                onEditBlur={handleChipEditBlur}
+              />
             )}
-            <div className="quick-tooltip-agent-model-row">
-              <div className="screenie-chat-model-select quick-tooltip-agent-model-select">
-                <CustomDropdown
-                  value={providerInfo.model}
-                  options={modelOptions}
-                  onChange={updateModel}
-                  ariaLabel={`${providerInfo.label} agent model`}
-                  variant="ghost"
-                  disabled={agentRunning}
-                  placement="below"
-                  onOpenChange={setAgentModelMenuOpen}
-                  triggerLabel={
-                    <span className="quick-tooltip-agent-model-label">
-                      <span
-                        className={`screenie-model-dot ${
-                          providerInfo.cloud ? "cloud" : "local"
-                        }`}
-                      />
-                      <span className="quick-tooltip-agent-model-provider">
-                        {providerInfo.label}
-                      </span>
-                      <span className="quick-tooltip-agent-model-name">
-                        {activeModelLabel}
-                      </span>
-                    </span>
-                  }
-                />
-              </div>
-              <div className="screenie-chat-model-select quick-tooltip-agent-autonomy-select">
-                <CustomDropdown
-                  value={autonomy}
-                  options={AGENT_AUTONOMY_OPTIONS}
-                  onChange={updateAutonomy}
-                  ariaLabel="Agent autonomy"
-                  variant="ghost"
-                  disabled={agentRunning}
-                  placement="below"
-                  onOpenChange={setAgentModelMenuOpen}
-                  triggerLabel={
-                    <span className="quick-tooltip-agent-model-label">
-                      <ShieldCheck size={11} strokeWidth={1.9} aria-hidden />
-                      <span className="quick-tooltip-agent-model-name">
-                        {
-                          AGENT_AUTONOMY_OPTIONS.find(
-                            (option) => option.value === autonomy,
-                          )?.label
-                        }
-                      </span>
-                    </span>
-                  }
-                />
-              </div>
-            </div>
           </div>
         </section>
       )}

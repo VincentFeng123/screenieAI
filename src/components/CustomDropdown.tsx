@@ -173,11 +173,26 @@ export default function CustomDropdown({
             : availableAbove > availableBelow;
       const available = useAbove ? availableAbove : availableBelow;
       setResolvedPlacement(useAbove ? "above" : "below");
+      // What physically fits between the trigger and the window edge on the
+      // chosen side: the webview hard-clips at the window bounds, so the
+      // MENU_MIN_HEIGHT floor must never push past this.
+      const sideCap = Math.max(
+        60,
+        Math.floor(
+          (useAbove ? rect.top : viewportH - rect.bottom) -
+            MENU_GAP -
+            VIEWPORT_EDGE_MARGIN,
+        ),
+      );
       // Cap at 70% of viewport height (or the available side-room, whichever
       // is smaller). The min keeps the menu usable when the trigger sits in
       // a tight slot.
       setMenuMaxHeight(
-        Math.min(viewportMenuMax(), Math.max(MENU_MIN_HEIGHT, Math.floor(available))),
+        Math.min(
+          viewportMenuMax(),
+          Math.max(MENU_MIN_HEIGHT, Math.floor(available)),
+          sideCap,
+        ),
       );
       // Width cap: when the trigger is inside the overlay's chat panel, the
       // menu is bounded to 70% of that panel's width so it doesn't sprawl

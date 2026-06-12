@@ -20,8 +20,9 @@ pub const VOICE_CONFIG_FILE: &str = "voice.json";
 pub struct ModelSpec {
     pub model: WhisperModel,
     pub file_name: &'static str,
-    /// Generous static bounds (the upstream files are ~75 / ~142 / ~466 MB);
-    /// the exact `Content-Length` is also enforced when the server sends it.
+    /// Generous static bounds (the upstream files are ~75 / ~142 / ~466 /
+    /// ~574 MB); the exact `Content-Length` is also enforced when the server
+    /// sends it.
     pub min_bytes: u64,
     pub max_bytes: u64,
 }
@@ -45,6 +46,13 @@ pub const MODEL_SPECS: &[ModelSpec] = &[
         min_bytes: 450_000_000,
         max_bytes: 510_000_000,
     },
+    ModelSpec {
+        model: WhisperModel::LargeV3Turbo,
+        // Upstream file is exactly 574,041,195 bytes today.
+        file_name: "ggml-large-v3-turbo-q5_0.bin",
+        min_bytes: 540_000_000,
+        max_bytes: 610_000_000,
+    },
 ];
 
 impl WhisperModel {
@@ -60,6 +68,7 @@ impl WhisperModel {
             WhisperModel::TinyEn => "tiny.en",
             WhisperModel::BaseEn => "base.en",
             WhisperModel::SmallEn => "small.en",
+            WhisperModel::LargeV3Turbo => "large-v3-turbo",
         }
     }
 }
@@ -246,6 +255,7 @@ mod tests {
             WhisperModel::TinyEn,
             WhisperModel::BaseEn,
             WhisperModel::SmallEn,
+            WhisperModel::LargeV3Turbo,
         ] {
             assert_eq!(m.spec().model, m);
             assert_eq!(WhisperModel::parse(m.wire_name()), Some(m));

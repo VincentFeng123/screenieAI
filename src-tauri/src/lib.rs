@@ -53,13 +53,15 @@ const AGENT_KILL_SWITCH_SHORTCUT: &str = "CommandOrControl+Alt+Escape";
 const QUICK_TOOLTIP_EDGE_PAD: f64 = 2.0;
 const QUICK_TOOLTIP_COMPACT_W: f64 = 238.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_COMPACT_H: f64 = 54.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
-const QUICK_TOOLTIP_AGENT_INPUT_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
-const QUICK_TOOLTIP_EXPANDED_W: f64 = 400.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+// Must match --quick-tooltip-agent-card-w in src/quick-tooltip.css (the
+// pill centers itself against that var in every expanded mode).
+const QUICK_TOOLTIP_AGENT_INPUT_W: f64 = 430.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
+const QUICK_TOOLTIP_EXPANDED_W: f64 = 430.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_EXPANDED_H: f64 = 540.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_GAP: f64 = 12.0;
-const QUICK_TOOLTIP_AGENT_CARD_H: f64 = 88.0;
+const QUICK_TOOLTIP_AGENT_CARD_H: f64 = 106.0;
 /// Upper bound for the voice-feed-grown agent card (level meter + chips).
-const QUICK_TOOLTIP_AGENT_CARD_MAX_H: f64 = 300.0;
+const QUICK_TOOLTIP_AGENT_CARD_MAX_H: f64 = 340.0;
 const QUICK_TOOLTIP_AGENT_INPUT_WITH_MENU_H: f64 = 380.0 + 2.0 * QUICK_TOOLTIP_EDGE_PAD;
 const QUICK_TOOLTIP_STATUS_H: f64 = 178.0;
 const QUICK_TOOLTIP_STATUS_MIN_H: f64 = 82.0;
@@ -4033,6 +4035,42 @@ async fn start_capture(app: AppHandle, window: WebviewWindow) -> Result<(), Stri
     Ok(())
 }
 
+/// True when the menu-grown agent-input window still fits between the
+/// toolbar's CURRENT y and the monitor's bottom edge — i.e. growing for a
+/// downward menu would not trip the y clamp. Shared by the direction query
+/// and resize_quick_tooltip so they can never disagree.
+fn quick_tooltip_menu_fits_below(
+    monitor: Option<&tauri::Monitor>,
+    position: QuickTooltipPosition,
+    agent_card_height: Option<f64>,
+) -> bool {
+    let Some(monitor) = monitor else {
+        return true;
+    };
+    let size = QuickTooltipSize::agent_input_with_menu(agent_card_height);
+    let (_, y, _, h) = monitor_logical_rect(monitor);
+    position.y as f64 + size.height + QUICK_TOOLTIP_SCREEN_PAD <= y + h
+}
+
+/// Which way the agent card's dropdown menus should open: "below" when the
+/// menu-grown window still fits between the toolbar and the monitor's
+/// bottom edge, "above" otherwise. The webview can't know where its window
+/// sits on screen, so React asks before rendering the menu (and skips the
+/// with-menu window growth entirely for "above").
+#[tauri::command]
+fn quick_tooltip_menu_direction(
+    window: WebviewWindow,
+    agent_card_height: Option<f64>,
+) -> Result<&'static str, String> {
+    require_window(&window, "quick_tooltip")?;
+    let Some(position) = quick_tooltip_current_logical_position(&window) else {
+        return Ok("below");
+    };
+    let monitor = window.current_monitor().ok().flatten();
+    let fits_below = quick_tooltip_menu_fits_below(monitor.as_ref(), position, agent_card_height);
+    Ok(if fits_below { "below" } else { "above" })
+}
+
 #[tauri::command]
 fn resize_quick_tooltip(
     window: WebviewWindow,
@@ -4047,12 +4085,24 @@ fn resize_quick_tooltip(
     let status_open = status_open.unwrap_or(false);
     let agent_input_open = agent_input_open.unwrap_or(false);
     let agent_model_menu_open = agent_model_menu_open.unwrap_or(false);
+    let position = quick_tooltip_current_logical_position(&window)
+        .unwrap_or(QuickTooltipPosition { x: 24, y: 24 });
+    let monitor = window.current_monitor().ok().flatten();
     let requested_size = if expanded && status_open {
         QuickTooltipSize::expanded_with_status(status_height)
     } else if expanded {
         QuickTooltipSize::expanded()
     } else if agent_input_open && agent_model_menu_open {
-        QuickTooltipSize::agent_input_with_menu(agent_card_height)
+        // Growing for a downward menu must never trip the y clamp and shove
+        // the toolbar up — near the bottom edge the menu opens upward over
+        // the card instead (quick_tooltip_menu_direction) and the window
+        // keeps its agent-input size. Enforced HERE, not just advised from
+        // React, so a stale frontend placement can't move the window.
+        if quick_tooltip_menu_fits_below(monitor.as_ref(), position, agent_card_height) {
+            QuickTooltipSize::agent_input_with_menu(agent_card_height)
+        } else {
+            QuickTooltipSize::agent_input(agent_card_height)
+        }
     } else if agent_input_open {
         QuickTooltipSize::agent_input(agent_card_height)
     } else if status_open {
@@ -4060,10 +4110,7 @@ fn resize_quick_tooltip(
     } else {
         QuickTooltipSize::compact()
     };
-    let position = quick_tooltip_current_logical_position(&window)
-        .unwrap_or(QuickTooltipPosition { x: 24, y: 24 });
     let current_size = quick_tooltip_current_logical_size(&window).unwrap_or(requested_size);
-    let monitor = window.current_monitor().ok().flatten();
     let size = constrain_quick_tooltip_size_to_monitor(monitor.as_ref(), requested_size);
     let anchored_position = QuickTooltipPosition {
         x: (position.x as f64 + ((current_size.width - size.width) / 2.0)).round() as i32,
@@ -4706,6 +4753,7 @@ pub fn run() {
         repeat_last_capture,
         start_capture,
         resize_quick_tooltip,
+        quick_tooltip_menu_direction,
         add_history_entry,
         list_history,
         delete_history_entry,
@@ -4723,6 +4771,10 @@ pub fn run() {
         voice::voice_get_status,
         voice::voice_download_model,
         voice::voice_set_config,
+        voice::voice_queue_pause,
+        voice::voice_queue_clear,
+        voice::voice_queue_remove,
+        voice::voice_queue_edit,
         capture::commands::capture_permission,
         capture::commands::capture_frame,
         capture::commands::record_clip,

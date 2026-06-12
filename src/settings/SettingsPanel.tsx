@@ -970,11 +970,12 @@ export default function SettingsPanel({
               help="Larger models hear better but are slower to download and run. Switching prompts a one-time download on next mic use."
             >
               <SegmentedControl
-                value={voiceSettings?.model ?? "base.en"}
+                value={voiceSettings?.model ?? "large-v3-turbo"}
                 options={[
                   { value: "tiny.en", label: "Tiny · 75 MB" },
                   { value: "base.en", label: "Base · 142 MB" },
                   { value: "small.en", label: "Small · 466 MB" },
+                  { value: "large-v3-turbo", label: "Best · 574 MB" },
                 ]}
                 onChange={(value) => saveVoiceSetting({ model: value })}
                 ariaLabel="Voice model"
