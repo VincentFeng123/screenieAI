@@ -606,6 +606,22 @@ mod tests {
         }
     }
 
+    /// Prompt-cache guard: the system prompt must be a pure, deterministic
+    /// function of its flags — registry-driven assembly must not introduce
+    /// any ordering or formatting instability across builds.
+    #[test]
+    fn system_prompt_is_deterministic_per_flag_combination() {
+        for scripting in [false, true] {
+            for web_lookup in [false, true] {
+                assert_eq!(
+                    build_system_prompt(scripting, web_lookup),
+                    build_system_prompt(scripting, web_lookup),
+                    "prompt not byte-stable for scripting={scripting}, web_lookup={web_lookup}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn gated_actions_match_prompt_advertisement() {
         let base = build_system_prompt(false, false);

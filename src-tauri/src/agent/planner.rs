@@ -980,6 +980,14 @@ pub(crate) fn parse_milestones(raw_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// The registry's taught example for an action; prompt assembly may only
+/// reference actions the registry knows.
+fn action_example(name: &str) -> &'static str {
+    super::actions::spec_for(name)
+        .unwrap_or_else(|| panic!("prompt references unknown action '{name}'"))
+        .prompt_example
+}
+
 pub(crate) fn build_system_prompt(scripting_enabled: bool, web_lookup_available: bool) -> String {
     let mut lines: Vec<&str> = [
         "You are a computer-use agent choosing ONE action for this step.",
@@ -1027,27 +1035,29 @@ pub(crate) fn build_system_prompt(scripting_enabled: bool, web_lookup_available:
         "startRecording begins an open-ended screen recording (one session at a time; it auto-stops at a safety cap). stopRecording ends it and saves the clip - always stopRecording before done when you started one. Only record when the user asked for it.",
         "capturePermission reports the Screen Recording and Accessibility permission map without touching the screen. Call it FIRST if a capture or recording action seems blocked or you are unsure the permission is granted; when it reports denied or broken, do not capture - tell the user what to enable via ask, or fail with reason_detail.",
         "Allowed objects:",
-        r#"{"reason":"brief reason","action":"activateApp","app":"Safari"}"#,
-        r#"{"reason":"brief reason","action":"click","id":14,"target_name":"Add to Bag"}"#,
-        r#"{"reason":"select largest display","action":"clickText","text":"iPhone 17 Pro Max","role":"radio"}"#,
-        r#"{"reason":"brief reason","action":"doubleClick","id":14,"target_name":"report.pdf"}"#,
-        r#"{"reason":"brief reason","action":"type","id":9,"target_name":"Address and Search","text":"..."}"#,
-        r#"{"reason":"brief reason","action":"key","combo":"cmd+s"}"#,
-        r#"{"reason":"brief reason","action":"menu","path":["File","Export as PDF"]}"#,
-        r#"{"reason":"brief reason","action":"scroll","dx":0,"dy":300}"#,
-        r#"{"reason":"brief reason","action":"wait","ms":200}"#,
-        r#"{"reason":"brief reason","action":"openUrl","url":"https://example.com"}"#,
-        r#"{"reason":"brief reason","action":"webSearch","query":"refurbished mac mini"}"#,
-        r#"{"reason":"brief reason","action":"readPage"}"#,
-        r#"{"reason":"export control not visible","action":"findUi","query":"export as pdf"}"#,
-        r#"{"reason":"two drafts match","action":"ask","question":"Which draft should I send?","options":["Budget v2","Budget final"]}"#,
-        r#"{"reason":"need to see the chart's colors","action":"captureFrame","scope":"window"}"#,
-        r#"{"reason":"user asked for a 10s demo clip","action":"recordClip","seconds":10,"scope":"screen"}"#,
-        r#"{"reason":"user asked to record until the task is done","action":"startRecording","scope":"screen"}"#,
-        r#"{"reason":"flow finished; save the recording","action":"stopRecording"}"#,
-        r#"{"reason":"capture may be blocked","action":"capturePermission"}"#,
-        r#"{"reason":"brief reason","action":"done"}"#,
-        r#"{"reason":"brief reason","action":"fail","reason_detail":"..."}"#,
+        // The example objects live on the registry specs (single source);
+        // this curated order tracks the non-gated registry order.
+        action_example("activateApp"),
+        action_example("click"),
+        action_example("clickText"),
+        action_example("doubleClick"),
+        action_example("type"),
+        action_example("key"),
+        action_example("menu"),
+        action_example("scroll"),
+        action_example("wait"),
+        action_example("openUrl"),
+        action_example("webSearch"),
+        action_example("readPage"),
+        action_example("findUi"),
+        action_example("ask"),
+        action_example("captureFrame"),
+        action_example("recordClip"),
+        action_example("startRecording"),
+        action_example("stopRecording"),
+        action_example("capturePermission"),
+        action_example("done"),
+        action_example("fail"),
         "Optional fields you may add to any object:",
         "- note: a short fact worth remembering for later steps (a price, name, or URL). Saved notes are shown back to you under 'Notes you saved earlier'. Use it whenever you read something you will need again.",
         "- expect: a short phrase that should be visible after this action. You will be told whether it was found.",
@@ -1082,15 +1092,15 @@ pub(crate) fn build_system_prompt(scripting_enabled: bool, web_lookup_available:
         );
         let objects_at = lines
             .iter()
-            .position(|line| line.starts_with(r#"{"reason":"brief reason","action":"readPage"}"#))
+            .position(|line| *line == action_example("readPage"))
             .map(|index| index + 1)
             .unwrap_or(lines.len());
         lines.splice(
             objects_at..objects_at,
             [
-                r#"{"reason":"brief reason","action":"applescript","script":"tell application \"Notes\" to make new note with properties {body:\"hi\"}"}"#,
-                r#"{"reason":"brief reason","action":"shortcut","name":"Set Do Not Disturb"}"#,
-                r#"{"reason":"brief reason","action":"moveToTrash","file":"/Users/me/Desktop/old.dmg"}"#,
+                action_example("applescript"),
+                action_example("shortcut"),
+                action_example("moveToTrash"),
             ],
         );
     }
@@ -1123,13 +1133,10 @@ pub(crate) fn build_system_prompt(scripting_enabled: bool, web_lookup_available:
         );
         let example_at = lines
             .iter()
-            .position(|line| line.starts_with(r#"{"reason":"export control not visible""#))
+            .position(|line| *line == action_example("findUi"))
             .map(|index| index + 1)
             .unwrap_or(lines.len());
-        lines.insert(
-            example_at,
-            r#"{"reason":"findUi found nothing","action":"webLookup","query":"export note as PDF"}"#,
-        );
+        lines.insert(example_at, action_example("webLookup"));
     }
 
     // The date sits right under the identity line, next to the rules it
