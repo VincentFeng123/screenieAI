@@ -1492,3 +1492,91 @@
 .settings-template-prompt {
   color: var(--settings-text, rgba(255, 255, 255, 0.72));
 }
+
+/* Playbooks manager (Settings > Agent) */
+.playbooks-manager {
+  display: flex;
+  flex-direction: column;
+}
+
+.playbooks-row .settings-row-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.playbooks-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--settings-line, rgba(255, 255, 255, 0.14));
+  color: var(--settings-text, rgba(255, 255, 255, 0.6));
+}
+
+.playbooks-badge[data-edited] {
+  border-color: rgba(37, 99, 235, 0.5);
+  color: #6d9bf5;
+}
+
+.playbooks-badge[data-scripting] {
+  border-color: rgba(234, 179, 8, 0.45);
+  color: #d8b54a;
+}
+
+.playbooks-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.playbooks-editor {
+  padding: 12px 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.playbooks-editor-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--settings-line, rgba(255, 255, 255, 0.14));
+  background: var(--settings-control-bg, rgba(255, 255, 255, 0.04));
+  color: inherit;
+}
+
+.playbooks-editor-textarea:focus {
+  outline: none;
+  border-color: var(--settings-line-strong, rgba(255, 255, 255, 0.3));
+}
+
+.playbooks-editor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.playbooks-editor-footer .settings-muted {
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.playbooks-footer {
+  padding-top: 10px;
+}
+
+.playbooks-error {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #e5484d;
+}

@@ -113,6 +113,21 @@ struct PlaybookConfig {
     disabled: Vec<String>,
 }
 
+/// Settings-UI view of one playbook (no body — list views stay light).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookMeta {
+    pub name: String,
+    pub apps: Vec<String>,
+    pub triggers: Vec<String>,
+    pub requires_scripting: bool,
+    /// The active version is the compiled-in one.
+    pub builtin: bool,
+    /// A user file shadows a built-in of the same name.
+    pub overridden: bool,
+    pub enabled: bool,
+}
+
 /// Playbook source for one agent run. `dir: None` (tests, headless) serves
 /// built-ins only. Reads are cached for the run; only the settings UI
 /// writes user files.
@@ -135,37 +150,8 @@ impl PlaybookStore {
         if let Some(cached) = self.cache.borrow().as_ref() {
             return cached.clone();
         }
-        let mut playbooks: Vec<Playbook> = BUILTINS
-            .iter()
-            .filter_map(|raw| parse_playbook(raw))
-            .map(|playbook| Playbook {
-                builtin: true,
-                ..playbook
-            })
-            .collect();
-        if let Some(dir) = self.dir.as_ref() {
-            let mut user_files: Vec<PathBuf> = fs::read_dir(dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|entry| entry.ok())
-                        .map(|entry| entry.path())
-                        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-                        .collect()
-                })
-                .unwrap_or_default();
-            user_files.sort();
-            for path in user_files {
-                let Some(playbook) = fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|raw| parse_playbook(&raw))
-                else {
-                    continue;
-                };
-                playbooks.retain(|existing| existing.name != playbook.name);
-                playbooks.push(playbook);
-            }
-        }
         let disabled = self.disabled_names();
+        let mut playbooks = self.load_all();
         playbooks.retain(|playbook| !disabled.contains(&playbook.name));
         self.cache.borrow_mut().replace(playbooks.clone());
         playbooks
@@ -219,6 +205,170 @@ impl PlaybookStore {
         }
         Some(rendered)
     }
+}
+
+/// Management surface for the settings UI. These construct a fresh store
+/// per command, so the per-run read cache never serves stale state here.
+impl PlaybookStore {
+    pub(crate) fn list_meta(&self) -> Vec<PlaybookMeta> {
+        let disabled = self.disabled_names();
+        let builtin_names: HashSet<String> = BUILTINS
+            .iter()
+            .filter_map(|raw| parse_playbook(raw))
+            .map(|playbook| playbook.name)
+            .collect();
+        let mut meta: Vec<PlaybookMeta> = self
+            .load_all()
+            .into_iter()
+            .map(|playbook| PlaybookMeta {
+                enabled: !disabled.contains(&playbook.name),
+                overridden: !playbook.builtin && builtin_names.contains(&playbook.name),
+                builtin: playbook.builtin,
+                name: playbook.name,
+                apps: playbook.apps,
+                triggers: playbook.triggers,
+                requires_scripting: playbook.requires_scripting,
+            })
+            .collect();
+        meta.sort_by(|a, b| a.name.cmp(&b.name));
+        meta
+    }
+
+    /// Raw markdown for editing: the user file when one exists, else the
+    /// built-in source.
+    pub(crate) fn read_raw(&self, name: &str) -> Option<String> {
+        if let Some(path) = self.user_file_for(name) {
+            return fs::read_to_string(path).ok();
+        }
+        BUILTINS
+            .iter()
+            .find(|raw| parse_playbook(raw).is_some_and(|playbook| playbook.name == name))
+            .map(|raw| raw.to_string())
+    }
+
+    /// Validate and write a user playbook (named by its own frontmatter);
+    /// shadows a built-in with the same name on the next load.
+    pub(crate) fn write_user(&self, content: &str) -> Result<PlaybookMeta, String> {
+        let playbook =
+            parse_playbook(content).ok_or_else(|| {
+                "invalid playbook: needs --- frontmatter with a name, a non-empty body, and caps respected (name ≤ 64 chars, body ≤ 32KB, ≤ 8 apps, ≤ 12 triggers)".to_string()
+            })?;
+        let dir = self.dir.as_ref().ok_or("no playbook directory")?;
+        fs::create_dir_all(dir).map_err(|err| format!("create playbooks dir: {err}"))?;
+        let path = dir.join(format!("{}.md", sanitize_name(&playbook.name)));
+        let tmp = path.with_extension("md.tmp");
+        fs::write(&tmp, content).map_err(|err| format!("write playbook: {err}"))?;
+        fs::rename(&tmp, &path).map_err(|err| format!("write playbook: {err}"))?;
+        self.cache.borrow_mut().take();
+        let enabled = !self.disabled_names().contains(&playbook.name);
+        Ok(PlaybookMeta {
+            overridden: BUILTINS
+                .iter()
+                .filter_map(|raw| parse_playbook(raw))
+                .any(|builtin| builtin.name == playbook.name),
+            builtin: false,
+            enabled,
+            name: playbook.name,
+            apps: playbook.apps,
+            triggers: playbook.triggers,
+            requires_scripting: playbook.requires_scripting,
+        })
+    }
+
+    /// Delete the user file (a shadowed built-in reappears). Built-ins
+    /// themselves cannot be deleted, only disabled.
+    pub(crate) fn delete_user(&self, name: &str) -> Result<(), String> {
+        let path = self
+            .user_file_for(name)
+            .ok_or_else(|| format!("no user playbook named '{name}'"))?;
+        fs::remove_file(path).map_err(|err| format!("delete playbook: {err}"))?;
+        self.cache.borrow_mut().take();
+        Ok(())
+    }
+
+    pub(crate) fn set_enabled(&self, name: &str, enabled: bool) -> Result<(), String> {
+        let dir = self.dir.as_ref().ok_or("no playbook directory")?;
+        fs::create_dir_all(dir).map_err(|err| format!("create playbooks dir: {err}"))?;
+        let mut disabled: Vec<String> = self.disabled_names().into_iter().collect();
+        disabled.retain(|entry| entry != name);
+        if !enabled {
+            disabled.push(name.to_string());
+        }
+        disabled.sort();
+        let config = PlaybookConfig { disabled };
+        let serialized = serde_json::to_string_pretty(&config)
+            .map_err(|err| format!("encode playbook config: {err}"))?;
+        let path = dir.join(CONFIG_FILE);
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serialized).map_err(|err| format!("write playbook config: {err}"))?;
+        fs::rename(&tmp, &path).map_err(|err| format!("write playbook config: {err}"))?;
+        self.cache.borrow_mut().take();
+        Ok(())
+    }
+
+    /// All playbooks including disabled ones (management view).
+    fn load_all(&self) -> Vec<Playbook> {
+        let mut playbooks: Vec<Playbook> = BUILTINS
+            .iter()
+            .filter_map(|raw| parse_playbook(raw))
+            .map(|playbook| Playbook {
+                builtin: true,
+                ..playbook
+            })
+            .collect();
+        if let Some(dir) = self.dir.as_ref() {
+            let mut user_files: Vec<PathBuf> = fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok())
+                        .map(|entry| entry.path())
+                        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            user_files.sort();
+            for path in user_files {
+                let Some(playbook) = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|raw| parse_playbook(&raw))
+                else {
+                    continue;
+                };
+                playbooks.retain(|existing| existing.name != playbook.name);
+                playbooks.push(playbook);
+            }
+        }
+        playbooks
+    }
+
+    /// Path of the user file whose frontmatter name matches, regardless of
+    /// its filename (hand-created files may not follow the sanitized name).
+    fn user_file_for(&self, name: &str) -> Option<PathBuf> {
+        let dir = self.dir.as_ref()?;
+        fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .find(|path| {
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|raw| parse_playbook(&raw))
+                    .is_some_and(|playbook| playbook.name == name)
+            })
+    }
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// `*` matches any app; entries with a '.' compare against the bundle id,
@@ -566,6 +716,52 @@ mod tests {
         // Tiny budgets still terminate via hard truncation.
         let tiny = render_within_budget(&body, "search", 80);
         assert!(tiny.chars().count() <= 80);
+    }
+
+    #[test]
+    fn management_surface_lists_writes_toggles_and_deletes() {
+        let dir = temp_dir("manage");
+        let store = PlaybookStore::new(Some(dir.clone()));
+
+        // Built-ins listed enabled; writing an override flips its provenance.
+        let meta = store.list_meta();
+        let browser = meta.iter().find(|m| m.name == "browser-tasks").unwrap();
+        assert!(browser.builtin && browser.enabled && !browser.overridden);
+
+        let written = store
+            .write_user("---\nname: browser-tasks\napps: *\ntriggers: search\n---\nOverride body")
+            .unwrap();
+        assert!(!written.builtin && written.overridden);
+        let meta = store.list_meta();
+        let browser = meta.iter().find(|m| m.name == "browser-tasks").unwrap();
+        assert!(!browser.builtin && browser.overridden);
+        assert_eq!(
+            store.read_raw("browser-tasks").unwrap(),
+            "---\nname: browser-tasks\napps: *\ntriggers: search\n---\nOverride body"
+        );
+
+        // Invalid content is refused before touching disk.
+        assert!(store.write_user("no frontmatter at all").is_err());
+
+        // Disable removes it from selection but not from the list.
+        store.set_enabled("browser-tasks", false).unwrap();
+        let meta = store.list_meta();
+        assert!(!meta.iter().find(|m| m.name == "browser-tasks").unwrap().enabled);
+        assert!(store
+            .select_and_render(&safari(), "search the web for socks", false)
+            .map(|text| !text.contains("[browser-tasks]"))
+            .unwrap_or(true));
+        store.set_enabled("browser-tasks", true).unwrap();
+
+        // Deleting the override restores the built-in; built-ins themselves
+        // cannot be deleted.
+        store.delete_user("browser-tasks").unwrap();
+        let meta = store.list_meta();
+        let browser = meta.iter().find(|m| m.name == "browser-tasks").unwrap();
+        assert!(browser.builtin && !browser.overridden);
+        assert!(store.delete_user("browser-tasks").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

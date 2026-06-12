@@ -3901,6 +3901,59 @@ fn app_data_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
         .map_err(|e| format!("app_data_dir: {e}"))
 }
 
+/// Settings-window-only playbook management. Each command builds a fresh
+/// store over `<app_data>/agent/playbooks`, so edits land on the next
+/// agent run without any cache coordination.
+fn playbook_store(app: &AppHandle) -> Result<agent::PlaybookStore, String> {
+    Ok(agent::PlaybookStore::new(Some(
+        app_data_dir(app)?.join("agent").join("playbooks"),
+    )))
+}
+
+#[tauri::command]
+fn list_playbooks(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<Vec<agent::PlaybookMeta>, String> {
+    require_window(&window, "main")?;
+    Ok(playbook_store(&app)?.list_meta())
+}
+
+#[tauri::command]
+fn read_playbook(app: AppHandle, window: WebviewWindow, name: String) -> Result<String, String> {
+    require_window(&window, "main")?;
+    playbook_store(&app)?
+        .read_raw(&name)
+        .ok_or_else(|| format!("no playbook named '{name}'"))
+}
+
+#[tauri::command]
+fn write_playbook(
+    app: AppHandle,
+    window: WebviewWindow,
+    content: String,
+) -> Result<agent::PlaybookMeta, String> {
+    require_window(&window, "main")?;
+    playbook_store(&app)?.write_user(&content)
+}
+
+#[tauri::command]
+fn delete_playbook(app: AppHandle, window: WebviewWindow, name: String) -> Result<(), String> {
+    require_window(&window, "main")?;
+    playbook_store(&app)?.delete_user(&name)
+}
+
+#[tauri::command]
+fn set_playbook_enabled(
+    app: AppHandle,
+    window: WebviewWindow,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    require_window(&window, "main")?;
+    playbook_store(&app)?.set_enabled(&name, enabled)
+}
+
 /// Frontend has finished a capture cycle and wants to remember the rect for
 /// the "repeat last" hotkey. Stored on the frontend in localStorage; this
 /// function only handles the Rust-side flag that says "the next capture
@@ -4561,6 +4614,11 @@ pub fn run() {
         stop_agent_task,
         respond_to_confirmation,
         respond_to_user_question,
+        list_playbooks,
+        read_playbook,
+        write_playbook,
+        delete_playbook,
+        set_playbook_enabled,
         crop_capture,
         refresh_overlay_backdrop_capture,
         refresh_overlay_capture,

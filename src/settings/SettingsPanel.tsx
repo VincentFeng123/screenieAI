@@ -15,6 +15,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Eye, EyeOff, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import OllamaSetup from "./OllamaSetup";
 import NeedsVisionModel from "./NeedsVisionModel";
+import PlaybooksManager from "./PlaybooksManager";
 import CustomDropdown, {
   type CustomDropdownOption,
 } from "../components/CustomDropdown";
@@ -941,6 +942,12 @@ export default function SettingsPanel({
             >
               <span className="settings-muted">Always guarded</span>
             </PreferenceRow>
+          </SettingsCard>
+          <SettingsCard
+            title="Playbooks"
+            description="App- and task-specific guidance the agent reads only when the matching app or goal is active. Edit the built-ins or add your own."
+          >
+            <PlaybooksManager />
           </SettingsCard>
         </SettingsSection>
 

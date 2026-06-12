@@ -34,6 +34,8 @@ pub use grounding::{GroundingMode, GroundingPixel, GroundingReport};
 #[cfg(target_os = "macos")]
 pub use macos_observer::MacObserver;
 pub(crate) use planner::ContextAwareLlmPlanner;
+pub use playbooks::PlaybookMeta;
+pub(crate) use playbooks::PlaybookStore;
 pub use planner::{NameResolvingStubPlanner, StubPlanner};
 pub use types::{
     Action, CaptureScope, CoordinateSpace, Element, ElementSource, FocusedApp,
