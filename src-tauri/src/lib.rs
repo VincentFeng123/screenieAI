@@ -1480,6 +1480,10 @@ fn prepare_stub_agent_run(
     options.playbooks_dir = app_data_dir(app)
         .ok()
         .map(|dir| dir.join("agent").join("playbooks"));
+    // Cross-run memory (written only on Done with an explicit remember).
+    options.memory_dir = app_data_dir(app)
+        .ok()
+        .map(|dir| dir.join("agent").join("memory"));
     let state = app.state::<AppState>();
     state.agent_abort.reset();
     let _ = drain_pending_agent_confirmations(&state);

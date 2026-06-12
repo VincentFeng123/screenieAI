@@ -1140,6 +1140,7 @@ pub(crate) fn build_system_prompt(scripting_enabled: bool, web_lookup_available:
         action_example("fail"),
         "Optional fields you may add to any object:",
         "- note: a short fact worth remembering for later steps (a price, name, or URL). Saved notes are shown back to you under 'Notes you saved earlier'. Use it whenever you read something you will need again.",
+        "- remember: on done ONLY - one short durable fact about how you completed this goal worth reusing in future runs (a navigation path, a working approach, a preference you learned). It is saved across runs and shown to the user. Never include secrets, passwords, or anything you did not verify on screen.",
         "- expect: a short phrase that should be visible after this action. You will be told whether it was found.",
         "- milestone_done: set true when the CURRENT milestone in the plan is visibly complete.",
         "- next: up to 3 follow-up actions you are CONFIDENT about (only click, type, key, scroll, wait, on targets visible in the CURRENT observation). Each runs only if the previous action visibly worked, with no extra thinking turn. ALWAYS batch multi-field form fills: type the first field and put the remaining type actions in next. Also batch sure pairs like type then key Return. Never anything destructive (send, buy, delete, pay) in next - such items are dropped.",
@@ -1544,6 +1545,7 @@ pub(crate) fn planner_response_schema() -> Value {
             "ms": { "type": "integer", "minimum": 0 },
             "reason_detail": { "type": "string" },
             "note": { "type": "string", "maxLength": MAX_NOTE_CHARS },
+            "remember": { "type": "string", "maxLength": super::memory::MAX_REMEMBER_CHARS },
             "expect": { "type": "string", "maxLength": MAX_EXPECT_CHARS },
             "milestone_done": { "type": "boolean" },
             "target_name": { "type": "string", "maxLength": MAX_TARGET_NAME_CHARS },
@@ -1690,6 +1692,10 @@ pub(crate) fn parse_planner_decision(
     Ok(PlannerDecision::new(reason, action)
         .with_followups(followups)
         .with_note(normalize_optional_field(raw.note.as_deref(), MAX_NOTE_CHARS))
+        .with_remember(normalize_optional_field(
+            raw.remember.as_deref(),
+            super::memory::MAX_REMEMBER_CHARS,
+        ))
         .with_expect(normalize_optional_field(
             raw.expect.as_deref(),
             MAX_EXPECT_CHARS,
@@ -2433,6 +2439,7 @@ fn coerce_planner_value(mut value: Value) -> Value {
         "input",
         "file",
         "note",
+        "remember",
         "expect",
         "milestone_done",
         "target_name",
@@ -2823,6 +2830,7 @@ struct RawPlannerResponse {
     seconds: Option<u64>,
     // Globally-allowed metadata fields (never checked by reject_fields).
     note: Option<String>,
+    remember: Option<String>,
     expect: Option<String>,
     milestone_done: Option<bool>,
     target_name: Option<String>,

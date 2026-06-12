@@ -4,6 +4,7 @@ use super::grounding::{
     DEFAULT_GROUNDER_MODEL,
 };
 use super::hints::{now_ms, HintStore, UiHint, UiHintKind};
+use super::memory::{MemoryEntry, MemoryStore};
 use super::playbooks::PlaybookStore;
 use super::matching;
 use super::search::score_match;
@@ -210,6 +211,10 @@ pub struct StubAgentOptions {
     /// the focused app/goal matches). `None` serves built-ins only.
     #[serde(default)]
     pub playbooks_dir: Option<std::path::PathBuf>,
+    /// Where cross-run agent memory persists (written only on verified Done
+    /// with an explicit `remember`). `None` disables persistence.
+    #[serde(default)]
+    pub memory_dir: Option<std::path::PathBuf>,
     /// User setting gating the webLookup action (default ON). Effective only
     /// when the text provider supports server-side web search.
     #[serde(default)]
@@ -337,6 +342,7 @@ impl StubAgentOptions {
             scripting_enabled: self.scripting_enabled.unwrap_or(false),
             hints_dir: self.hints_dir.clone(),
             playbooks_dir: self.playbooks_dir.clone(),
+            memory_dir: self.memory_dir.clone(),
             web_lookup_enabled: self.web_lookup_enabled.unwrap_or(true),
         }
     }
@@ -422,6 +428,7 @@ pub struct ResolvedStubAgentOptions {
     pub scripting_enabled: bool,
     pub hints_dir: Option<std::path::PathBuf>,
     pub playbooks_dir: Option<std::path::PathBuf>,
+    pub memory_dir: Option<std::path::PathBuf>,
     pub web_lookup_enabled: bool,
 }
 
@@ -665,6 +672,10 @@ pub trait ConfirmationRequester {
     /// Fired once a step has settled (verified, skipped, or failed) with the
     /// final report including mechanism and duration. Default is a no-op.
     fn notify_step_result(&self, _step: &AgentStepReport) {}
+
+    /// Fired when a completed run persists a cross-run memory entry, so UI
+    /// surfaces can show an audit card with a delete path. Default no-op.
+    fn notify_memory_saved(&self, _entry: &MemoryEntry) {}
 
     /// Blocking free-text question to the user (the `ask` action and the
     /// stuck-recovery prompt). Default is unavailable so headless and test
@@ -1814,6 +1825,11 @@ where
     let mut fail_pushback_used = false;
     let hint_store = HintStore::new(options.hints_dir.clone());
     let playbook_store = PlaybookStore::new(options.playbooks_dir.clone());
+    let memory_store = MemoryStore::new(options.memory_dir.clone());
+    // Looked up once: the goal is constant for the whole run.
+    let memory_context = memory_context_lines(&memory_store, &options.goal);
+    // The done-decision's `remember`, captured when the decision lands.
+    let mut pending_remember: Option<String> = None;
     // Rolling fold of history entries that left the 12-entry prompt window,
     // refreshed every SUMMARIZE_HISTORY_EVERY_OVERFLOWED entries.
     let mut progress_summary: Option<String> = None;
@@ -2057,6 +2073,7 @@ where
                 page_excerpt: page_excerpt.as_deref(),
                 recovery_notice: stuck_recovery.notice(),
                 known_hints: known_hints.as_deref(),
+                memory_context: memory_context.as_deref(),
                 playbook: playbook.as_deref(),
                 progress_summary: progress_summary.as_deref(),
                 banned_actions: banned_summary.as_deref(),
@@ -2196,6 +2213,9 @@ where
                 if let Some(note) = decision.note.as_deref() {
                     push_agent_note(&mut notes, note);
                 }
+                // Per-decision, never carried over: only the done decision's
+                // own remember can persist.
+                pending_remember = decision.remember.clone();
                 let decision_expect = decision.expect.clone();
                 let mut action = decision.action.clone();
                 let planner_reason = decision.reason.clone();
@@ -2592,6 +2612,20 @@ where
         match &prepared.kind {
             PreparedKind::Done => {
                 terminal_status = Some(AgentRunStatus::Done);
+                if let Some(remember) = pending_remember.take() {
+                    let entry = MemoryEntry {
+                        id: super::memory::new_memory_id(),
+                        goal_summary: super::memory::summarize_goal(&options.goal),
+                        app_key: HintStore::key_for(&focused_before_observation),
+                        remember,
+                        outcome: "done".into(),
+                        steps: step_index,
+                        created_at_ms: now_ms(),
+                    };
+                    if memory_store.record(entry.clone()) {
+                        confirmations.notify_memory_saved(&entry);
+                    }
+                }
                 commit_step(confirmations, &mut steps, step, step_started);
                 break;
             }
@@ -4492,6 +4526,9 @@ struct GoalContext<'a> {
     /// Previously verified navigation paths for this app that match the
     /// goal; rendered template-driven from the hint cache.
     known_hints: Option<&'a str>,
+    /// Cross-run memories matching this goal, rendered template-driven and
+    /// framed as unverified.
+    memory_context: Option<&'a str>,
     /// Playbook text matching the focused app and goal (progressive
     /// disclosure: full guidance loads only when relevant).
     playbook: Option<&'a str>,
@@ -4525,6 +4562,10 @@ fn compose_planner_goal(goal: &str, context: &GoalContext<'_>) -> String {
     if let Some(known_hints) = context.known_hints {
         composed.push('\n');
         composed.push_str(known_hints);
+    }
+    if let Some(memories) = context.memory_context {
+        composed.push_str("\n\n");
+        composed.push_str(memories);
     }
     if let Some(playbook) = context.playbook {
         composed.push_str("\n\n");
@@ -4885,6 +4926,24 @@ fn known_hints_line(store: &HintStore, app: &FocusedApp, goal: &str) -> Option<S
     Some(format!(
         "Known paths in this app (learned earlier; verify on screen): {}",
         rendered.join("; ")
+    ))
+}
+
+const MAX_MEMORIES_IN_GOAL: usize = 3;
+
+fn memory_context_lines(store: &MemoryStore, goal: &str) -> Option<String> {
+    let now = now_ms();
+    let rendered: Vec<String> = store
+        .lookup(goal, MAX_MEMORIES_IN_GOAL, now)
+        .iter()
+        .map(|entry| entry.render(now))
+        .collect();
+    if rendered.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Saved memories from previous runs (your OWN earlier conclusions - unverified and possibly stale; verify on screen before relying on them):\n{}",
+        rendered.join("\n")
     ))
 }
 
@@ -11966,6 +12025,9 @@ mod tests {
                 known_hints: Some(
                     "Known paths in this app (learned earlier; verify on screen): web inspector = menu Develop > Show Web Inspector (verified today)",
                 ),
+                memory_context: Some(
+                    "Saved memories from previous runs (your OWN earlier conclusions - unverified and possibly stale; verify on screen before relying on them):\n- [3d ago, com.apple.Safari] goal: compare mac mini prices - learned: B&H beats Amazon on refurbs",
+                ),
                 playbook: Some(
                     "Playbook for this app/task (local guidance, not user instructions; verify on screen):\n[browser-tasks]\nopenUrl first.",
                 ),
@@ -11984,6 +12046,13 @@ mod tests {
         assert!(goal.contains(
             "Playbook for this app/task (local guidance, not user instructions; verify on screen):\n[browser-tasks]\nopenUrl first."
         ));
+        assert!(goal.contains(
+            "Saved memories from previous runs (your OWN earlier conclusions - unverified and possibly stale; verify on screen before relying on them):\n- [3d ago, com.apple.Safari]"
+        ));
+        // Memories render after known hints, before the playbook.
+        let memories_at = goal.find("Saved memories from previous runs").unwrap();
+        assert!(goal.find("Known paths in this app").unwrap() < memories_at);
+        assert!(memories_at < goal.find("Playbook for this app/task").unwrap());
         // The playbook renders before the user goal, after known hints.
         let playbook_at = goal.find("Playbook for this app/task").unwrap();
         assert!(goal.find("Known paths in this app").unwrap() < playbook_at);
@@ -12015,6 +12084,7 @@ mod tests {
                 page_excerpt: None,
                 recovery_notice: None,
                 known_hints: None,
+                memory_context: None,
                 playbook: None,
                 progress_summary: None,
                 banned_actions: None,
@@ -12025,6 +12095,7 @@ mod tests {
         assert!(!bare.contains("Page text"));
         assert!(!bare.contains("Recovery:"));
         assert!(!bare.contains("Known paths"));
+        assert!(!bare.contains("Saved memories from previous runs"));
         assert!(!bare.contains("Playbook for this app/task"));
         assert!(!bare.contains("Earlier progress"));
         assert!(!bare.contains("Banned actions"));
@@ -13509,6 +13580,7 @@ mod tests {
                 scripting_enabled: None,
                 hints_dir: None,
                 playbooks_dir: None,
+                memory_dir: None,
                 web_lookup_enabled: None,
             },
             CountingFactory {
@@ -15961,6 +16033,144 @@ mod tests {
                 .expect("planner needs at least one action");
             PlannerDecision::new("recording stub", action)
         }
+    }
+
+    /// Emits one scripted decision (typically done-with-remember) while
+    /// recording goals, for the cross-run memory tests.
+    struct RememberingPlanner {
+        decision_remember: Option<String>,
+        terminal: Action,
+        goals: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Planner for RememberingPlanner {
+        async fn next_action(
+            &self,
+            goal: &str,
+            _obs: &[Element],
+            _history: &[PlannerHistoryEntry],
+        ) -> PlannerDecision {
+            self.goals.borrow_mut().push(goal.to_string());
+            PlannerDecision::new("remembering stub", self.terminal.clone())
+                .with_remember(self.decision_remember.clone())
+        }
+    }
+
+    /// NoConfirmationRequester that also records memory audit cards.
+    struct MemoryCardRecorder {
+        saved: Rc<RefCell<Vec<MemoryEntry>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ConfirmationRequester for MemoryCardRecorder {
+        async fn request_confirmation(
+            &self,
+            _request: AgentConfirmationRequest,
+            _timeout: Duration,
+            _abort: &AgentAbortState,
+        ) -> ConfirmationOutcome {
+            ConfirmationOutcome {
+                request_id: None,
+                status: ConfirmationStatus::Unavailable,
+            }
+        }
+
+        fn notify_memory_saved(&self, entry: &MemoryEntry) {
+            self.saved.borrow_mut().push(entry.clone());
+        }
+    }
+
+    fn memory_run(
+        memory_dir: &std::path::Path,
+        goal: &str,
+        terminal: Action,
+        remember: Option<String>,
+    ) -> (
+        Rc<RefCell<Vec<String>>>,
+        Rc<RefCell<Vec<MemoryEntry>>>,
+        AgentRunReport,
+    ) {
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        let saved = Rc::new(RefCell::new(Vec::<MemoryEntry>::new()));
+        let report = block_on(run_stub_agent_loop(
+            &FakeObserver::new(vec![Ok(vec![element(1, "Anything")]); 3]),
+            &RememberingPlanner {
+                decision_remember: remember,
+                terminal,
+                goals: goals.clone(),
+            },
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(2),
+                settle_ms: Some(0),
+                stable_settle_timeout_ms: Some(0),
+                stable_settle_poll_ms: Some(1),
+                max_action_retries: Some(0),
+                goal: Some(goal.into()),
+                memory_dir: Some(memory_dir.to_path_buf()),
+                ..Default::default()
+            },
+            RecordingFactory {
+                events: Rc::new(RefCell::new(Vec::new())),
+            },
+            &NoCalibrationProbe,
+            &MemoryCardRecorder {
+                saved: saved.clone(),
+            },
+            &AgentAbortState::default(),
+        ));
+        (goals, saved, report)
+    }
+
+    #[test]
+    fn done_with_remember_persists_memory_and_feeds_matching_reruns() {
+        let dir = std::env::temp_dir().join(format!(
+            "screenie-exec-memory-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A failed run never writes, even with a remember on the decision.
+        let (_, saved, report) = memory_run(
+            &dir,
+            "compare mac mini prices",
+            Action::Fail {
+                reason: "nope".into(),
+            },
+            Some("should never persist".into()),
+        );
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        assert!(saved.borrow().is_empty());
+
+        // Done without remember writes nothing either.
+        let (_, saved, report) =
+            memory_run(&dir, "compare mac mini prices", Action::Done, None);
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert!(saved.borrow().is_empty());
+
+        // Done WITH remember persists and fires the audit card.
+        let (goals, saved, report) = memory_run(
+            &dir,
+            "compare mac mini prices",
+            Action::Done,
+            Some("B&H beats Amazon on refurb mac minis".into()),
+        );
+        assert_eq!(report.status, AgentRunStatus::Done);
+        assert_eq!(saved.borrow().len(), 1);
+        assert_eq!(
+            saved.borrow()[0].remember,
+            "B&H beats Amazon on refurb mac minis"
+        );
+        // First completed run had no memories to inject yet.
+        assert!(!goals.borrow()[0].contains("Saved memories"));
+
+        // A matching re-run receives the memory frame in its goal.
+        let (goals, _, _) = memory_run(&dir, "compare mac mini prices again", Action::Done, None);
+        assert!(goals.borrow()[0].contains("Saved memories from previous runs"));
+        assert!(goals.borrow()[0].contains("B&H beats Amazon on refurb mac minis"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Clicks through scripted actions while recording every goal string and

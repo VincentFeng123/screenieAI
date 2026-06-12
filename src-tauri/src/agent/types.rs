@@ -1204,6 +1204,9 @@ pub struct PlannerDecision {
     pub followups: Vec<Action>,
     /// Fact the planner wants remembered across steps (prices, names, URLs).
     pub note: Option<String>,
+    /// On done ONLY: one durable takeaway worth persisting across runs
+    /// (bounded free text; surfaced to the user as an audit card).
+    pub remember: Option<String>,
     /// Short phrase the planner expects to be visible after the action.
     pub expect: Option<String>,
     /// True when the planner judges the current milestone visibly complete.
@@ -1224,6 +1227,7 @@ impl PlannerDecision {
             action,
             followups: Vec::new(),
             note: None,
+            remember: None,
             expect: None,
             milestone_done: false,
             target_name: None,
@@ -1233,6 +1237,11 @@ impl PlannerDecision {
 
     pub fn with_followups(mut self, followups: Vec<Action>) -> Self {
         self.followups = followups;
+        self
+    }
+
+    pub fn with_remember(mut self, remember: Option<String>) -> Self {
+        self.remember = remember;
         self
     }
 
