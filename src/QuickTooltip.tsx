@@ -68,6 +68,8 @@ type ChatMessage = {
   content: string;
 };
 
+// Mirrors the serialized Rust Action (see src-tauri/src/agent/actions.rs for
+// the per-action field contract); every field except `action` is optional.
 type AgentAction = {
   action: string;
   app?: string;
@@ -76,14 +78,21 @@ type AgentAction = {
   combo?: string;
   path?: string[];
   question?: string;
+  options?: string[];
   script?: string;
   name?: string;
+  input?: string;
   file?: string;
   dx?: number;
   dy?: number;
   ms?: number;
   url?: string;
   query?: string;
+  scope?: string;
+  seconds?: number;
+  role?: string;
+  nth?: number;
+  target?: string;
   reason?: string;
 };
 
