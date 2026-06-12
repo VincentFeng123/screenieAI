@@ -111,12 +111,17 @@ impl SnapshotRecord {
     }
 }
 
+/// Freshness window when no change counter is available (registration
+/// failed or permission missing): a snapshot older than this re-sees.
+const NO_SIGNAL_FRESHNESS: std::time::Duration = std::time::Duration::from_millis(1500);
+
 struct WindowState {
     latest: Arc<SnapshotRecord>,
     dirty: bool,
     /// AX change-counter value observed when the snapshot was taken; freshness
     /// checks compare against the live counter (C3).
     change_counter: Option<u64>,
+    published_at: std::time::Instant,
 }
 
 /// Process-global registry of resolvable snapshots. The SQLite index is the
@@ -133,6 +138,9 @@ struct RegistryState {
     by_id: HashMap<String, Arc<SnapshotRecord>>,
     /// Publication order for eviction.
     order: VecDeque<String>,
+    /// Last published window per pid — the no-snapshot-id read path looks up
+    /// the frontmost app's latest snapshot through this.
+    by_pid: HashMap<i32, WindowKey>,
 }
 
 static REGISTRY: OnceLock<SnapshotRegistry> = OnceLock::new();
@@ -155,6 +163,7 @@ impl SnapshotRegistry {
         &self,
         record: SnapshotRecord,
         change_counter: Option<u64>,
+        pid: Option<i32>,
     ) -> Arc<SnapshotRecord> {
         let record = Arc::new(record);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -167,15 +176,41 @@ impl SnapshotRegistry {
                 state.by_id.remove(&evicted);
             }
         }
+        if let Some(pid) = pid {
+            state.by_pid.insert(pid, record.window_key.clone());
+        }
         state.windows.insert(
             record.window_key.clone(),
             WindowState {
                 latest: Arc::clone(&record),
                 dirty: false,
                 change_counter,
+                published_at: std::time::Instant::now(),
             },
         );
         record
+    }
+
+    /// The latest snapshot id for a window, fresh or not.
+    pub fn latest_snapshot_id(&self, window_key: &WindowKey) -> Option<String> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .windows
+            .get(window_key)
+            .map(|window| window.latest.snapshot_id.clone())
+    }
+
+    /// Fresh latest snapshot for the window last published under `pid`.
+    pub fn fresh_snapshot_for_pid(
+        &self,
+        pid: i32,
+        live_change_counter: Option<u64>,
+    ) -> Option<Arc<SnapshotRecord>> {
+        let key = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.by_pid.get(&pid).cloned()?
+        };
+        self.fresh_snapshot(&key, live_change_counter)
     }
 
     /// The diff hook (C3): a significant change over a window marks its
@@ -187,8 +222,10 @@ impl SnapshotRegistry {
         }
     }
 
-    /// Latest snapshot for a window if it is fresh: not dirty, and (when
-    /// both sides have one) the AX change counter still matches.
+    /// Latest snapshot for a window if it is fresh: not dirty, and either
+    /// the AX change counter still matches (the event-driven path) or — when
+    /// either side lacks a counter — the snapshot is younger than the
+    /// no-signal TTL.
     pub fn fresh_snapshot(
         &self,
         window_key: &WindowKey,
@@ -199,9 +236,13 @@ impl SnapshotRegistry {
         if window.dirty {
             return None;
         }
-        if let (Some(seen), Some(live)) = (window.change_counter, live_change_counter) {
-            if seen != live {
-                return None;
+        match (window.change_counter, live_change_counter) {
+            (Some(seen), Some(live)) if seen != live => return None,
+            (Some(_), Some(_)) => {}
+            _ => {
+                if window.published_at.elapsed() > NO_SIGNAL_FRESHNESS {
+                    return None;
+                }
             }
         }
         Some(Arc::clone(&window.latest))
@@ -492,7 +533,7 @@ mod tests {
         registry().clear();
         let window = WindowKey::WindowId(7);
         let first = SnapshotRecord::new("ax:firstsnap".into(), window.clone(), vec![row("ax:B1")]);
-        registry().publish(first, Some(10));
+        registry().publish(first, Some(10), Some(99));
 
         // Latest + clean resolves.
         let resolved = resolve("ax:B1", "ax:firstsnap", false).unwrap();
@@ -508,7 +549,7 @@ mod tests {
         // A newer snapshot supersedes: old id is stale unless allowed.
         let second =
             SnapshotRecord::new("ax:secondsnap".into(), window.clone(), vec![row("ax:B1")]);
-        registry().publish(second, Some(11));
+        registry().publish(second, Some(11), Some(99));
         assert!(matches!(
             resolve("ax:B1", "ax:firstsnap", false),
             Err(PerceptionError::StaleSnapshot { .. })
@@ -579,7 +620,7 @@ mod tests {
         registry().clear();
         let window = WindowKey::WindowId(9);
         let record = SnapshotRecord::new("ax:counter01".into(), window.clone(), vec![row("ax:B1")]);
-        registry().publish(record, Some(5));
+        registry().publish(record, Some(5), None);
         assert!(registry().fresh_snapshot(&window, Some(5)).is_some());
         // Counter moved → not fresh (read must re-see).
         assert!(registry().fresh_snapshot(&window, Some(6)).is_none());

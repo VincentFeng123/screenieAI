@@ -4705,6 +4705,11 @@ pub fn run() {
     builder = builder.invoke_handler(tauri::generate_handler![
         take_pending_capture,
         dump_observation,
+        perception::commands::perception_see,
+        perception::commands::perception_read,
+        perception::commands::perception_read_sql,
+        perception::commands::perception_look,
+        perception::commands::perception_resolve,
         run_stub_agent,
         start_agent_task,
         stop_agent_task,

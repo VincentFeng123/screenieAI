@@ -201,6 +201,49 @@ unsafe extern "C" fn ax_change_callback(
     }
 }
 
+/// Ensure the shared AXObserver registration follows the frontmost app and
+/// hand back the hub. Never prompts for Accessibility; `None` when the
+/// permission is missing, there is no frontmost pid, or registration failed
+/// for this pid (callers poll / fall back to TTL freshness).
+fn ensure_frontmost_change_registration() -> Option<&'static AxChangeSignalHub> {
+    if !system_accessibility_trusted() {
+        return None;
+    }
+    let pid = frontmost_application_info().ok().flatten()?.pid?;
+    let hub = ax_change_hub();
+    let mut slot = hub.slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.active.as_ref().map(|reg| reg.pid) != Some(pid) {
+        if slot.failed_pid == Some(pid) {
+            return None;
+        }
+        // Drop the previous app's registration before creating the new
+        // one so at most one AXObserver source is ever scheduled.
+        slot.active = None;
+        match register_ax_change_observer(pid) {
+            Some(registration) => {
+                slot.active = Some(registration);
+                slot.failed_pid = None;
+            }
+            None => {
+                eprintln!(
+                    "[screenie] agent ax-signal registration failed pid={pid}; settle falls back to polling"
+                );
+                slot.failed_pid = Some(pid);
+                return None;
+            }
+        }
+    }
+    Some(hub)
+}
+
+/// Perception freshness probe (C3): the current change-counter value for
+/// the frontmost app, registering the AXObserver if needed — the same
+/// event feed the settle path uses. `None` → callers use TTL freshness.
+pub(crate) fn perception_change_counter() -> Option<u64> {
+    let hub = ensure_frontmost_change_registration()?;
+    Some(hub.counter.value())
+}
+
 struct AxChangeRegistration {
     pid: Pid,
     observer: AXObserverRef,
@@ -668,33 +711,7 @@ impl ScreenObserver for MacObserver {
     /// Never prompts for Accessibility; any unavailability returns `None`
     /// and the caller polls instead.
     fn change_signal(&self) -> Option<Box<dyn UiChangeSignal>> {
-        if !system_accessibility_trusted() {
-            return None;
-        }
-        let pid = frontmost_application_info().ok().flatten()?.pid?;
-        let hub = ax_change_hub();
-        let mut slot = hub.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.active.as_ref().map(|reg| reg.pid) != Some(pid) {
-            if slot.failed_pid == Some(pid) {
-                return None;
-            }
-            // Drop the previous app's registration before creating the new
-            // one so at most one AXObserver source is ever scheduled.
-            slot.active = None;
-            match register_ax_change_observer(pid) {
-                Some(registration) => {
-                    slot.active = Some(registration);
-                    slot.failed_pid = None;
-                }
-                None => {
-                    eprintln!(
-                        "[screenie] agent ax-signal registration failed pid={pid}; settle falls back to polling"
-                    );
-                    slot.failed_pid = Some(pid);
-                    return None;
-                }
-            }
-        }
+        let hub = ensure_frontmost_change_registration()?;
         Some(Box::new(hub.counter.waiter()))
     }
 
@@ -1394,7 +1411,7 @@ fn log_suspect_safari_dom_geometry(web_area: Rect, web_elements: &[Element]) {
     }
 }
 
-fn frontmost_application_info() -> Result<Option<FocusedApp>, ObservationError> {
+pub(crate) fn frontmost_application_info() -> Result<Option<FocusedApp>, ObservationError> {
     unsafe {
         let workspace_class = objc_getClass(cstr_ptr(b"NSWorkspace\0"));
         if workspace_class.is_null() {

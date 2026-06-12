@@ -8955,6 +8955,7 @@ mod tests {
         registry().publish(
             SnapshotRecord::new("ax:exectest1".into(), window.clone(), vec![row.clone()]),
             None,
+            None,
         );
 
         let resolved = resolve_perception_target(&[], "ax:B1", "ax:exectest1", false)
@@ -8977,6 +8978,7 @@ mod tests {
         // and allow_stale opts back in.
         registry().publish(
             SnapshotRecord::new("ax:exectest2".into(), window, vec![row]),
+            None,
             None,
         );
         match resolve_perception_target(&[], "ax:B1", "ax:exectest1", false) {

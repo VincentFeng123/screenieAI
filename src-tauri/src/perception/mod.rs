@@ -10,9 +10,11 @@
 
 pub mod annotate;
 pub mod ax;
+pub mod commands;
 pub mod geometry;
 pub mod ids;
 pub mod index;
+pub mod serialize;
 
 pub use geometry::RectPt;
 pub use ids::{ElementRow, ResolvedElement};

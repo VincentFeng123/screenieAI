@@ -77,6 +77,47 @@ pub struct SqlRows {
     pub truncated: bool,
 }
 
+/// The snapshots-table fields a serialized SNAP header needs.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotHeaderRow {
+    pub snapshot_id: String,
+    pub ns: String,
+    pub app_bundle: Option<String>,
+    pub app_pid: Option<i32>,
+    pub window_id: Option<u32>,
+    pub window_title: Option<String>,
+    pub scale: f64,
+    pub cap_rect: Option<RectPt>,
+    pub element_count: u32,
+    pub took_ms: u64,
+    pub partial: bool,
+}
+
+fn row_to_element(row: &rusqlite::Row<'_>) -> rusqlite::Result<ElementRow> {
+    Ok(ElementRow {
+        eid: row.get(0)?,
+        fp: row.get::<_, i64>(1)? as u64,
+        class_prefix: row.get::<_, String>(2)?.chars().next().unwrap_or('X'),
+        role: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        subrole: row.get(4)?,
+        title: row.get(5)?,
+        descr: row.get(6)?,
+        value: row.get(7)?,
+        actionable: row.get(8)?,
+        enabled: row.get(9)?,
+        focused: row.get(10)?,
+        frame: RectPt::new(row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?),
+        depth: row.get::<_, i64>(15)?.clamp(0, u8::MAX as i64) as u8,
+        parent_eid: row.get(16)?,
+        actions: row
+            .get::<_, Option<String>>(17)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
+        is_web_boundary: row.get(18)?,
+    })
+}
+
 /// Read handle: persistent read-only connection for structured queries.
 pub struct Reader {
     db_path: PathBuf,
@@ -162,37 +203,28 @@ impl Reader {
             .map(|count| count.max(0) as u64)
             .map_err(map_query_err)?;
 
+        // Salience order (same ranking as marks and see's top-K): focused,
+        // then actionable, then class priority, then area, then tree order —
+        // so a LIMIT always returns the most useful rows, not the first in
+        // tree order.
         let sql = format!(
             "SELECT eid, fp, class, role, subrole, title, descr, value, actionable,
                     enabled, focused, x, y, w, h, depth, parent_eid, actions,
                     is_web_boundary
-             FROM elements WHERE {where_sql} ORDER BY rowid LIMIT {limit}"
+             FROM elements WHERE {where_sql}
+             ORDER BY focused DESC, actionable DESC,
+                      CASE class WHEN 'B' THEN 0 WHEN 'T' THEN 1 WHEN 'L' THEN 2
+                                 WHEN 'C' THEN 3 WHEN 'M' THEN 4 WHEN 'S' THEN 5
+                                 WHEN 'G' THEN 6 WHEN 'I' THEN 7 ELSE 8 END,
+                      (w*h) DESC, rowid
+             LIMIT {limit}"
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(map_query_err)?;
         let rows = stmt
-            .query_map(params_from_iter(args.iter().map(|a| a.as_ref())), |row| {
-                Ok(ElementRow {
-                    eid: row.get(0)?,
-                    fp: row.get::<_, i64>(1)? as u64,
-                    class_prefix: row.get::<_, String>(2)?.chars().next().unwrap_or('X'),
-                    role: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    subrole: row.get(4)?,
-                    title: row.get(5)?,
-                    descr: row.get(6)?,
-                    value: row.get(7)?,
-                    actionable: row.get(8)?,
-                    enabled: row.get(9)?,
-                    focused: row.get(10)?,
-                    frame: RectPt::new(row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?),
-                    depth: row.get::<_, i64>(15)?.clamp(0, u8::MAX as i64) as u8,
-                    parent_eid: row.get(16)?,
-                    actions: row
-                        .get::<_, Option<String>>(17)?
-                        .and_then(|json| serde_json::from_str(&json).ok())
-                        .unwrap_or_default(),
-                    is_web_boundary: row.get(18)?,
-                })
-            })
+            .query_map(
+                params_from_iter(args.iter().map(|a| a.as_ref())),
+                row_to_element,
+            )
             .map_err(map_query_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_query_err)?;
@@ -202,6 +234,83 @@ impl Reader {
             rows,
             total,
         })
+    }
+
+    /// The snapshots-table row a serialized header needs. `None` when the
+    /// snapshot is unknown.
+    pub fn snapshot_header(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<SnapshotHeaderRow>, PerceptionError> {
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let row = conn
+            .query_row(
+                "SELECT ns, app_bundle, app_pid, window_id, window_title, scale,
+                        cap_x, cap_y, cap_w, cap_h, element_count, took_ms, partial
+                 FROM snapshots WHERE id = ?1",
+                [snapshot_id],
+                |row| {
+                    Ok(SnapshotHeaderRow {
+                        snapshot_id: snapshot_id.to_string(),
+                        ns: row.get(0)?,
+                        app_bundle: row.get(1)?,
+                        app_pid: row.get(2)?,
+                        window_id: row.get(3)?,
+                        window_title: row.get(4)?,
+                        scale: row.get(5)?,
+                        cap_rect: match (
+                            row.get::<_, Option<f64>>(6)?,
+                            row.get::<_, Option<f64>>(7)?,
+                            row.get::<_, Option<f64>>(8)?,
+                            row.get::<_, Option<f64>>(9)?,
+                        ) {
+                            (Some(x), Some(y), Some(w), Some(h)) => Some(RectPt::new(x, y, w, h)),
+                            _ => None,
+                        },
+                        element_count: row.get::<_, Option<i64>>(10)?.unwrap_or(0) as u32,
+                        took_ms: row.get::<_, Option<i64>>(11)?.unwrap_or(0) as u64,
+                        partial: row.get(12)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(map_query_err(other)),
+            })?;
+        Ok(row)
+    }
+
+    /// Every element row of a snapshot in tree order — the annotation
+    /// renderer's input (internal; not limit-clamped like `query`).
+    pub fn all_rows(&self, snapshot_id: &str) -> Result<Vec<ElementRow>, PerceptionError> {
+        let result = self.query(
+            snapshot_id,
+            &ElementQuery {
+                limit: MAX_READ_LIMIT,
+                ..ElementQuery::default()
+            },
+        )?;
+        if result.total <= u64::from(MAX_READ_LIMIT) {
+            return Ok(result.rows);
+        }
+        // Above the structured cap: pull the full set directly (bounded by
+        // the walker's own element budget).
+        let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT eid, fp, class, role, subrole, title, descr, value, actionable,
+                        enabled, focused, x, y, w, h, depth, parent_eid, actions,
+                        is_web_boundary
+                 FROM elements WHERE snapshot_id = ? ORDER BY rowid",
+            )
+            .map_err(map_query_err)?;
+        let rows = stmt
+            .query_map([snapshot_id], row_to_element)
+            .map_err(map_query_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_query_err)?;
+        Ok(rows)
     }
 
     /// Restricted raw SQL (`read_sql`): fresh read-only connection,

@@ -34,6 +34,8 @@ pub(crate) use grounding::GrounderManager;
 pub use grounding::{GroundingMode, GroundingPixel, GroundingReport};
 #[cfg(target_os = "macos")]
 pub use macos_observer::MacObserver;
+#[cfg(target_os = "macos")]
+pub(crate) use macos_observer::{frontmost_application_info, perception_change_counter};
 pub use memory::MemoryEntry;
 pub(crate) use memory::MemoryStore;
 pub(crate) use planner::ContextAwareLlmPlanner;

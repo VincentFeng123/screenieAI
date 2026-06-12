@@ -304,6 +304,12 @@ impl ChangeCounter {
             seen,
         }
     }
+
+    /// Current count — the perception layer stamps this on snapshots and
+    /// re-sees when the live value moves (its freshness signal).
+    pub fn value(&self) -> u64 {
+        *self.count.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// One settle path's view onto a [`ChangeCounter`]: it only reports bumps

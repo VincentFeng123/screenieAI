@@ -254,6 +254,28 @@ pub fn walk_app_windows(pid: i32, config: &WalkConfig) -> Vec<WalkOutcome> {
     outcomes
 }
 
+/// Current focused-window frame + CGWindowID for a pid. The look path uses
+/// this to shift element frames by the window's movement since the walk
+/// (same window id), so marks stay aligned without a re-walk.
+pub fn focused_window_frame(pid: i32) -> Option<(RectPt, Option<u32>)> {
+    let app = ffi::app_element(pid, WINDOW_ACQUIRE_TIMEOUT_SECS)?;
+    let window = ffi::focused_window(&app)?;
+    let window_id = ffi::window_id(&window);
+    let attrs = ffi::copy_attributes(&window, &["AXPosition", "AXSize"], 0).ok()?;
+    let mut position = None;
+    let mut size = None;
+    for (index, attr) in attrs.into_iter().enumerate() {
+        match (index, attr) {
+            (0, ffi::AttrValue::Point(x, y)) => position = Some((x, y)),
+            (1, ffi::AttrValue::Size(w, h)) => size = Some((w, h)),
+            _ => {}
+        }
+    }
+    let (x, y) = position?;
+    let (w, h) = size?;
+    Some((RectPt::new(x, y, w, h), window_id))
+}
+
 /// Children with the cap applied. When the list overflows, actionable-role
 /// children keep their slots first (Electron tab strips and web remnants
 /// produce thousands of inert siblings that would otherwise crowd out the

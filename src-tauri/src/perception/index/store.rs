@@ -58,6 +58,9 @@ enum Job {
         snapshot_id: String,
         raw_png: Option<String>,
         marked_png: Option<String>,
+        /// Real capture scale (px/pt), measured at look time — see ingests
+        /// snapshots before any capture exists, so scale lands here.
+        scale: Option<f64>,
         ack: mpsc::Sender<Result<(), String>>,
     },
     MarkDirty {
@@ -130,12 +133,14 @@ impl Store {
             .map_err(PerceptionError::Index)
     }
 
-    /// Record rendered PNG paths on an existing snapshot row.
+    /// Record rendered PNG paths (and the measured capture scale) on an
+    /// existing snapshot row.
     pub fn set_png_paths(
         &self,
         snapshot_id: &str,
         raw_png: Option<String>,
         marked_png: Option<String>,
+        scale: Option<f64>,
     ) -> Result<(), PerceptionError> {
         let (ack, done) = mpsc::channel();
         self.sender
@@ -143,6 +148,7 @@ impl Store {
                 snapshot_id: snapshot_id.to_string(),
                 raw_png,
                 marked_png,
+                scale,
                 ack,
             })
             .map_err(|_| PerceptionError::Index("store writer thread is gone".into()))?;
@@ -173,14 +179,16 @@ fn writer_loop(mut conn: Connection, receiver: mpsc::Receiver<Job>) {
                 snapshot_id,
                 raw_png,
                 marked_png,
+                scale,
                 ack,
             } => {
                 let result = conn
                     .execute(
                         "UPDATE snapshots SET raw_png = COALESCE(?2, raw_png),
-                                              marked_png = COALESCE(?3, marked_png)
+                                              marked_png = COALESCE(?3, marked_png),
+                                              scale = COALESCE(?4, scale)
                          WHERE id = ?1",
-                        params![snapshot_id, raw_png, marked_png],
+                        params![snapshot_id, raw_png, marked_png, scale],
                     )
                     .map(|_| ())
                     .map_err(|err| err.to_string());

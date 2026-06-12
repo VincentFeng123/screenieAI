@@ -87,11 +87,18 @@ fn role_class(role: &str) -> Option<ElementClass> {
 }
 
 /// Classify an element given its AX role and the actions it advertises.
+/// Static is strictly the non-actionable rest: any unlisted role carrying an
+/// actionable action (press, confirm, show-menu) is Generic — otherwise a
+/// menu-bearing AXList would be unmarked and class-filtered out despite
+/// being interactive.
 pub fn classify(role: &str, actions: &[String]) -> ElementClass {
     if let Some(class) = role_class(role) {
         return class;
     }
-    if actions.iter().any(|a| a == "AXPress") {
+    if actions
+        .iter()
+        .any(|a| ACTIONABLE_ACTIONS.iter().any(|known| known == a))
+    {
         ElementClass::Generic
     } else {
         ElementClass::Static
@@ -154,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_roles_split_on_press_action() {
+    fn unknown_roles_split_on_actionable_actions() {
         assert_eq!(classify("AXGroup", &s(&["AXPress"])), ElementClass::Generic);
         assert_eq!(classify("AXGroup", &[]), ElementClass::Static);
         assert_eq!(classify("AXStaticText", &[]), ElementClass::Static);
@@ -163,6 +170,15 @@ mod tests {
             classify("AXStaticText", &s(&["AXPress"])),
             ElementClass::Generic
         );
+        // Static is the NON-ACTIONABLE rest: menu-bearing and confirmable
+        // roles are Generic (Finder's icon-view AXList carries AXShowMenu).
+        assert_eq!(
+            classify("AXList", &s(&["AXShowMenu"])),
+            ElementClass::Generic
+        );
+        assert_eq!(classify("AXRow", &s(&["AXConfirm"])), ElementClass::Generic);
+        // Non-actionable custom actions don't promote.
+        assert_eq!(classify("AXRow", &s(&["AXOpen"])), ElementClass::Static);
     }
 
     #[test]
