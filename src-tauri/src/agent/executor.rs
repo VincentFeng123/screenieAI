@@ -57,6 +57,10 @@ const DEFAULT_STABLE_SETTLE_POLL_MS: u64 = 50;
 const DEFAULT_FAST_SETTLE_TIMEOUT_MS: u64 = 600;
 const OPEN_URL_SETTLE_TIMEOUT_MS: u64 = 2_500;
 const CARRIED_OBSERVATION_MAX_AGE_MS: u64 = 300;
+/// Hard ceiling for a single Wait action's sleep. Planners under-observing a
+/// stuck screen escalate their waits exponentially (observed: 500→13547 ms);
+/// everything past this cap was pure wall-clock burn.
+const MAX_WAIT_ACTION_MS: u64 = 5_000;
 const DEFAULT_MAX_ACTION_RETRIES: u32 = 2;
 const DEFAULT_PROGRESS_LOOP_WINDOW: u32 = 8;
 const DEFAULT_PROGRESS_LOOP_THRESHOLD: u32 = 3;
@@ -2272,7 +2276,13 @@ where
                                 "[screenie] agent step {} clickText-unresolved: {reason}",
                                 step_number
                             );
-                            if duplicate_rejections < MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP {
+                            let proposal_key =
+                                format!("clickText:{}", normalize_text_for_match(&text));
+                            let was_banned =
+                                stuck_recovery.rejection_for(&proposal_key).is_some();
+                            if !was_banned
+                                && duplicate_rejections < MAX_DUPLICATE_PLANNER_REJECTIONS_PER_STEP
+                            {
                                 planning_history.push(PlannerHistoryEntry::new(
                                     action.clone(),
                                     planner_reason.clone(),
@@ -2285,8 +2295,29 @@ where
                                 duplicate_rejections = duplicate_rejections.saturating_add(1);
                                 continue;
                             }
-                            // Rejection cap: surface a non-executed step and
-                            // replan next step from a fresh observation.
+                            // Rejection cap (or a re-proposed banned query):
+                            // ban the text query and walk the recovery ladder,
+                            // mirroring the banned-proposal path. Unresolvable
+                            // clickText used to be invisible to stuck
+                            // detection and could free-spin for the whole
+                            // step budget while the planner insisted the text
+                            // was visible on screen.
+                            let proposal_display =
+                                format!("clickText \"{}\"", compact_history_text(&text));
+                            let stage = stuck_recovery.escalate_rejection(
+                                &proposal_key,
+                                &proposal_display,
+                                &reason,
+                            );
+                            let exhausted = stage == StuckRecoveryStage::Exhausted;
+                            if stage == StuckRecoveryStage::VisionReplan {
+                                force_visual_replan_next =
+                                    Some("after-clicktext-unresolved-cap".into());
+                            }
+                            eprintln!(
+                                "[screenie] agent step {} clickText-unresolved cap; banning '{proposal_key}' and escalating recovery stage={stage:?}",
+                                step_number
+                            );
                             history.push(PlannerHistoryEntry::new(
                                 action.clone(),
                                 planner_reason.clone(),
@@ -2316,9 +2347,14 @@ where
                                 vision_capture_size: observation_metadata.capture_size,
                                 vision_detector_kind: observation_metadata.detector_kind.clone(),
                                 grounding: None,
-                                failure_reason: Some(reason),
+                                failure_reason: Some(reason.clone()),
                             };
                             commit_step(confirmations, &mut steps, step, step_started);
+                            if exhausted {
+                                terminal_status = Some(AgentRunStatus::Failed);
+                                failure_reason = Some(reason);
+                                break 'steps;
+                            }
                             continue 'steps;
                         }
                     }
@@ -4182,6 +4218,50 @@ where
                         &milestones,
                         step_number,
                     );
+                    // Waits skip screen verification, but a planner that keeps
+                    // waiting on an unchanged screen is as stuck as one that
+                    // keeps clicking: feed the loop detector (the Wait key is
+                    // ms-insensitive) so same-screen waits walk the recovery
+                    // ladder instead of silently burning the wall clock.
+                    if matches!(prepared.kind, PreparedKind::Wait { .. })
+                        && step.verification.status
+                            == VerificationStatus::SkippedNoUiChangeExpected
+                    {
+                        let entry = ProgressLoopEntry {
+                            pre_state_hash: pre_state_hash.clone(),
+                            normalized_action: normalized_action.clone(),
+                        };
+                        match handle_no_progress_entry(
+                            &mut recent_no_progress,
+                            &mut stuck_recovery,
+                            entry,
+                            options.progress_loop_window,
+                            options.progress_loop_threshold,
+                            &mut force_visual_replan_next,
+                            &action_display,
+                        ) {
+                            NoProgressOutcome::Exhausted(reason) => {
+                                step.failure_reason = Some(reason.clone());
+                                terminal_status = Some(AgentRunStatus::Failed);
+                                failure_reason = Some(reason);
+                                commit_step(confirmations, &mut steps, step, step_started);
+                                break 'steps;
+                            }
+                            NoProgressOutcome::Recovering(stage) => {
+                                eprintln!(
+                                    "[screenie] agent step {} stuck-recovery stage={:?} after repeated same-screen waits",
+                                    step_number, stage
+                                );
+                                // Recovery invalidates any queued batch, like
+                                // every other no-progress path — otherwise
+                                // banned waits inside a batch keep executing
+                                // planner-free and a VisionReplan capture is
+                                // burned on a step that never calls the model.
+                                last_step_clean = false;
+                            }
+                            NoProgressOutcome::Recorded => {}
+                        }
+                    }
                     commit_step(confirmations, &mut steps, step, step_started);
                     continue 'steps;
                 }
@@ -5158,6 +5238,16 @@ fn keyword_matches_word_boundary(haystack: &str, keyword: &str) -> bool {
 }
 
 fn normalize_key_combo_for_safety(combo: &str) -> String {
+    // Canonicalize through the parser whenever the combo is executable, so
+    // every spelling of one keystroke ("cmd+de lete", "CMD+DELETE", "del")
+    // produces the same textual key — destructive_action_reason, the ban and
+    // loop-dedup keys, and confirmation approval keys all compare these
+    // strings, and a spelling the parser accepts but this normalizer doesn't
+    // recognize would slip past the destructive-combo gate. The textual
+    // fallback keeps unparsable combos stable.
+    if let Ok(parsed) = parse_key_combo(combo) {
+        return parsed.canonical_string();
+    }
     combo
         .split('+')
         .map(|part| part.trim().to_ascii_lowercase())
@@ -5398,7 +5488,10 @@ fn prepare_action(action: &Action, obs: &[Element]) -> Result<PreparedAction, Ex
             Ok(PreparedAction::scroll_with_target(*dx, *dy, target))
         }
         Action::Wait { ms } => Ok(PreparedAction::without_target(PreparedKind::Wait {
-            ms: *ms,
+            // Past a few seconds, longer waits add latency, not signal — the
+            // settle loop already absorbs slow UI, and same-screen repeats
+            // are the loop detector's job, not a longer sleep's.
+            ms: (*ms).min(MAX_WAIT_ACTION_MS),
         })),
         Action::CaptureFrame { scope } => Ok(PreparedAction::without_target(
             PreparedKind::CaptureFrame { scope: *scope },
@@ -7776,7 +7869,10 @@ fn normalized_progress_action(action: &Action, prepared: &PreparedAction) -> Str
                 .map(|target| target.signature.as_str())
                 .unwrap_or("missing")
         ),
-        Action::Wait { ms } => format!("wait:{ms}"),
+        // Deliberately ms-insensitive: a planner that keeps waiting on an
+        // unchanged screen must look like a repeat to the loop detector even
+        // when it grows the duration each time.
+        Action::Wait { .. } => "wait".into(),
         Action::Done => "done".into(),
         Action::Fail { reason } => format!("fail:{reason}"),
     }
@@ -8028,6 +8124,59 @@ struct ParsedKeyCombo {
     main: InputKey,
 }
 
+impl ParsedKeyCombo {
+    /// One canonical spelling per physical keystroke, for the textual
+    /// safety/ban/dedup/approval keys: modifiers in a fixed order with
+    /// parser aliases collapsed ("Down Arrow"/"arrowdown" → "down",
+    /// "option" → "alt", "del" → "delete").
+    fn canonical_string(&self) -> String {
+        fn precedence(key: &InputKey) -> u8 {
+            match key {
+                InputKey::Command => 0,
+                InputKey::Control => 1,
+                InputKey::Alt | InputKey::Option => 2,
+                InputKey::Shift => 3,
+                _ => 4,
+            }
+        }
+        let mut modifiers = self.modifiers.clone();
+        modifiers.sort_by_key(precedence);
+        // Alt and Option are the same physical modifier.
+        modifiers.dedup_by(|a, b| precedence(a) == precedence(b));
+        modifiers
+            .iter()
+            .chain(std::iter::once(&self.main))
+            .map(canonical_key_token)
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+}
+
+fn canonical_key_token(key: &InputKey) -> String {
+    match key {
+        InputKey::Command => "cmd".into(),
+        InputKey::Control => "ctrl".into(),
+        InputKey::Alt | InputKey::Option => "alt".into(),
+        InputKey::Shift => "shift".into(),
+        InputKey::Escape => "escape".into(),
+        InputKey::Return => "return".into(),
+        InputKey::Tab => "tab".into(),
+        InputKey::Space => "space".into(),
+        InputKey::Backspace => "backspace".into(),
+        InputKey::Delete => "delete".into(),
+        InputKey::LeftArrow => "left".into(),
+        InputKey::RightArrow => "right".into(),
+        InputKey::UpArrow => "up".into(),
+        InputKey::DownArrow => "down".into(),
+        InputKey::Home => "home".into(),
+        InputKey::End => "end".into(),
+        InputKey::PageUp => "pageup".into(),
+        InputKey::PageDown => "pagedown".into(),
+        InputKey::Unicode(ch) => ch.to_lowercase().to_string(),
+        InputKey::F(n) => format!("f{n}"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputKey {
     Command,
@@ -8125,8 +8274,17 @@ pub(crate) fn validate_key_combo(combo: &str) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+/// Planners emit spaced/hyphenated key names ("Down Arrow", "page-up");
+/// collapse separators so the named lookups see a single token.
+fn normalize_key_segment(part: &str) -> String {
+    part.to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '-' | '_'))
+        .collect()
+}
+
 fn parse_modifier(part: &str) -> Option<InputKey> {
-    match part.to_ascii_lowercase().as_str() {
+    match normalize_key_segment(part).as_str() {
         "cmd" | "command" => Some(InputKey::Command),
         "ctrl" | "control" => Some(InputKey::Control),
         "shift" => Some(InputKey::Shift),
@@ -8137,7 +8295,7 @@ fn parse_modifier(part: &str) -> Option<InputKey> {
 }
 
 fn parse_main_key(part: &str) -> Option<InputKey> {
-    let lower = part.to_ascii_lowercase();
+    let lower = normalize_key_segment(part);
     let named = match lower.as_str() {
         "esc" | "escape" => Some(InputKey::Escape),
         "enter" | "return" => Some(InputKey::Return),
@@ -8813,6 +8971,83 @@ mod tests {
         assert!(parse_key_combo("a+b").is_err());
         assert!(parse_key_combo("cmd+s+p").is_err());
         assert!(parse_key_combo("cmd+shift").is_err());
+    }
+
+    #[test]
+    fn parse_key_combo_accepts_spaced_and_hyphenated_key_names() {
+        // Planners emit prose-style key names; "Down Arrow" burned planner
+        // retries in the field before separators were normalized away.
+        assert_eq!(
+            parse_key_combo("Down Arrow").unwrap(),
+            ParsedKeyCombo {
+                modifiers: vec![],
+                main: InputKey::DownArrow,
+            }
+        );
+        assert_eq!(
+            parse_key_combo("page-up").unwrap(),
+            ParsedKeyCombo {
+                modifiers: vec![],
+                main: InputKey::PageUp,
+            }
+        );
+        assert_eq!(
+            parse_key_combo("cmd+left_arrow").unwrap(),
+            ParsedKeyCombo {
+                modifiers: vec![InputKey::Command],
+                main: InputKey::LeftArrow,
+            }
+        );
+        // Single punctuation characters still parse as literal keys.
+        assert_eq!(
+            parse_key_combo("cmd+-").unwrap(),
+            ParsedKeyCombo {
+                modifiers: vec![InputKey::Command],
+                main: InputKey::Unicode('-'),
+            }
+        );
+    }
+
+    #[test]
+    fn safety_key_normalization_canonicalizes_aliases_and_separators() {
+        // Every spelling of one keystroke must produce one safety/ban key —
+        // destructive_key_combos are compared textually, so a spelling the
+        // parser executes but the normalizer doesn't collapse would bypass
+        // the confirmation gate.
+        assert_eq!(normalize_key_combo_for_safety("cmd+de lete"), "cmd+delete");
+        assert_eq!(normalize_key_combo_for_safety("CMD+DELETE"), "cmd+delete");
+        assert_eq!(normalize_key_combo_for_safety("del"), "delete");
+        assert_eq!(normalize_key_combo_for_safety("Down Arrow"), "down");
+        assert_eq!(normalize_key_combo_for_safety("arrowdown"), "down");
+        assert_eq!(normalize_key_combo_for_safety("shift+cmd+z"), "cmd+shift+z");
+        assert_eq!(normalize_key_combo_for_safety("option+enter"), "alt+return");
+        // Unparsable combos keep a stable textual key.
+        assert_eq!(normalize_key_combo_for_safety("cmd+shift"), "cmd+shift");
+    }
+
+    #[test]
+    fn wait_prepare_clamps_duration_and_progress_key_ignores_ms() {
+        let short = prepare_action(&Action::Wait { ms: 500 }, &[]).unwrap();
+        assert!(matches!(short.kind, PreparedKind::Wait { ms: 500 }));
+
+        let long = prepare_action(&Action::Wait { ms: 60_000 }, &[]).unwrap();
+        assert!(matches!(
+            long.kind,
+            PreparedKind::Wait {
+                ms: MAX_WAIT_ACTION_MS
+            }
+        ));
+
+        // The loop detector must see growing waits on an unchanged screen
+        // as the same action.
+        assert_eq!(
+            normalized_progress_action(&Action::Wait { ms: 500 }, &short),
+            "wait"
+        );
+        assert_eq!(
+            normalized_progress_action(&Action::Wait { ms: 13_547 }, &long),
+            "wait"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -11817,6 +12052,102 @@ mod tests {
         // ...and each banned re-proposal escalates after a single planner
         // call instead of re-burning the in-step rejection cap.
         assert!(goals.borrow().len() <= report.steps.len() + 1);
+    }
+
+    #[test]
+    fn repeated_same_screen_waits_walk_the_stuck_recovery_ladder() {
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 80]);
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        // Growing durations mimic the field failure (500→13547 ms): the
+        // ms-insensitive progress key must still read them as repeats.
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![
+                Action::Wait { ms: 5 },
+                Action::Wait { ms: 10 },
+                Action::Wait { ms: 20 },
+            ],
+            goals: goals.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(20),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                progress_loop_threshold: Some(3),
+                progress_loop_window: Some(8),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        // Three same-screen waits trip the loop detector, ban `wait`, and
+        // the ladder fails the run well before the step budget instead of
+        // letting the planner sleep through the wall clock.
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        assert!(report.steps.len() < 20);
+        assert!(goals.borrow().iter().any(|goal| goal.contains("STUCK")));
+        assert!(goals.borrow().iter().any(|goal| {
+            goal.contains("Banned actions — do NOT propose these") && goal.contains("wait")
+        }));
+    }
+
+    #[test]
+    fn unresolvable_click_text_walks_the_stuck_recovery_ladder() {
+        // The observation never contains "First": resolution fails every
+        // attempt, mimicking text visible in pixels but absent from the
+        // element set. This used to free-spin outside stuck detection.
+        let observer = FakeObserver::new(vec![Ok(vec![element(1, "Ask")]); 80]);
+        let goals = Rc::new(RefCell::new(Vec::<String>::new()));
+        let planner = GoalRecordingActionPlanner {
+            actions: vec![Action::ClickByText {
+                text: "First".into(),
+                role_hint: None,
+                nth: None,
+            }],
+            goals: goals.clone(),
+        };
+        let report = block_on(run_stub_agent_loop(
+            &observer,
+            &planner,
+            StubAgentOptions {
+                execution_policy: Some(ExecutionPolicy::Auto),
+                max_steps: Some(20),
+                settle_ms: Some(0),
+                max_action_retries: Some(0),
+                progress_loop_threshold: Some(3),
+                progress_loop_window: Some(8),
+                ..Default::default()
+            },
+            CountingFactory {
+                create_calls: Rc::new(Cell::new(0)),
+            },
+            &NoCalibrationProbe,
+            &NoConfirmationRequester,
+            &AgentAbortState::default(),
+        ));
+
+        // Step 1 burns the in-step rejection cap and bans the query; each
+        // re-proposal afterwards escalates one ladder stage per step, so the
+        // run fails in a handful of steps instead of twenty.
+        assert_eq!(report.status, AgentRunStatus::Failed);
+        assert!(report.steps.len() <= 6);
+        assert!(report
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("no visible element matches"));
+        assert!(goals.borrow().iter().any(|goal| {
+            goal.contains("Banned actions — do NOT propose these")
+                && goal.contains("clickText \"First\"")
+        }));
     }
 
     #[test]

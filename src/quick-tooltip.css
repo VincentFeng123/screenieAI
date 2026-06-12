@@ -848,6 +848,11 @@ body,
   padding: 8px 10px;
   max-height: 140px;
   overflow: auto;
+  /* overflow:auto gives this flex item an automatic minimum size of 0, so
+     inside the height-capped card it collapses to its padding instead of
+     overflowing — and measureStatusHeight's scrollHeight then never includes
+     the script, freezing the card too short to show even one line. */
+  flex: 0 0 auto;
   border-radius: 10px;
   background: rgba(0, 0, 0, 0.35);
   color: rgba(255, 255, 255, 0.88);

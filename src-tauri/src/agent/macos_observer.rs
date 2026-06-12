@@ -423,6 +423,18 @@ impl MacObserver {
                 let remaining = MAX_OBSERVED_ELEMENTS.saturating_sub(elements.len());
                 if remaining > 0 {
                     let mut web_elements = safari_dom::observe_safari_dom(web_area, start_id)?;
+                    // Truncation drops tail-of-document elements — where
+                    // open-dropdown option portals usually live. Leave a
+                    // trace instead of silently reproducing the "visible in
+                    // pixels, absent from observation" failure mode.
+                    if web_elements.len() > remaining {
+                        eprintln!(
+                            "[screenie] agent safari-dom truncated: ax={} web={} kept={}",
+                            elements.len(),
+                            web_elements.len(),
+                            remaining
+                        );
+                    }
                     web_elements.truncate(remaining);
                     log_suspect_safari_dom_geometry(web_area, &web_elements);
                     elements.extend(web_elements);
