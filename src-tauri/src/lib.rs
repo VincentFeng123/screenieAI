@@ -4,6 +4,7 @@ mod ai;
 mod capture;
 mod history;
 mod ollama_install;
+pub mod perception;
 mod secrets;
 
 #[cfg(target_os = "windows")]
